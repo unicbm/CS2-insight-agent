@@ -252,11 +252,11 @@ export default function Sidebar({
             />
             <div className="space-y-1">
               <label className="block text-[10px] font-semibold uppercase tracking-wide text-cs2-text-secondary">
-                录制帧率上限 (fps_max)
+                录制帧率上限 (fps_max，0=不限制)
               </label>
               <input
                 type="number"
-                min={30}
+                min={0}
                 max={9999}
                 step={10}
                 value={cs2FpsMax}

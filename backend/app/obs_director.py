@@ -506,7 +506,7 @@ class OBSDirector:
     ):
         self.obs_config = obs_config
         self.cs2_path = cs2_path
-        self._cs2_fps_max: int = max(30, int(cs2_fps_max))
+        self._cs2_fps_max: int = max(0, min(int(cs2_fps_max), 9999))
         self._ws: Optional[obsws] = None
         self._cs2_process: Optional[subprocess.Popen] = None
         self._on_state_change = on_state_change
@@ -981,7 +981,7 @@ class OBSDirector:
         cfg_path = cfg_dir / f"{stem}.cfg"
         # 用 cfg 里 playdemo 比单独 +playdemo 在 CS2 上更稳；路径仅 ASCII
         # engine_no_focus_sleep 0 关闭 Source 2 失焦节流（默认 50ms/帧 ≈ 20fps）。
-        # fps_max 由用户在页面配置（默认 240）：整场录制的帧率上限。
+        # fps_max 由用户在页面配置（默认 240；0 在 CS2 中表示不限制）：整场录制的帧率上限。
         console_toggle_key = (os.environ.get("CS2_INSIGHT_CONSOLE_TOGGLE_KEY") or "F10").strip().upper()
         if console_toggle_key in {"~", "OEM_3"}:
             console_toggle_key = "`"
@@ -2269,11 +2269,8 @@ class OBSDirector:
                 logger.warning("Console inject failed stage 4: spec_mode + %s", spec_cmd)
             await self._sleep_abortable(spec_settle)
 
-        # 与 _launch_cs2 cfg 中的 fps_max IDLE（默认 30）配对：命令都已注入完，
-        # 进入录制前把帧率恢复到 RECORD（默认 120）。默认不再用 400 的原因：
-        # 400fps ≈ 2.5ms/帧，激烈场景渲染一帧就吃 5-15ms → 主线程 100% 忙 →
-        # 段间 jump_cut 再次 demo_pause 时 WM_CHAR 又龟速。120fps 每帧 8.3ms，
-        # 激烈场景仍能留出数 ms 处理窗口消息；OBS 成片也足够流畅。
+        # 与 _launch_cs2 cfg 中的 fps_max 一致：前置命令注入完后再次设置 fps_max，
+        # 确保进入录制前帧率与用户配置一致（含 fps_max 0 = 不限制）。
         ok5 = await asyncio.to_thread(_inj, [self._fps_record_cmd(), close_cmd], skip=True, close=False)
         if ok5:
             logger.info("Injected stage 5: %s + %s", self._fps_record_cmd(), close_cmd)

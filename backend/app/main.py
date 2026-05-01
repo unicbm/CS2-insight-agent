@@ -554,7 +554,7 @@ async def update_config(payload: ConfigPayload):
         cfg.expected_parse_players = cleaned
     if payload.cs2_fps_max is not None:
         v = int(payload.cs2_fps_max)
-        cfg.cs2_fps_max = max(30, min(v, 9999))
+        cfg.cs2_fps_max = max(0, min(v, 9999))
     if payload.recording_global_pacing is not None:
         cfg.recording_global_pacing = (
             dict(payload.recording_global_pacing)
