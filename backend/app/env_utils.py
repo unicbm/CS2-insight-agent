@@ -10,9 +10,9 @@ import os
 import re
 import winreg
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # 轻量 JSON 配置：默认在仓库根目录 cs2-insight.config.json（可用环境变量 CS2_INSIGHT_CONFIG 覆盖绝对路径）
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -122,6 +122,8 @@ class LLMConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     obs: OBSConfig = Field(default_factory=OBSConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     cs2_path: str = ""
@@ -132,6 +134,10 @@ class AppConfig(BaseModel):
     expected_parse_players: list[str] = Field(default_factory=list)
     # 录制期间 CS2 的 fps_max 上限（默认 240）
     cs2_fps_max: int = 240
+    # 前端录制队列「全局节奏」覆写（仅含用户改过的字段；空对象表示沿用内置默认）
+    recording_global_pacing: dict[str, Any] = Field(default_factory=dict)
+    # 录制前观战选项默认值（与前端 RecordWarmupModal DEFAULT_OPTIONS 对齐的扁平对象）
+    default_record_warmup: dict[str, Any] = Field(default_factory=dict)
 
 
 def _parse_config_json_file(path: Path) -> dict:

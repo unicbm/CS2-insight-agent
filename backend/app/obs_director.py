@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple
 
 from obswebsocket import obsws, requests as obs_requests
 
@@ -31,6 +31,20 @@ from .gsi_ready import gsi_status, is_gsi_ready, reset_gsi_ready, wait_gsi_paylo
 from .win_cs2_console import ensure_cs2_foreground, find_cs2_hwnd, inject_console_sequence, send_cs2_space_taps
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_gsi_sink_url() -> str:
+    """URI written into ``gamestate_integration_*.cfg``; must match the backend listen port."""
+    explicit = os.environ.get("CS2_INSIGHT_GSI_URL") or os.environ.get("CS2_INSIGHT_BACKEND_GSI_URL")
+    if explicit:
+        return explicit.strip()
+    try:
+        port = int(os.environ.get("CS2_INSIGHT_PORT", "8000") or "8000")
+    except ValueError:
+        port = 8000
+    # CS2 POSTs from the same machine; mirror CS2_INSIGHT_PORT so a non-default
+    # uvicorn port still receives GSI (previously defaulted to :8000 only).
+    return f"http://127.0.0.1:{port}/api/gsi/cs2"
 
 
 class RecordingAborted(Exception):
@@ -469,8 +483,14 @@ class RecordingWarmupExtras:
     hide_demo_playback_ui: bool = True
     # 投掷物抛物线 + 画中窗预览
     hide_grenade_trajectory_pip: bool = True
+    # 与 cs2_video.txt / video.cfg 中 setting.aspectratiomode 一致：0=4:3，1=16:9，2=16:10
+    aspect_ratio: Optional[Literal["4:3", "16:9", "16:10"]] = None
     # 若前端传入非空列表，则优先使用该顺序注入（须已含各 cvar）；否则由静态方法从布尔字段拼装
     console_cmds: Optional[tuple[str, ...]] = None
+
+
+# CS2 视频设置「宽高比」下拉与 setting.aspectratiomode 枚举（社区常用映射）。
+_ASPECT_RATIO_VIDEOCFG_MODE: dict[str, int] = {"4:3": 0, "16:9": 1, "16:10": 2}
 
 
 class OBSDirector:
@@ -982,12 +1002,9 @@ class OBSDirector:
         self._copied_cfg = cfg_path
 
         reset_gsi_ready()
-        gsi_url = (
-            os.environ.get("CS2_INSIGHT_GSI_URL")
-            or os.environ.get("CS2_INSIGHT_BACKEND_GSI_URL")
-            or "http://127.0.0.1:8000/api/gsi/cs2"
-        ).strip()
+        gsi_url = _resolve_gsi_sink_url()
         gsi_path = cfg_dir / f"gamestate_integration_{stem}.cfg"
+        logger.info("GSI HTTP sink (gamestate cfg): %s -> %s", gsi_url, gsi_path)
         gsi_lines = [
             '"CS2 Insight Agent"',
             "{",
@@ -1032,6 +1049,10 @@ class OBSDirector:
             w, h = warmup.resolution_width, warmup.resolution_height
             if w is not None and h is not None and int(w) > 0 and int(h) > 0:
                 argv.extend(["-w", str(int(w)), "-h", str(int(h))])
+                arm = warmup.aspect_ratio
+                mode = _ASPECT_RATIO_VIDEOCFG_MODE.get(arm) if arm else None
+                if mode is not None:
+                    argv.extend(["+setting.aspectratiomode", str(mode)])
 
         argv.extend(["+exec", stem])
         logger.info("Launch CS2 cwd=%s cmd=%s", cwd, " ".join(argv))
@@ -1923,6 +1944,44 @@ class OBSDirector:
         except Exception as e:  # noqa: BLE001
             logger.warning("Could not rename OBS recording %s: %s", original, e)
             return {"original_output_path": original, "rename_error": str(e)}
+
+    async def _finalize_obs_recording_rename(
+        self,
+        stop_path: Optional[Path],
+        clip: dict,
+        demo_abs: Path,
+        spectator_name: Optional[str],
+        record_started_at_wall: Optional[float],
+    ) -> dict:
+        """StopRecord 后对 OBS 输出文件改名：无固定前置等待；最多 5 次尝试，间隔 0.5s，成功即返回。
+
+        WebSocket 已给出 ``outputPath`` 时各轮只尝试该路径（避免录制目录内误选其它成片）；
+        仅当 StopRecord 未返回路径时才按录制目录扫描兜底。
+        """
+        interval = 0.5
+        max_attempts = 5
+        clip_ref = str(clip.get("clip_id") or "")
+        for attempt in range(1, max_attempts + 1):
+            self._check_abort()
+            path: Optional[Path]
+            if stop_path is not None:
+                try:
+                    path = stop_path.expanduser()
+                except OSError:
+                    path = None
+            else:
+                path = self._locate_recent_recording_output(record_started_at_wall)
+            result = self._rename_recording_output(path, clip, demo_abs, spectator_name)
+            if result.get("output_path") and not result.get("rename_error"):
+                return result
+            if attempt < max_attempts:
+                await self._sleep_abortable(interval)
+        logger.warning(
+            "OBS output rename skipped after %d attempts (clip_id=%s)",
+            max_attempts,
+            clip_ref,
+        )
+        return {}
 
     @staticmethod
     def _recording_warmup_console_lines(w: RecordingWarmupExtras) -> list[str]:
@@ -2879,10 +2938,13 @@ class OBSDirector:
             except Exception as ce:
                 logger.debug("restore cursor pos: %s", ce)
             if record_started_at_wall is not None or stop_record_output_path is not None:
-                await asyncio.sleep(1.0)
-                if stop_record_output_path is None:
-                    stop_record_output_path = self._locate_recent_recording_output(record_started_at_wall)
-                output_result = self._rename_recording_output(stop_record_output_path, clip, demo_abs, spectator_name)
+                output_result = await self._finalize_obs_recording_rename(
+                    stop_record_output_path,
+                    clip,
+                    demo_abs,
+                    spectator_name,
+                    record_started_at_wall,
+                )
 
         self._set_state(DirectorState.STOPPING, clip_id)
         if fatal_recording_error:
