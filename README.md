@@ -206,4 +206,5 @@ Counter-Strike 2、CS2、Counter-Strike、Steam、Valve 等名称、商标和标
 
 如果这个项目帮你节省了剪辑时间，欢迎请我喝一杯咖啡 ☕  
 你的支持会用于 Demo 解析、录制兼容性测试和后续功能维护。
-
+<img src="asset/wx.jpg" alt="赞助方式1" style="zoom:33%;" />
+<img src="asset/ali.jpg" alt="赞助方式2" style="zoom:33%;" />

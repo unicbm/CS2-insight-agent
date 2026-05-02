@@ -450,7 +450,7 @@ D:\steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe
 
 如果这个项目帮你节省了剪辑时间，欢迎请我喝一杯咖啡 ☕  
 你的支持会用于 Demo 解析、录制兼容性测试和后续功能维护。
-<img src="assets/wx.jpg" alt="赞助方式1" style="zoom:33%;" />
-<img src="assets/ali.jpg" alt="赞助方式2" style="zoom:33%;" />
+<img src="asset/wx.jpg" alt="赞助方式1" style="zoom:33%;" />
+<img src="asset/ali.jpg" alt="赞助方式2" style="zoom:33%;" />
 
 > **CS2 Insight Agent** v1.1.0 · Made with ❤️ for CS2 Players
