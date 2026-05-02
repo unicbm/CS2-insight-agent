@@ -136,34 +136,6 @@ export default function CommonParamsModal({
             <p className="mb-3 text-[10px] leading-relaxed text-zinc-600">
               数值参数与录制队列侧栏「全局节奏设置」同源；恢复数值默认不影响下方入队默认开关与 POV 时序默认值。
             </p>
-
-            <label className="mb-3 block text-[10px] text-zinc-500">
-              结尾留白 (秒)
-              <div className="mt-1 flex items-center gap-2">
-                <input
-                  type="range"
-                  min={0}
-                  max={10}
-                  step={0.1}
-                  disabled={batchRecording}
-                  value={post}
-                  onChange={(e) => commitPacingNumbers({ post_last_sec: parseFloat(e.target.value) })}
-                  className="min-w-0 flex-1 accent-cs2-orange disabled:opacity-40"
-                />
-                <input
-                  type="number"
-                  step={0.1}
-                  min={0}
-                  disabled={batchRecording}
-                  value={post}
-                  onChange={(e) => {
-                    const n = parseFloat(e.target.value);
-                    if (Number.isFinite(n)) commitPacingNumbers({ post_last_sec: n });
-                  }}
-                  className="w-16 rounded border border-white/10 bg-black/40 px-1 py-0.5 font-mono text-[10px] text-zinc-200 disabled:opacity-40"
-                />
-              </div>
-            </label>
             <label className="mb-3 block text-[10px] text-zinc-500">
               开场预留 (秒)
               <div className="mt-1 flex items-center gap-2">
@@ -192,12 +164,39 @@ export default function CommonParamsModal({
               </div>
             </label>
             <label className="mb-3 block text-[10px] text-zinc-500">
+              结尾留白 (秒)
+              <div className="mt-1 flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0}
+                  max={10}
+                  step={0.1}
+                  disabled={batchRecording}
+                  value={post}
+                  onChange={(e) => commitPacingNumbers({ post_last_sec: parseFloat(e.target.value) })}
+                  className="min-w-0 flex-1 accent-cs2-orange disabled:opacity-40"
+                />
+                <input
+                  type="number"
+                  step={0.1}
+                  min={0}
+                  disabled={batchRecording}
+                  value={post}
+                  onChange={(e) => {
+                    const n = parseFloat(e.target.value);
+                    if (Number.isFinite(n)) commitPacingNumbers({ post_last_sec: n });
+                  }}
+                  className="w-16 rounded border border-white/10 bg-black/40 px-1 py-0.5 font-mono text-[10px] text-zinc-200 disabled:opacity-40"
+                />
+              </div>
+            </label>
+            <label className="mb-3 block text-[10px] text-zinc-500">
               防跳剪阈值 (秒)
               <div className="mt-1 flex items-center gap-2">
                 <input
                   type="range"
                   min={2}
-                  max={30}
+                  max={70}
                   step={0.5}
                   disabled={batchRecording}
                   value={gap}

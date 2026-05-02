@@ -123,7 +123,7 @@ function PacingMicroPanel({ item, expanded, onToggleExpand, updateItemPacing }) 
                   <input
                     type="range"
                     min={2}
-                    max={30}
+                    max={70}
                     step={0.5}
                     value={gap}
                     onChange={(e) => commit({ max_gap_sec: parseFloat(e.target.value) })}
