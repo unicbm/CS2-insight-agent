@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -244,6 +245,10 @@ def extract_radar_timeline_impl(
     from demoparser2 import DemoParser
 
     from app.demo_parser import _to_pandas_df
+    from app.parser.parse_utils import (
+        PLAYER_TEAM_PARSE_FIELDS,
+        coalesce_player_team_num,
+    )
 
     def _norm_sid(val: object) -> str:
         if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -290,8 +295,11 @@ def extract_radar_timeline_impl(
     pov_sid = _norm_sid(pov_steamid64)
     pov_name_key = (pov_player_name or "").strip().lower()
 
-    raw0 = parser.parse_ticks(["steamid", "name", "team_num", "is_alive"], ticks=[probe_ticks[0]])
-    df0 = _to_pandas_df(raw0)
+    raw0 = parser.parse_ticks(
+        ["steamid", "name", *PLAYER_TEAM_PARSE_FIELDS, "is_alive"],
+        ticks=[probe_ticks[0]],
+    )
+    df0 = coalesce_player_team_num(_to_pandas_df(raw0))
     pov_team: int | None = None
     pov_display_name = ""
     if not df0.empty and "team_num" in df0.columns:
@@ -362,7 +370,7 @@ def extract_radar_timeline_impl(
         "yaw",
         "name",
         "steamid",
-        "team_num",
+        *PLAYER_TEAM_PARSE_FIELDS,
         "is_alive",
         "health",
         "player_color",
@@ -378,12 +386,15 @@ def extract_radar_timeline_impl(
         except Exception:
             try:
                 raw = parser.parse_ticks(
-                    ["X", "Y", "Z", "yaw", "name", "steamid", "team_num", "is_alive", "player_color"],
+                    [
+                        "X", "Y", "Z", "yaw", "name", "steamid",
+                        *PLAYER_TEAM_PARSE_FIELDS, "is_alive", "player_color",
+                    ],
                     ticks=uniq,
                 )
             except Exception:
                 continue
-        pdf = _to_pandas_df(raw)
+        pdf = coalesce_player_team_num(_to_pandas_df(raw))
         if pdf.empty or "tick" not in pdf.columns:
             continue
         for tick_val, grp in pdf.groupby("tick", sort=False):
@@ -416,12 +427,18 @@ def extract_radar_timeline_impl(
                     hz = float(r.get("Z")) if "Z" in work.columns else 0.0
                 except (TypeError, ValueError):
                     continue
+                if not math.isfinite(hx) or not math.isfinite(hy):
+                    continue
+                if not math.isfinite(hz):
+                    hz = 0.0
                 yaw_v = 0.0
                 if "yaw" in work.columns:
                     try:
                         yaw_v = float(r.get("yaw") or 0.0)
                     except (TypeError, ValueError):
                         yaw_v = 0.0
+                if not math.isfinite(yaw_v):
+                    yaw_v = 0.0
                 alive = True
                 if "is_alive" in work.columns:
                     try:
