@@ -32,7 +32,7 @@ from typing import Any, Optional
 import pandas as pd
 from demoparser2 import DemoParser
 
-from .parse_utils import _to_pandas_df as _to_df
+from .parse_utils import _to_pandas_df as _to_df, safe_parse_events_batch
 from .tag_constants import (
     TICK_RATE,
     _KEQIAO_WEAPONS,
@@ -96,16 +96,27 @@ def _load_demo_tables(demo_path: str) -> dict:
 
         parser = DemoParser(demo_path)
         death_other = list(dict.fromkeys(["total_rounds_played"] + list(_PLAYER_DEATH_GAME_KEYS)))
-        try:
-            deaths = _to_df(parser.parse_event("player_death", other=death_other))
-        except Exception as e:
-            logger.warning("[kill_track] player_death parse failed: %s", e)
-            deaths = pd.DataFrame()
-        try:
-            hurts = _to_df(parser.parse_event("player_hurt"))
-        except Exception as e:
-            logger.warning("[kill_track] player_hurt parse failed (one_tap disabled): %s", e)
-            hurts = pd.DataFrame()
+        batch = safe_parse_events_batch(
+            parser,
+            ["player_death", "player_hurt"],
+            other=death_other,
+        )
+        deaths = batch["player_death"]
+        hurts = batch["player_hurt"]
+
+        # 兼容不支持 parse_events 的旧 demoparser2。正常比赛不可能两张事件表
+        # 同时为空，因此仅在批量接口完全不可用时才回退到两次独立扫描。
+        if deaths.empty and hurts.empty:
+            try:
+                deaths = _to_df(parser.parse_event("player_death", other=death_other))
+            except Exception as e:
+                logger.warning("[kill_track] player_death parse failed: %s", e)
+                deaths = pd.DataFrame()
+            try:
+                hurts = _to_df(parser.parse_event("player_hurt"))
+            except Exception as e:
+                logger.warning("[kill_track] player_hurt parse failed (one_tap disabled): %s", e)
+                hurts = pd.DataFrame()
 
         tables = {"deaths": deaths, "hurts": hurts}
         with _CACHE_LOCK:

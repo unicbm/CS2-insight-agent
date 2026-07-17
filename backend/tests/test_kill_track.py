@@ -1,6 +1,16 @@
 import pandas as pd
+import pytest
 
 from app.parser import kill_track
+
+
+@pytest.fixture(autouse=True)
+def _clear_kill_track_cache():
+    with kill_track._CACHE_LOCK:
+        kill_track._tables_cache.clear()
+    yield
+    with kill_track._CACHE_LOCK:
+        kill_track._tables_cache.clear()
 
 
 def _event_tables() -> dict[str, pd.DataFrame]:
@@ -49,6 +59,57 @@ def _event_tables() -> dict[str, pd.DataFrame]:
         [{"tick": 200, "attacker_name": "Hero", "user_name": "Rival"}]
     )
     return {"deaths": deaths, "hurts": hurts}
+
+
+def test_load_demo_tables_batches_death_and_hurt_events(monkeypatch):
+    calls: list[tuple] = []
+    expected = _event_tables()
+
+    class FakeParser:
+        def __init__(self, path):
+            calls.append(("init", path))
+
+        def parse_events(self, names, player, other):
+            calls.append(("parse_events", names, player, other))
+            return [("player_death", expected["deaths"]), ("player_hurt", expected["hurts"])]
+
+        def parse_event(self, *_args, **_kwargs):
+            raise AssertionError("批量解析成功时不应回退到 parse_event")
+
+    monkeypatch.setattr(kill_track, "DemoParser", FakeParser)
+    monkeypatch.setattr(kill_track, "_demo_cache_key", lambda _path: ("batch",))
+
+    tables = kill_track._load_demo_tables("match.dem")
+
+    assert tables["deaths"].equals(expected["deaths"])
+    assert tables["hurts"].equals(expected["hurts"])
+    assert [call[0] for call in calls] == ["init", "parse_events"]
+
+
+def test_load_demo_tables_falls_back_for_legacy_parser(monkeypatch):
+    calls: list[str] = []
+    expected = _event_tables()
+
+    class FakeParser:
+        def __init__(self, _path):
+            pass
+
+        def parse_events(self, _names, player, other):
+            calls.append("parse_events")
+            return []
+
+        def parse_event(self, name, **_kwargs):
+            calls.append(name)
+            return expected["deaths" if name == "player_death" else "hurts"]
+
+    monkeypatch.setattr(kill_track, "DemoParser", FakeParser)
+    monkeypatch.setattr(kill_track, "_demo_cache_key", lambda _path: ("legacy",))
+
+    tables = kill_track._load_demo_tables("match.dem")
+
+    assert tables["deaths"].equals(expected["deaths"])
+    assert tables["hurts"].equals(expected["hurts"])
+    assert calls == ["parse_events", "player_death", "player_hurt"]
 
 
 def test_extract_kill_track_maps_tags_and_multikill_banner(monkeypatch):
