@@ -7,7 +7,13 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.parser import analyzer as analyzer_module
-from app.parser.analyzer import DemoAnalyzer, _build_shared_player_indexes
+from app.parser.analyzer import (
+    DemoAnalyzer,
+    _ANALYSIS_EVENT_NAMES,
+    _build_shared_player_indexes,
+    _parse_analysis_event_batch,
+    _trim_analysis_union_fields,
+)
 from app.parser.parse_utils import _max_demo_tick
 from app.parser.player_roster import (
     build_player_name_to_steam_id,
@@ -24,6 +30,60 @@ from app.parser.spatial_analysis import (
 class _ParserMustNotRun:
     def __getattr__(self, name):
         raise AssertionError(f"unexpected native parser call: {name}")
+
+
+def test_analysis_events_use_one_master_batch():
+    class Parser:
+        def __init__(self):
+            self.calls = []
+
+        def parse_events(self, names, *, player, other):
+            self.calls.append((names, player, other))
+            return []
+
+    parser = Parser()
+
+    tables = _parse_analysis_event_batch(parser)
+
+    assert list(tables) == list(_ANALYSIS_EVENT_NAMES)
+    assert len(parser.calls) == 1
+    assert parser.calls[0][0] == list(_ANALYSIS_EVENT_NAMES)
+    assert "blind_duration" in parser.calls[0][2]
+    assert "X" in parser.calls[0][1]
+
+
+def test_master_batch_frames_restore_legacy_column_contracts():
+    hurt = pd.DataFrame([{
+        "tick": 100,
+        "dmg_health": 20,
+        "total_rounds_played": 2,
+        "attacker_X": 1.0,
+        "attacker_user_id": 7,
+    }])
+    death = pd.DataFrame([{
+        "tick": 120,
+        "total_rounds_played": 2,
+        "attacker_X": 1.0,
+        "attacker_user_id": 7,
+        "attacker_team_num": 2,
+        "attacker_last_place_name": "Mid",
+    }])
+    blind = pd.DataFrame([{
+        "tick": 140,
+        "blind_duration": 1.5,
+        "total_rounds_played": 2,
+        "user_X": 2.0,
+    }])
+
+    assert list(_trim_analysis_union_fields("player_hurt", hurt).columns) == [
+        "tick", "dmg_health",
+    ]
+    assert list(_trim_analysis_union_fields("player_death", death).columns) == [
+        "tick", "total_rounds_played", "attacker_X", "attacker_user_id",
+    ]
+    assert list(_trim_analysis_union_fields("player_blind", blind).columns) == [
+        "tick", "blind_duration",
+    ]
 
 
 def test_precomputed_frames_do_not_reparse_death_or_round_events():
@@ -187,6 +247,7 @@ def test_nonempty_but_unusable_precomputed_frames_retry_legacy_paths():
 def test_multi_player_analysis_builds_shared_facts_once(monkeypatch):
     empty = pd.DataFrame()
     shared_events = {
+        "match_start_tick": 1,
         "events": empty,
         "fire_df": empty,
         "hurt_df": empty,
@@ -231,8 +292,7 @@ def test_multi_player_analysis_builds_shared_facts_once(monkeypatch):
     fact_builds = []
     finish_facts = []
 
-    monkeypatch.setattr(analyzer_module, "_get_match_start_tick", lambda _parser: 1)
-    monkeypatch.setattr(analyzer, "_parse_shared_events", lambda _tick: shared_events)
+    monkeypatch.setattr(analyzer, "_parse_shared_events", lambda: shared_events)
 
     def fake_build_facts(**kwargs):
         fact_builds.append(kwargs)

@@ -66,6 +66,77 @@ from .spatial_analysis import count_shots_before
 
 logger = logging.getLogger(__name__)
 
+_ANALYSIS_EVENT_NAMES = (
+    "bomb_planted", "bomb_defused", "bomb_exploded", "bomb_begindefuse",
+    "item_equip", "item_pickup", "player_death", "weapon_fire", "player_hurt",
+    "hegrenade_detonate", "inferno_startburn", "molotov_detonate",
+    "smokegrenade_detonate", "flashbang_detonate",
+    "round_end", "round_freeze_end", "round_start", "round_announce_match_start",
+    "player_blind", "cs_win_panel_match",
+)
+_ANALYSIS_EVENT_PLAYER_FIELDS = (
+    "steamid", "X", "Y", "Z", "last_place_name", "name", "team_num", "user_id",
+)
+_ANALYSIS_EVENT_OTHER_FIELDS = tuple(dict.fromkeys(
+    [
+        "site", "total_rounds_played", *_PLAYER_DEATH_GAME_KEYS,
+        "winner", "reason", "blind_duration",
+    ]
+))
+
+_ANALYSIS_BOMB_EVENTS = frozenset({
+    "bomb_planted", "bomb_defused", "bomb_exploded", "bomb_begindefuse",
+})
+_ANALYSIS_EQUIP_EVENTS = frozenset({"item_equip", "item_pickup"})
+_ANALYSIS_ROUND_EVENTS = frozenset({
+    "round_end", "round_freeze_end", "round_start", "round_announce_match_start",
+})
+
+
+def _parse_analysis_event_batch(parser: DemoParser) -> dict[str, pd.DataFrame]:
+    return safe_parse_events_batch(
+        parser,
+        list(_ANALYSIS_EVENT_NAMES),
+        player=list(_ANALYSIS_EVENT_PLAYER_FIELDS),
+        other=list(_ANALYSIS_EVENT_OTHER_FIELDS),
+    )
+
+
+def _trim_analysis_union_fields(event_name: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Restore the per-event column contract after parsing with a field union."""
+    if df.empty:
+        return df
+
+    allowed_player_fields: set[str] = set()
+    allowed_other_fields: set[str] = set()
+    if event_name in _ANALYSIS_BOMB_EVENTS:
+        allowed_player_fields.update(("X", "Y", "Z", "last_place_name"))
+        allowed_other_fields.update(("site", "total_rounds_played"))
+    elif event_name in _ANALYSIS_EQUIP_EVENTS:
+        allowed_player_fields.add("team_num")
+        allowed_other_fields.add("total_rounds_played")
+    elif event_name == "player_death":
+        allowed_player_fields.update(("X", "Y", "Z", "user_id"))
+        allowed_other_fields.update(_EXTRA_EVENT_FIELDS)
+        allowed_other_fields.update(_PLAYER_DEATH_GAME_KEYS)
+    elif event_name in _ANALYSIS_ROUND_EVENTS:
+        allowed_other_fields.update((*_EXTRA_EVENT_FIELDS, "winner", "reason"))
+    elif event_name == "player_blind":
+        allowed_other_fields.add("blind_duration")
+
+    drop_columns: set[str] = set()
+    for field in ("X", "Y", "Z", "last_place_name", "team_num", "user_id"):
+        if field in allowed_player_fields:
+            continue
+        suffix = f"_{field}"
+        drop_columns.update(column for column in df.columns if column.endswith(suffix))
+    drop_columns.update(
+        field
+        for field in _ANALYSIS_EVENT_OTHER_FIELDS
+        if field not in allowed_other_fields and field in df.columns
+    )
+    return df.drop(columns=sorted(drop_columns), errors="ignore") if drop_columns else df
+
 
 @dataclass(slots=True)
 class SharedDemoFacts:
@@ -411,7 +482,7 @@ class DemoAnalyzer:
         except Exception:
             return pd.DataFrame()
 
-    def _parse_shared_events(self, match_start_tick: int) -> dict:
+    def _parse_shared_events(self, match_start_tick: Optional[int] = None) -> dict:
         """
         Parse all player-independent events once. Returns a dict with keys:
           events, fire_df, hurt_df, equip_df, pickup_df,
@@ -433,62 +504,84 @@ class DemoAnalyzer:
             "defuser", "defuser_name",
         )
 
-        # Bomb events batch
-        _bomb_batch = safe_parse_events_batch(
-            self.parser,
-            ["bomb_planted", "bomb_defused", "bomb_exploded", "bomb_begindefuse"],
-            other=["site", "total_rounds_played"],
-            player=["steamid", "X", "Y", "Z", "last_place_name"],
-        )
-        planted_df    = _filter_ms(_bomb_batch["bomb_planted"])
-        defused_df    = _filter_ms(_bomb_batch["bomb_defused"])
-        bomb_exploded = _filter_ms(_bomb_batch["bomb_exploded"])
-        begindefuse   = _filter_ms(_bomb_batch["bomb_begindefuse"])
-
-        # Equipment batch
-        _equip_batch = safe_parse_events_batch(
-            self.parser,
-            ["item_equip", "item_pickup"],
-            player=["steamid", "name", "team_num"],
-            other=["total_rounds_played"],
-        )
-        equip_df  = _filter_ms(_equip_batch["item_equip"])
-        pickup_df = _filter_ms(_equip_batch["item_pickup"])
-
-        # player_death (largest event) — player=["X","Y","Z"] 附带攻击者/受害者击杀瞬间坐标
+        # demoparser2 的主要成本是每次调用都要顺序扫描整个 demo。所有分析事件
+        # 使用字段并集一次取回；无关字段只会成为空列，不改变各事件的有效数据。
+        _event_batch = _parse_analysis_event_batch(self.parser)
         _death_other = list(dict.fromkeys(list(_EXTRA_EVENT_FIELDS) + list(_PLAYER_DEATH_GAME_KEYS)))
-        events = _filter_ms(_to_pandas_df(self.parser.parse_event(
-            "player_death", other=_death_other, player=["X", "Y", "Z", "user_id"],
-        )))
+        _master_batch_usable = any(not df.empty for df in _event_batch.values())
 
-        # weapon_fire + player_hurt — 合并为单次 demo 扫描
-        _fire_hurt_batch = safe_parse_events_batch(
-            self.parser,
-            ["weapon_fire", "player_hurt"],
-        )
-        fire_df = _filter_ms(_fire_hurt_batch["weapon_fire"])
-        hurt_df = _filter_ms(_fire_hurt_batch["player_hurt"])
+        if not _master_batch_usable:
+            # 兼容不支持大批次 parse_events 的旧 demoparser2：仅在主批次完全
+            # 不可用时恢复旧分组路径，不让兼容回退拖慢正常 demo。
+            logger.warning("Master analysis event batch unavailable; using legacy event scans")
+            _bomb_batch = safe_parse_events_batch(
+                self.parser,
+                ["bomb_planted", "bomb_defused", "bomb_exploded", "bomb_begindefuse"],
+                other=["site", "total_rounds_played"],
+                player=["steamid", "X", "Y", "Z", "last_place_name"],
+            )
+            _equip_batch = safe_parse_events_batch(
+                self.parser,
+                ["item_equip", "item_pickup"],
+                player=["steamid", "name", "team_num"],
+                other=["total_rounds_played"],
+            )
+            events_raw = _to_pandas_df(self.parser.parse_event(
+                "player_death", other=_death_other, player=["X", "Y", "Z", "user_id"],
+            ))
+            _fire_hurt_batch = safe_parse_events_batch(
+                self.parser, ["weapon_fire", "player_hurt"],
+            )
+            nade_batch = safe_parse_events_batch(
+                self.parser,
+                [
+                    "hegrenade_detonate", "inferno_startburn", "molotov_detonate",
+                    "smokegrenade_detonate", "flashbang_detonate",
+                ],
+            )
+            _round_batch = safe_parse_events_batch(
+                self.parser,
+                ["round_end", "round_freeze_end", "round_start", "round_announce_match_start"],
+                other=list(_EXTRA_EVENT_FIELDS) + ["winner", "reason"],
+            )
+            blind_raw = _to_pandas_df(
+                self.parser.parse_event("player_blind", other=["blind_duration"])
+            )
+            win_panel_raw = self._safe_parse_event("cs_win_panel_match")
+        else:
+            _event_batch = {
+                name: _trim_analysis_union_fields(name, frame)
+                for name, frame in _event_batch.items()
+            }
+            _bomb_batch = _event_batch
+            _equip_batch = _event_batch
+            events_raw = _event_batch["player_death"]
+            _fire_hurt_batch = _event_batch
+            nade_batch = {
+                name: _event_batch[name]
+                for name in (
+                    "hegrenade_detonate", "inferno_startburn", "molotov_detonate",
+                    "smokegrenade_detonate", "flashbang_detonate",
+                )
+            }
+            _round_batch = _event_batch
+            blind_raw = _event_batch["player_blind"]
+            win_panel_raw = _event_batch["cs_win_panel_match"]
 
-        # Grenade batch
-        nade_batch = safe_parse_events_batch(
-            self.parser,
-            [
-                "hegrenade_detonate", "inferno_startburn", "molotov_detonate",
-                "smokegrenade_detonate", "flashbang_detonate",
-            ],
-        )
-        nade_batch = {k: _filter_ms(v) for k, v in nade_batch.items()}
+        re_df          = _round_batch["round_end"]
+        freeze_end_df  = _round_batch["round_freeze_end"]
+        round_start_df = _round_batch["round_start"]
+        match_start_df = _round_batch["round_announce_match_start"]
 
-        # round 边界事件合批（4 个事件一次 demo 扫描）
-        _round_batch = safe_parse_events_batch(
-            self.parser,
-            ["round_end", "round_freeze_end", "round_start", "round_announce_match_start"],
-            other=list(_EXTRA_EVENT_FIELDS) + ["winner", "reason"],
-        )
-        re_df           = _round_batch["round_end"]
-        freeze_end_df   = _round_batch["round_freeze_end"]
-        round_start_df  = _round_batch["round_start"]
-        match_start_df  = _round_batch["round_announce_match_start"]
+        if match_start_df.empty and match_start_tick is None:
+            match_start_df = self._safe_parse_event("round_announce_match_start")
+        if match_start_tick is None:
+            match_start_tick = (
+                _get_match_start_tick(self.parser, precomputed_df=match_start_df)
+                if not match_start_df.empty
+                else 0
+            )
+        match_start_tick = int(match_start_tick)
 
         # A failed batch parse is represented as empty frames. Empty critical
         # round data is not authoritative: retry the legacy single-event paths
@@ -509,15 +602,23 @@ class DemoAnalyzer:
         if match_start_df.empty:
             match_start_df = self._safe_parse_event("round_announce_match_start")
 
+        planted_df    = _filter_ms(_bomb_batch["bomb_planted"])
+        defused_df    = _filter_ms(_bomb_batch["bomb_defused"])
+        bomb_exploded = _filter_ms(_bomb_batch["bomb_exploded"])
+        begindefuse   = _filter_ms(_bomb_batch["bomb_begindefuse"])
+        equip_df      = _filter_ms(_equip_batch["item_equip"])
+        pickup_df     = _filter_ms(_equip_batch["item_pickup"])
+        events        = _filter_ms(events_raw)
+        fire_df       = _filter_ms(_fire_hurt_batch["weapon_fire"])
+        hurt_df       = _filter_ms(_fire_hurt_batch["player_hurt"])
+        nade_batch    = {k: _filter_ms(v) for k, v in nade_batch.items()}
+
         if match_start_tick > 0 and not re_df.empty and "tick" in re_df.columns:
             re_df = re_df.loc[
                 pd.to_numeric(re_df["tick"], errors="coerce").fillna(0).astype(int) >= match_start_tick
             ].copy()
 
-        # player_blind — 单独解析以确保 blind_duration 字段可用（与其他事件混批时该字段会丢失）
-        blind_df = _filter_ms(_to_pandas_df(
-            self.parser.parse_event("player_blind", other=["blind_duration"])
-        ))
+        blind_df = _filter_ms(blind_raw)
         if not blind_df.empty and "user_name" in blind_df.columns:
             blind_df["user_name"] = blind_df["user_name"].astype(str).str.strip()
 
@@ -570,7 +671,7 @@ class DemoAnalyzer:
 
         # cs_win_panel_match — 比赛结算界面出现的 tick（全场一次；仅终局回合有意义）
         win_panel_match_tick = 0
-        _wp_df = self._safe_parse_event("cs_win_panel_match")
+        _wp_df = win_panel_raw
         if _wp_df is not None and not _wp_df.empty and "tick" in _wp_df.columns:
             _wp_ticks = pd.to_numeric(_wp_df["tick"], errors="coerce").dropna().astype(int)
             if match_start_tick > 0:
@@ -580,6 +681,7 @@ class DemoAnalyzer:
         logger.info("[win_panel] cs_win_panel_match tick=%s", win_panel_match_tick)
 
         return {
+            "match_start_tick":               match_start_tick,
             "events":                        events,
             "fire_df":                       fire_df,
             "hurt_df":                       hurt_df,
@@ -823,10 +925,9 @@ class DemoAnalyzer:
         except Exception:
             header = {}
         map_name = str(header.get("map_name") or "unknown")
-        match_start_tick = _get_match_start_tick(self.parser)
-
-        # Phase 1: Parse all shared events ONCE
-        _shared = self._parse_shared_events(match_start_tick)
+        # Phase 1: Parse all shared events ONCE, including the match-start marker.
+        _shared = self._parse_shared_events()
+        match_start_tick = int(_shared["match_start_tick"])
         shared_facts = self._build_shared_demo_facts(
             match_start_tick=match_start_tick,
             header=header,
