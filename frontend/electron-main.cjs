@@ -600,11 +600,17 @@ ipcMain.handle('get-version', () => {
 ipcMain.handle('show-open-dialog', async (event, options) => {
   if (!mainWindow) return { canceled: true, filePaths: [] };
   try {
+    const requestedProperties = Array.isArray(options?.properties) ? options.properties : [];
+    const allowedProperties = new Set(['openFile', 'openDirectory', 'multiSelections', 'showHiddenFiles']);
+    const properties = requestedProperties.filter((property) => allowedProperties.has(property));
+    if (!properties.includes('openFile') && !properties.includes('openDirectory')) {
+      properties.unshift('openFile');
+    }
     const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ['openFile'],
-      filters: options.filters || [{ name: 'Executable Files', extensions: ['exe'] }],
-      defaultPath: options.defaultPath || '',
-      title: options.title || '选择文件',
+      properties,
+      filters: options?.filters || [{ name: 'Executable Files', extensions: ['exe'] }],
+      defaultPath: options?.defaultPath || '',
+      title: options?.title || '选择文件',
     });
     return result;
   } catch (e) {

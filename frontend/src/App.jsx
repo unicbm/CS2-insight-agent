@@ -205,8 +205,9 @@ export default function App() {
   const [expectedParsePlayersText, setExpectedParsePlayersText] = useState("");
   const [demoLibraryItems, setDemoLibraryItems] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
-  /** 仅「扫描本地 demo 库」进行中；不在顶部 ProgressBar 展示，由按钮内 spinner 表示 */
+  /** 「扫描本地 demo 库」进行中；工具栏显示秒数，底部 ProgressBar 显示当前扫描阶段。 */
   const [libraryScanning, setLibraryScanning] = useState(false);
+  const [libraryScanElapsedSeconds, setLibraryScanElapsedSeconds] = useState(0);
   const [libraryLoadingOverlay, setLibraryLoadingOverlay] = useState(false);
   const [libraryLoadingText, setLibraryLoadingText] = useState("");
   const [libraryPage, setLibraryPage] = useState(1);
@@ -572,20 +573,58 @@ export default function App() {
   }, [libraryJumpDraft, libraryTotalPages, refreshDemoLibrary, t]);
 
   const handleScanDemos = useCallback(async () => {
+    const startedAt = Date.now();
+    const pathCount = demoWatchPaths.length;
     setLibraryScanning(true);
+    setLibraryScanElapsedSeconds(0);
+    setProgressText(t("app.scanProgress", { paths: pathCount, seconds: 0 }), { loading: true });
+    const elapsedTimer = window.setInterval(() => {
+      const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      setLibraryScanElapsedSeconds(seconds);
+      setProgressText(t("app.scanProgress", { paths: pathCount, seconds }), { loading: true });
+    }, 1000);
     try {
       const { data } = await API.post("/demos/scan");
       await refreshDemoLibrary(libraryPage, { manageLoading: false });
-      const n = data?.discovered_count;
-      if (typeof n === "number" && n > 0) {
-        setProgressText(t("app.scanDone", { n }));
-      }
+      const scanned = Number(data?.scanned) || 0;
+      const demosFound = Number(data?.demos_found) || 0;
+      const archivesFound = Number(data?.archives_found) || 0;
+      const newDemos = Number(data?.new_demos) || 0;
+      const skippedKnown = Number(data?.skipped_known) || 0;
+      const skippedDuplicate = Number(data?.skipped_duplicate) || 0;
+      const discoveredCount = Number(data?.discovered_count) || 0;
+      const errorCount = Array.isArray(data?.errors)
+        ? data.errors.length
+        : Math.max(0, Number(data?.errors) || 0);
+      const elapsedMs = Number(data?.elapsed_ms);
+      const elapsedSeconds = Number.isFinite(elapsedMs)
+        ? Math.max(0, elapsedMs / 1000).toFixed(1)
+        : Math.max(0, (Date.now() - startedAt) / 1000).toFixed(1);
+      setLibraryScanElapsedSeconds(Math.max(0, Math.round(Number(elapsedSeconds))));
+      const key = errorCount > 0 ? "app.scanDoneWithErrors" : "app.scanDoneDetailed";
+      setProgressText(
+        t(key, {
+          scanned,
+          demos: demosFound,
+          archives: archivesFound,
+          newDemos,
+          skipped: skippedKnown,
+          duplicates: skippedDuplicate,
+          pending: discoveredCount,
+          errors: errorCount,
+          seconds: elapsedSeconds,
+        }),
+        errorCount > 0 ? { isError: true } : { autoDismissMs: 7000 },
+      );
+      return data;
     } catch (e) {
       setProgressText(t("app.scanFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
+      return null;
     } finally {
+      window.clearInterval(elapsedTimer);
       setLibraryScanning(false);
     }
-  }, [refreshDemoLibrary, libraryPage, t]);
+  }, [demoWatchPaths.length, refreshDemoLibrary, libraryPage, t]);
 
   const handleDeleteDemo = useCallback(
     async (id, rescan) => {
@@ -2050,10 +2089,15 @@ export default function App() {
   const handleSaveConfig = useCallback(async (config) => {
     try {
       await API.put("config", config);
-    } catch {
-      // silent
+      return { ok: true };
+    } catch (error) {
+      const detail = error?.response?.data?.detail;
+      return {
+        ok: false,
+        error: typeof detail === "string" ? detail : error?.message || t("common.requestFail"),
+      };
     }
-  }, []);
+  }, [t]);
 
   const handleSaveExpectedParsePlayers = useCallback(async () => {
     const arr = expectedParsePlayersText
@@ -2694,6 +2738,7 @@ export default function App() {
     handleScanDemos,
     libraryLoading,
     libraryScanning,
+    libraryScanElapsedSeconds,
     expectedParsePlayersText,
     setExpectedParsePlayersText,
     handleSaveExpectedParsePlayers,
@@ -2901,7 +2946,7 @@ export default function App() {
                 onAbortBatch={
                   recordingAbortRequested ? undefined : handleAbortBatchRecording
                 }
-                dismissible={Boolean(progressText?.trim())}
+                dismissible={Boolean(progressText?.trim()) && !libraryScanning}
                 onDismiss={() => setProgressText("")}
                 autoDismissAfterMs={progressToastMeta?.autoDismissMs ?? undefined}
                 showQueueNavigate={Boolean(progressToastMeta?.queueLink)}

@@ -417,3 +417,133 @@ def test_batch_detail_isolates_corrupt_result_json(tmp_path: Path):
         assert "损坏的解析结果" in rows[0]["result_error"]
 
     _run(scenario())
+
+
+def test_purge_deleted_demo_files_is_limited_to_scanned_roots(tmp_path: Path):
+    async def scenario():
+        db = DemoDB(tmp_path / "purge-scope.sqlite3")
+        await db.init_db()
+        scanned_root = tmp_path / "scanned"
+        other_root = tmp_path / "other"
+        scanned_root.mkdir()
+        other_root.mkdir()
+
+        missing_path = str(scanned_root / "missing.dem")
+        existing_path = str(scanned_root / "existing.dem")
+        too_deep_path = str(scanned_root / "child" / "grandchild" / "outside-scan.dem")
+        outside_path = str(other_root / "outside.dem")
+        missing_id, _ = await db.add_demo(missing_path, status="loaded")
+        existing_id, _ = await db.add_demo(existing_path, status="loaded")
+        too_deep_id, _ = await db.add_demo(too_deep_path, status="loaded")
+        outside_id, _ = await db.add_demo(outside_path, status="loaded")
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            for demo_id, demo_path in ((missing_id, missing_path), (outside_id, outside_path)):
+                await conn.execute(
+                    "INSERT INTO match_results(demo_path, result_json, created_at) VALUES (?, '{}', ?)",
+                    (demo_path, "2026-07-17T00:00:00Z"),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO demo_result_summaries(
+                        demo_path, clip_count, analyzed_targets_json,
+                        result_created_at, summary_version
+                    ) VALUES (?, 0, '[]', ?, 1)
+                    """,
+                    (demo_path, "2026-07-17T00:00:00Z"),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO demo_timeline_events(
+                        demo_path, target_player, event_id, round_number, tick,
+                        record_type, tags_json, event_json, created_at
+                    ) VALUES (?, 'player', 'event-1', 1, 1, 'kill', '[]', '{}', ?)
+                    """,
+                    (demo_path, "2026-07-17T00:00:00Z"),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO demo_roster_cache(
+                        demo_id, demo_path, cache_version, state, row_count, updated_at
+                    ) VALUES (?, ?, 1, 'ready', 1, ?)
+                    """,
+                    (demo_id, demo_path, "2026-07-17T00:00:00Z"),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO demo_player_stats(demo_id, demo_path, player_name, indexed_at)
+                    VALUES (?, ?, 'player', ?)
+                    """,
+                    (demo_id, demo_path, "2026-07-17T00:00:00Z"),
+                )
+            await conn.commit()
+
+        removed = await db.purge_deleted_demo_files({existing_path}, [scanned_root])
+
+        assert removed == 1
+        assert await db.get_demo_by_id(missing_id) is None
+        assert await db.get_demo_by_id(existing_id) is not None
+        assert await db.get_demo_by_id(too_deep_id) is not None
+        assert await db.get_demo_by_id(outside_id) is not None
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            for table in (
+                "match_results",
+                "demo_result_summaries",
+                "demo_timeline_events",
+                "demo_roster_cache",
+                "demo_player_stats",
+            ):
+                missing_count = (
+                    await (
+                        await conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE demo_path = ?",
+                            (missing_path,),
+                        )
+                    ).fetchone()
+                )[0]
+                outside_count = (
+                    await (
+                        await conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE demo_path = ?",
+                            (outside_path,),
+                        )
+                    ).fetchone()
+                )[0]
+                assert missing_count == 0
+                assert outside_count == 1
+
+    _run(scenario())
+
+
+def test_discovered_dedupe_uses_case_insensitive_indexes(tmp_path: Path):
+    async def scenario():
+        db = DemoDB(tmp_path / "discovered-index.sqlite3")
+        await db.init_db()
+        loaded_id, _ = await db.add_demo(
+            str(tmp_path / "library" / "MATCH.DEM"),
+            status="loaded",
+        )
+        pending_id, _ = await db.add_demo(
+            str(tmp_path / "incoming" / "match.dem"),
+            status="pending",
+        )
+        unique_id, _ = await db.add_demo(
+            str(tmp_path / "incoming" / "unique.dem"),
+            status="pending",
+        )
+
+        rows = await db.list_discovered_demos(limit=100)
+        assert [row["id"] for row in rows] == [unique_id]
+        assert loaded_id != pending_id
+
+        with sqlite3.connect(db.db_path) as conn:
+            indexes = {
+                str(row[1])
+                for row in conn.execute("PRAGMA index_list(demo_files)").fetchall()
+            }
+        assert "idx_demo_files_status_id" in indexes
+        assert "idx_demo_files_path_nocase" in indexes
+        assert "idx_demo_files_filename_nocase" in indexes
+
+    _run(scenario())

@@ -7,6 +7,7 @@ export default function DemoLibraryToolbar({
   onOpenIngest,
   libraryLoading,
   libraryScanning,
+  libraryScanElapsedSeconds = 0,
   pageSelectableCount,
   libraryTotal,
   onSelectPage,
@@ -64,7 +65,7 @@ export default function DemoLibraryToolbar({
           {libraryScanning ? (
             <>
               <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-cs2-accent" aria-hidden />
-              <span>{t("library.btnScanning")}</span>
+              <span>{t("library.btnScanningElapsed", { seconds: libraryScanElapsedSeconds })}</span>
             </>
           ) : (
             t("library.btnScan")

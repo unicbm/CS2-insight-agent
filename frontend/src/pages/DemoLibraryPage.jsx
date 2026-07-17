@@ -71,8 +71,12 @@ export default function DemoLibraryPage() {
   }, [addToQueue]);
 
   const handleBatchIngest = useCallback(async (ids) => {
-    await API.post("/demos/batch-ingest", { demo_ids: ids });
-    void s.refreshDemoLibrary(s.libraryPage, { manageLoading: false });
+    const { data } = await API.post("/demos/batch-ingest", { demo_ids: ids });
+    return data;
+  }, []);
+
+  const handleBatchIngestComplete = useCallback(async () => {
+    await s.refreshDemoLibrary(s.libraryPage, { manageLoading: false });
   }, [s]);
 
   const handleUpdateRemark = useCallback(async (demoId, remark) => {
@@ -256,6 +260,7 @@ export default function DemoLibraryPage() {
         onOpenIngest={() => setIngestModalOpen(true)}
         libraryLoading={s.libraryLoading}
         libraryScanning={s.libraryScanning}
+        libraryScanElapsedSeconds={s.libraryScanElapsedSeconds}
         pageSelectableCount={filteredRows.length}
         libraryTotal={s.libraryTotal}
         onSelectPage={handleSelectVisiblePage}
@@ -530,6 +535,7 @@ export default function DemoLibraryPage() {
         isOpen={ingestModalOpen}
         onClose={() => setIngestModalOpen(false)}
         onIngest={handleBatchIngest}
+        onIngestComplete={handleBatchIngestComplete}
         onUpload={s.handleUpload}
       />
     </PageContainer>

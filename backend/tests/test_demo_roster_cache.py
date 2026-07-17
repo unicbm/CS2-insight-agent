@@ -580,3 +580,58 @@ def test_batch_ingest_bounds_inspection_concurrency_and_reuses_rosters(
         for call in index_stats.await_args_list
     ] == ["match-1", "match-2", "match-3"]
     notify.assert_awaited_once_with("enqueue")
+
+
+def test_enqueue_known_demo_skips_full_file_hash(monkeypatch, tmp_path):
+    demo_path = tmp_path / "known.dem"
+    demo_path.write_bytes(b"large-demo-placeholder")
+
+    monkeypatch.setattr(main.demo_db, "is_path_scan_blocked", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        main.demo_db,
+        "get_demo_by_path",
+        AsyncMock(return_value={"id": 7, "path": str(demo_path.resolve())}),
+    )
+
+    def hash_must_not_run(_path):
+        raise AssertionError("known paths must be skipped before full-file MD5")
+
+    monkeypatch.setattr(main, "file_md5_hex", hash_must_not_run)
+
+    inserted = asyncio.run(main._enqueue_demo_path(demo_path))
+
+    assert inserted is False
+
+
+def test_enqueue_duplicate_content_records_path_and_repeat_skips_hash(monkeypatch, tmp_path):
+    async def scenario():
+        db = DemoDB(tmp_path / "duplicate-path.sqlite3")
+        await db.init_db()
+        original = tmp_path / "original.dem"
+        duplicate = tmp_path / "copy.dem"
+        original.write_bytes(b"same-demo-content")
+        duplicate.write_bytes(b"same-demo-content")
+        content_md5 = main.file_md5_hex(original)
+        await db.add_demo(
+            str(original.resolve()),
+            status="loaded",
+            content_md5=content_md5,
+        )
+
+        monkeypatch.setattr(main, "demo_db", db)
+        notify = AsyncMock()
+        monkeypatch.setattr(main, "demo_library_hub", SimpleNamespace(notify=notify))
+
+        first = await main._enqueue_demo_path(duplicate)
+        assert first == "duplicate"
+        assert await db.get_demo_by_path(str(duplicate.resolve())) is not None
+        notify.assert_not_awaited()
+
+        def hash_must_not_run(_path):
+            raise AssertionError("recorded duplicate paths must skip MD5 on repeat scans")
+
+        monkeypatch.setattr(main, "file_md5_hex", hash_must_not_run)
+        second = await main._enqueue_demo_path(duplicate)
+        assert second is False
+
+    asyncio.run(scenario())

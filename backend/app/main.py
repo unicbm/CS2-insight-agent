@@ -121,6 +121,7 @@ _DEMO_ROSTER_CACHE_VERSION = 1
 # 同一路径并发入库（扫描 + watchdog 双触发等）时，避免重复写库 / 双开自动解析任务
 _enqueue_striped_locks: list[asyncio.Lock] = []
 _enqueue_striped_init_lock = asyncio.Lock()
+_enqueue_content_lock = asyncio.Lock()
 _ENQUEUE_STRIPE_COUNT = 64
 
 
@@ -175,7 +176,16 @@ def infer_demo_source(filename: str, server_name: str | None = None) -> str:
     return "Local/Other"
 
 
-async def _enqueue_demo_path(path: Path, origin_zip: str | None = None) -> None:
+async def _enqueue_demo_path(
+    path: Path,
+    origin_zip: str | None = None,
+) -> bool | Literal["duplicate"]:
+    """Stage one discovered Demo without parsing it into the main library.
+
+    Path lookup is intentionally before full-file MD5.  Repeat scans therefore
+    stay index-only instead of rereading hundreds of megabytes per known Demo.
+    Expensive match/roster inspection remains in the explicit ingest step.
+    """
     global _enqueue_striped_locks
     can_store_md5 = demo_db.ingest_md5_supported
     use_md5 = can_store_md5 and _demo_ingest_md5_enabled()
@@ -185,9 +195,11 @@ async def _enqueue_demo_path(path: Path, origin_zip: str | None = None) -> None:
     demo_path = str(path.resolve())
     if await demo_db.is_path_scan_blocked(demo_path):
         logger.debug("Skip enqueue (scan blocklist): %s", demo_path)
-        return
+        return False
     stripe = (hash(demo_path) & 0x7FFFFFFF) % _ENQUEUE_STRIPE_COUNT
     async with _enqueue_striped_locks[stripe]:
+        if await demo_db.get_demo_by_path(demo_path) is not None:
+            return False
         size: int | None = None
         mtime_iso: str | None = None
         try:
@@ -206,39 +218,33 @@ async def _enqueue_demo_path(path: Path, origin_zip: str | None = None) -> None:
                 md5_hex = await asyncio.to_thread(file_md5_hex, path)
             except OSError as e:
                 logger.warning("Demo file md5 failed, continue without md5 dedupe: %s (%s)", demo_path, e)
-            if md5_hex and await demo_db.content_md5_exists(md5_hex):
-                logger.info("Skip enqueue duplicate demo content (md5): %s", demo_path)
-                return
+        async def add_staged_path() -> tuple[int, bool]:
+            return await demo_db.add_demo(
+                demo_path,
+                file_size=size,
+                source=source,
+                status="pending",
+                added_at=mtime_iso,
+                content_md5=md5_hex if use_md5 else None,
+                origin_zip=origin_zip if use_md5 else None,
+            )
 
-        _, inserted = await demo_db.add_demo(
-            demo_path,
-            file_size=size,
-            source=source,
-            status="pending",
-            added_at=mtime_iso,
-            content_md5=md5_hex if use_md5 else None,
-            origin_zip=origin_zip if use_md5 else None,
-        )
+        if md5_hex:
+            # Hashing remains concurrent; serialize only the tiny check+insert
+            # section so two same-content paths discovered together cannot both
+            # become visible pending rows.
+            async with _enqueue_content_lock:
+                if await demo_db.content_md5_exists(md5_hex):
+                    _, recorded = await add_staged_path()
+                    if recorded:
+                        logger.info("Recorded duplicate demo path (md5): %s", demo_path)
+                        return "duplicate"
+                    return False
+                _, inserted = await add_staged_path()
+        else:
+            _, inserted = await add_staged_path()
         if not inserted:
-            if can_store_md5:
-                try:
-                    fill = await asyncio.to_thread(file_md5_hex, path)
-                    await demo_db.update_demo_content_md5_if_absent(demo_path, fill, origin_zip)
-                except OSError:
-                    pass
-            return
-
-        # 轻量解析：只提取地图与记分板元数据，避免重量级玩家片段解析。
-        try:
-            from .demo_parse_isolation import get_demo_match_summary_isolated
-
-            meta = await asyncio.to_thread(get_demo_match_summary_isolated, demo_path)
-            if isinstance(meta, dict):
-                refined_source = infer_demo_source(path.name, server_name=meta.get("server_name"))
-                await demo_db.update_lightweight_meta(demo_path, meta, source=refined_source)
-        except Exception:
-            logger.exception("Lightweight meta parse failed for %s", demo_path)
-        await demo_db.update_status(demo_path, "pending", error_msg=None, parsed_at=None)
+            return False
         if can_store_md5:
             try:
                 fill = md5_hex if md5_hex else await asyncio.to_thread(file_md5_hex, path)
@@ -246,6 +252,7 @@ async def _enqueue_demo_path(path: Path, origin_zip: str | None = None) -> None:
             except OSError:
                 pass
     await demo_library_hub.notify("enqueue")
+    return True
 
 
 @asynccontextmanager
@@ -254,11 +261,11 @@ async def lifespan(_: FastAPI):
     仅初始化 DB 与 DemoWatcher 实例（不启动 watchdog Observer，也不做启动时扫描）。
 
     **为什么不再自动扫描**：watchdog Observer 会在目录出现新 .dem 时立刻触发
-    ``_enqueue_demo_path``，其中包含 ``get_demo_match_summary`` 的轻量解析。录制期我们会
+    入库发现。录制期我们会
     ``shutil.copy2`` 一个 ``_insight_<uuid>.dem`` 到 CS2 的 ``csgo/``；若用户的监听目录与
-    ``csgo/`` 有重叠（常见：就是把 CS2 的 replay 目录作为监听目录），**每次录制都会在后台触发
-    入库与轻量读盘**（记分板元数据等），仍可能与录制争用磁盘；历史上还曾叠加「名单自动深度解析」
-    加重负载，故默认不在启动时全量扫描。
+    ``csgo/`` 有重叠（常见：就是把 CS2 的 replay 目录作为扫描目录），自动发现仍会把
+    应用自己生成的临时录像加入待入库；历史上还曾叠加自动解析并与录制争用磁盘，故默认
+    不在启动时启用目录 Observer，也不做全量扫描。
     保留 ``DemoWatcher`` 实例只是为 ``POST /api/demos/scan`` 这一条手动扫描接口
     服务；页面上改为用户点"刷新"按钮时主动扫描。
     """
@@ -2195,7 +2202,7 @@ async def download_match_demo(body: MatchHistoryDownloadBody):
     cfg = load_config()
     watch_paths = [p for p in cfg.demo_watch_paths if p.strip()]
     if not watch_paths:
-        raise HTTPException(400, "未配置 Demo 库监听目录，请先在「Demo 库」设置监听路径")
+        raise HTTPException(400, "未配置 Demo 扫描目录，请先在「Demo 库」设置扫描路径")
 
     dest_dir = Path(watch_paths[0])
     filename = body.filename if body.filename.endswith(".dem") else body.filename + ".dem"
@@ -2408,15 +2415,33 @@ async def patch_demo_display_name(demo_id: int, body: DemoDisplayNamePatch):
 @app.post("/api/demos/scan")
 async def scan_watch_paths():
     if demo_watcher is None:
-        return {"scanned": 0, "player_stats_index": None, "discovered_count": 0}
-    scanned = await demo_watcher.scan_existing()
-    logger.info("POST /api/demos/scan: scan_existing finished scanned=%s", scanned)
+        return {
+            "scanned": 0,
+            "roots_scanned": 0,
+            "directories_scanned": 0,
+            "demos_found": 0,
+            "archives_found": 0,
+            "new_demos": 0,
+            "skipped_known": 0,
+            "skipped_duplicate": 0,
+            "purged_missing": 0,
+            "errors": 0,
+            "elapsed_ms": 0,
+            "player_stats_index": None,
+            "discovered_count": 0,
+        }
+    report = await demo_watcher.scan_existing()
+    logger.info("POST /api/demos/scan: scan_existing finished report=%s", report)
     try:
         discovered_count = await demo_db.count_discovered_demos()
     except Exception:
         logger.exception("count discovered demos after scan failed")
         discovered_count = 0
-    return {"scanned": scanned, "player_stats_index": None, "discovered_count": discovered_count}
+    return {
+        **report,
+        "player_stats_index": None,
+        "discovered_count": discovered_count,
+    }
 
 
 @app.post("/api/demos/{demo_id}/parse")

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Iterable, Literal, Optional
 
 import aiosqlite
 
@@ -282,6 +283,15 @@ class DemoDB:
             await self._backfill_result_summaries(conn)
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_demo_files_content_md5 ON demo_files(content_md5)",
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_demo_files_status_id ON demo_files(status, id)",
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_demo_files_path_nocase ON demo_files(path COLLATE NOCASE)",
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_demo_files_filename_nocase ON demo_files(filename COLLATE NOCASE)",
             )
             cur_z = await conn.execute("PRAGMA table_info(zip_extract_state)")
             zcols = {str(r[1]) for r in await cur_z.fetchall()}
@@ -1531,6 +1541,19 @@ class DemoDB:
                 return None
             return dict(row)
 
+    async def load_scan_path_index(self) -> tuple[set[str], set[str]]:
+        """Load known and blocked paths once per filesystem scan.
+
+        This keeps repeat scans on SQLite's compact path index instead of
+        reopening the database and re-hashing every large Demo file.
+        """
+        async with aiosqlite.connect(self.db_path) as conn:
+            known_cur = await conn.execute("SELECT path FROM demo_files")
+            blocked_cur = await conn.execute("SELECT path FROM demo_scan_blocklist")
+            known = {str(row[0]) for row in await known_cur.fetchall() if row and row[0]}
+            blocked = {str(row[0]) for row in await blocked_cur.fetchall() if row and row[0]}
+        return known, blocked
+
     async def is_path_scan_blocked(self, path: str) -> bool:
         async with aiosqlite.connect(self.db_path) as conn:
             cur = await conn.execute(
@@ -1593,31 +1616,30 @@ class DemoDB:
             return cur.rowcount > 0
 
     @staticmethod
-    def _discovered_duplicate_match_sql(left_alias: str, right_alias: str) -> str:
-        la, ra = left_alias, right_alias
-        return f"""(
-            lower({la}.path) = lower({ra}.path)
-            OR lower({la}.filename) = lower({ra}.filename)
-            OR (
-                {la}.content_md5 IS NOT NULL AND trim({la}.content_md5) != ''
-                AND {ra}.content_md5 IS NOT NULL AND trim({ra}.content_md5) != ''
-                AND {la}.content_md5 = {ra}.content_md5
-            )
-        )"""
-
-    @staticmethod
     def _discovered_not_already_in_library_sql(alias: str = "d") -> str:
         """待入库列表去重：排除主库已有 demo，以及与其它 pending 重复的条目（保留 id 最小的一条）。"""
         a = alias
-        dup = DemoDB._discovered_duplicate_match_sql(a, "ing")
         return f"""
         AND NOT EXISTS (
             SELECT 1 FROM demo_files ing
             WHERE ing.id != {a}.id
-            AND {dup}
-            AND (
-                ing.status != 'pending'
-                OR ing.id < {a}.id
+            AND (ing.status != 'pending' OR ing.id < {a}.id)
+            AND ing.path = {a}.path COLLATE NOCASE
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM demo_files ing
+            WHERE ing.id != {a}.id
+            AND (ing.status != 'pending' OR ing.id < {a}.id)
+            AND ing.filename = {a}.filename COLLATE NOCASE
+        )
+        AND (
+            {a}.content_md5 IS NULL
+            OR trim({a}.content_md5) = ''
+            OR NOT EXISTS (
+                SELECT 1 FROM demo_files ing
+                WHERE ing.id != {a}.id
+                AND (ing.status != 'pending' OR ing.id < {a}.id)
+                AND ing.content_md5 = {a}.content_md5
             )
         )
         """
@@ -1659,28 +1681,75 @@ class DemoDB:
             row = await cur.fetchone()
             return int(row[0]) if row else 0
 
-    async def purge_deleted_demo_files(self, existing_paths: set[str]) -> int:
-        """删除 `demo_files` 中 ``path`` 不在 ``existing_paths`` 里的记录（物理文件已被手动删除）。
+    async def purge_deleted_demo_files(
+        self,
+        existing_paths: set[str],
+        scanned_roots: Iterable[str | Path],
+        max_depth: int = 1,
+    ) -> int:
+        """Delete missing rows only when they are inside the scanned roots.
 
-        用临时表收集现有路径集合，然后单条 ``DELETE ... WHERE path NOT IN (SELECT ...)`` 级联清理，
-        避免全表预读和 ``NOT IN`` 参数数量限制。
+        The previous global ``NOT IN`` purge could erase valid library rows
+        from every other configured/imported directory after scanning just one
+        root. Scope is resolved in Python with the same depth limit as discovery,
+        then related tables are cleaned through one bounded temporary path set.
         """
-        if not existing_paths:
+        roots = [
+            os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(root))))
+            for root in scanned_roots
+        ]
+        if not roots:
             return 0
+        depth_limit = max(0, int(max_depth))
+
+        existing_keys = {
+            os.path.normcase(os.path.normpath(os.path.abspath(path)))
+            for path in existing_paths
+        }
+
+        def in_scope(path: str) -> bool:
+            key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+            for root in roots:
+                try:
+                    if os.path.commonpath((key, root)) != root:
+                        continue
+                    relative = os.path.relpath(key, root)
+                    parent = os.path.dirname(relative)
+                    parent_depth = 0 if parent in ("", ".") else len(Path(parent).parts)
+                    if parent_depth <= depth_limit:
+                        return True
+                except ValueError:
+                    continue
+            return False
+
         batch_size = 500
-        all_paths = list(existing_paths)
         async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("CREATE TEMP TABLE IF NOT EXISTS _tmp_existing_paths (path TEXT PRIMARY KEY)")
-            await conn.execute("DELETE FROM _tmp_existing_paths")
-            for i in range(0, len(all_paths), batch_size):
-                chunk = all_paths[i:i + batch_size]
-                await conn.executemany("INSERT INTO _tmp_existing_paths(path) VALUES (?)", [(p,) for p in chunk])
-            await conn.execute("DELETE FROM match_results WHERE demo_path NOT IN (SELECT path FROM _tmp_existing_paths)")
-            await conn.execute("DELETE FROM demo_result_summaries WHERE demo_path NOT IN (SELECT path FROM _tmp_existing_paths)")
-            await conn.execute("DELETE FROM demo_timeline_events WHERE demo_path NOT IN (SELECT path FROM _tmp_existing_paths)")
-            await conn.execute("DELETE FROM demo_roster_cache WHERE demo_id NOT IN (SELECT d.id FROM demo_files d WHERE d.path IN (SELECT path FROM _tmp_existing_paths))")
-            await conn.execute("DELETE FROM demo_player_stats WHERE demo_id NOT IN (SELECT d.id FROM demo_files d WHERE d.path IN (SELECT path FROM _tmp_existing_paths))")
-            cur = await conn.execute("DELETE FROM demo_files WHERE path NOT IN (SELECT path FROM _tmp_existing_paths)")
+            path_cur = await conn.execute("SELECT path FROM demo_files")
+            missing = [
+                str(row[0])
+                for row in await path_cur.fetchall()
+                if row
+                and row[0]
+                and in_scope(str(row[0]))
+                and os.path.normcase(os.path.normpath(os.path.abspath(str(row[0])))) not in existing_keys
+            ]
+            if not missing:
+                return 0
+
+            await conn.execute("CREATE TEMP TABLE IF NOT EXISTS _tmp_missing_demo_paths (path TEXT PRIMARY KEY)")
+            await conn.execute("DELETE FROM _tmp_missing_demo_paths")
+            for i in range(0, len(missing), batch_size):
+                chunk = missing[i:i + batch_size]
+                await conn.executemany(
+                    "INSERT INTO _tmp_missing_demo_paths(path) VALUES (?)",
+                    [(path,) for path in chunk],
+                )
+            await conn.execute("DELETE FROM match_results WHERE demo_path IN (SELECT path FROM _tmp_missing_demo_paths)")
+            await conn.execute("DELETE FROM demo_result_summaries WHERE demo_path IN (SELECT path FROM _tmp_missing_demo_paths)")
+            await conn.execute("DELETE FROM demo_timeline_events WHERE demo_path IN (SELECT path FROM _tmp_missing_demo_paths)")
+            await conn.execute("DELETE FROM demo_roster_cache WHERE demo_path IN (SELECT path FROM _tmp_missing_demo_paths)")
+            await conn.execute("DELETE FROM demo_player_stats WHERE demo_path IN (SELECT path FROM _tmp_missing_demo_paths)")
+            cur = await conn.execute("DELETE FROM demo_files WHERE path IN (SELECT path FROM _tmp_missing_demo_paths)")
             await conn.commit()
             total = cur.rowcount
             if total:
