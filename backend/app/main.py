@@ -56,7 +56,6 @@ from .gsi_ready import (
     install_gsi_access_log_filter,
     notify_gsi_payload,
 )
-from .update_info import build_update_payload, resolve_local_version_info
 from .montage_db import MontageDB
 from .name_card_meta import (
     build_name_card_tags_and_result,
@@ -669,9 +668,6 @@ class ConfigPayload(BaseModel):
     steam_id64: Optional[str] = None
     match_mode: Optional[str] = None
     match_count: Optional[int] = None
-    # Cloudflare / electron-updater 启动检查频率（不再用于 GitHub update-info）
-    update_check_frequency: Optional[str] = None
-    last_update_check_at: Optional[str] = None
 
 
 class MatchHistoryDownloadBody(BaseModel):
@@ -698,22 +694,6 @@ def get_config():
     from app.env_utils import resolve_effective_locale
     data["effective_locale"] = resolve_effective_locale(data.get("locale", "auto"))
     return data
-
-
-@app.get("/api/app/update-info")
-def get_app_update_info(force: bool = False):
-    """对比 GitHub 最新 Release；force=true 跳过进程内短缓存（手动「检查更新」）。"""
-    cur, src = resolve_local_version_info()
-    payload = build_update_payload(cur, src, force_refresh=bool(force))
-    # 保存检查时间到配置
-    if payload.get("checked_at"):
-        try:
-            cfg = load_config()
-            cfg.last_update_check_at = payload["checked_at"]
-            save_config(cfg)
-        except Exception:
-            pass
-    return payload
 
 
 @app.post("/api/config/detect-encoder")
@@ -1027,12 +1007,6 @@ async def update_config(payload: ConfigPayload):
         cfg.match_mode = payload.match_mode
     if payload.match_count is not None and payload.match_count in (20, 50, 100):
         cfg.match_count = payload.match_count
-    if payload.update_check_frequency is not None:
-        freq = str(payload.update_check_frequency).strip().lower()
-        if freq in ("weekly", "monthly", "never"):
-            cfg.update_check_frequency = freq
-    if payload.last_update_check_at is not None:
-        cfg.last_update_check_at = str(payload.last_update_check_at).strip()
     save_config(cfg)
     if demo_watcher is not None and payload.demo_watch_paths is not None:
         # 只更新路径配置（供后续 /api/demos/scan 手动扫描使用）；

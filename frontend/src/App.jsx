@@ -2,7 +2,6 @@ import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
 import { AppShellProvider } from "./context/AppShellContext";
 import SidebarNav from "./components/SidebarNav";
-import UpdateCheckModal from "./components/UpdateCheckModal";
 import RecordingBlockedDialog from "./components/RecordingBlockedDialog";
 import RecordingResultModal from "./components/recordingQueue/RecordingResultModal";
 import RecordWarmupModal from "./components/RecordWarmupModal";
@@ -39,35 +38,12 @@ import {
 import { messageFromApiCode } from "./utils/apiErrorMessages";
 import { formatRecordingApiError, parseRecordingApiError } from "./utils/formatRecordingApiError";
 import { progressToastShowsBusy } from "./utils/progressToast";
-import { shouldCheckAppUpdates } from "./utils/shouldCheckAppUpdates";
 import { Loader2 } from "lucide-react";
 import API, { API_BASE_URL, BACKEND_CONNECT_LABEL } from "./api/api";
 
 import CustomTitleBar from "./components/CustomTitleBar";
 
 const DEFAULT_CS2_EXTRA_LAUNCH_ARGS = "-fullscreen";
-
-/** 根据频率和上次检查时间判断是否需要检查更新 */
-function shouldCheckUpdateByFrequency(frequency, lastCheckAt) {
-  if (frequency === "never") return false;
-  if (!lastCheckAt) return true; // 没有记录过，需要检查
-
-  try {
-    const lastCheck = new Date(lastCheckAt);
-    const now = new Date();
-    const diffMs = now.getTime() - lastCheck.getTime();
-    const diffDays = diffMs / 86400000;
-
-    if (frequency === "weekly") {
-      return diffDays >= 7;
-    } else if (frequency === "monthly") {
-      return diffDays >= 30;
-    }
-    return true;
-  } catch {
-    return true; // 解析失败，默认检查
-  }
-}
 
 function ensureDefaultCs2FullscreenArg(value) {
   const text = String(value ?? "").trim();
@@ -82,36 +58,16 @@ export default function App() {
   const t = useT();
   const locale = useLocaleStore((s) => s.locale);
   const [backendReady, setBackendReady] = useState(false);
-  /** 后端就绪后的启动流程：先检查更新，再拉取首页配置检查 */
+  /** 后端就绪后仅执行首页配置检查；桌面端不再承担自动更新。 */
   const [startupInitDone, setStartupInitDone] = useState(false);
-  const [startupInitPhase, setStartupInitPhase] = useState(/** @type {"update" | "config" | null} */ (null));
   const [initialQuickCheckStatus, setInitialQuickCheckStatus] = useState(null);
   const startupInitStartedRef = useRef(false);
-  const startupUpdateWaitRef = useRef(/** @type {(() => void) | null} */ (null));
   const [aiMode, setAiMode] = useState(false);
-  const [updateCheckFrequency, setUpdateCheckFrequency] = useState("weekly");
-  const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState("");
-  const shouldCheckUpdateRef = useRef(false);
-
-  // 修正 isPackaged 检测：同步判断
-  const [isPackaged, setIsPackaged] = useState(false);
-  useEffect(() => {
-    if (window.electron?.isPackaged) {
-      window.electron.isPackaged().then(setIsPackaged);
-    }
-  }, []);
   const [obsConfig, setObsConfig] = useState({ host: "localhost", port: 4455, password: "", obs_path: "" });
   /** 服务器是否已有 OBS 密码（GET /api/config 返回脱敏或本地刚保存成功） */
   const [obsHasSavedPassword, setObsHasSavedPassword] = useState(false);
   /** 用户是否正在编辑密码框（用于失焦时恢复“已保存”提示） */
   const [obsPasswordEditing, setObsPasswordEditing] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState(null);
-  const [updateModalOpen, setUpdateModalOpen] = useState(false);
-  const [updateModalManual, setUpdateModalManual] = useState(false);
-  const updateCheckOptsRef = useRef({ manual: false, awaitDismiss: false });
-  const updateStatusUnsubRef = useRef(null);
-  /** 用户点「关闭」后忽略后续 cancelled 重开弹窗 */
-  const updateModalDismissedRef = useRef(false);
   const obsConfigRef = useRef(obsConfig);
   obsConfigRef.current = obsConfig;
   const obsConfigHydratedRef = useRef(false);
@@ -952,18 +908,6 @@ export default function App() {
           }
           if (data.cs2_path) setCs2Path(data.cs2_path);
           if (typeof data.ffmpeg_path === "string") setFfmpegPath(data.ffmpeg_path);
-          if (typeof data.update_check_frequency === "string") {
-            setUpdateCheckFrequency(data.update_check_frequency);
-          }
-          if (typeof data.last_update_check_at === "string") {
-            setLastUpdateCheckAt(data.last_update_check_at);
-          }
-          // 判断是否需要检查更新（根据频率和上次检查时间）
-          const needCheck = shouldCheckUpdateByFrequency(
-            data.update_check_frequency ?? "weekly",
-            data.last_update_check_at ?? ""
-          );
-          shouldCheckUpdateRef.current = needCheck;
           if (typeof data.montage_encoder === "string" && data.montage_encoder.trim()) {
             setMontageEncoder(data.montage_encoder.trim().toLowerCase());
           }
@@ -2408,205 +2352,6 @@ export default function App() {
     }
   }, [persistLlmConfig, t]);
 
-  const waitForUpdateModalDismiss = useCallback(
-    () =>
-      new Promise((resolve) => {
-        startupUpdateWaitRef.current = resolve;
-      }),
-    [],
-  );
-
-  const markUpdateChecked = useCallback(async () => {
-    const checkedAt = new Date().toISOString();
-    setLastUpdateCheckAt(checkedAt);
-    try {
-      await API.put("config", { last_update_check_at: checkedAt });
-    } catch {
-      // ignore persistence failures; UI still reflects local time
-    }
-  }, []);
-
-  const handleUpdateModalClose = useCallback(() => {
-    // 关闭弹窗时若仍在下载/准备下载，真正取消，避免后台继续下
-    const st = String(updateInfo?.status || "");
-    updateModalDismissedRef.current = true;
-    if (
-      window.electron?.cancelUpdate &&
-      (st === "checking" || st === "available" || st === "downloading")
-    ) {
-      window.electron.cancelUpdate();
-    }
-    setUpdateModalOpen(false);
-    setUpdateModalManual(false);
-    const resume = startupUpdateWaitRef.current;
-    startupUpdateWaitRef.current = null;
-    resume?.();
-  }, [updateInfo?.status]);
-
-  const handleUpdateCancel = useCallback(() => {
-    // 「停止更新」：取消下载并保留弹窗提示，不视为 dismiss
-    updateModalDismissedRef.current = false;
-    window.electron?.cancelUpdate?.();
-  }, []);
-
-  /** Cloudflare R2 + electron-updater（不走 GitHub /api/app/update-info） */
-  const fetchUpdateInfo = useCallback(
-    async (opts = { manual: false, awaitDismiss: false }) => {
-      const manual = Boolean(opts.manual);
-      const awaitDismiss = Boolean(opts.awaitDismiss);
-
-      if (!(await shouldCheckAppUpdates()) || !window.electron?.checkForUpdates) {
-        if (manual) {
-          setUpdateInfo({
-            status: "error",
-            error: t("settings.updateDevModeError"),
-            current_version: "",
-            latest_version: null,
-          });
-          setUpdateModalManual(true);
-          setUpdateModalOpen(true);
-        }
-        return;
-      }
-
-      updateCheckOptsRef.current = { manual, awaitDismiss };
-      updateModalDismissedRef.current = false;
-
-      let currentVersion = "";
-      try {
-        if (window.electron?.getVersion) {
-          currentVersion = String((await window.electron.getVersion()) || "");
-        }
-      } catch {
-        currentVersion = "";
-      }
-
-      if (updateStatusUnsubRef.current) {
-        updateStatusUnsubRef.current();
-        updateStatusUnsubRef.current = null;
-      }
-
-      const unsub = window.electron.onUpdateStatus?.((statusPayload) => {
-        const status = String(statusPayload?.status || "");
-        const incomingLatest =
-          statusPayload?.latest_version || statusPayload?.info?.version || null;
-        const incomingNotes =
-          typeof statusPayload?.release_notes === "string"
-            ? statusPayload.release_notes
-            : typeof statusPayload?.info?.releaseNotes === "string"
-              ? statusPayload.info.releaseNotes
-              : "";
-        // download-progress 等事件可能不带版本号，合并保留上次已知的 latest
-        setUpdateInfo((prev) => ({
-          status,
-          current_version: currentVersion || prev?.current_version || "",
-          latest_version: incomingLatest || prev?.latest_version || null,
-          release_notes: incomingNotes || prev?.release_notes || "",
-          progress: statusPayload?.progress || null,
-          error:
-            statusPayload?.error === "dev-mode"
-              ? t("settings.updateDevModeError")
-              : statusPayload?.error
-                ? String(statusPayload.error)
-                : "",
-        }));
-
-        const isManual = Boolean(updateCheckOptsRef.current.manual);
-
-        if (status === "checking") {
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          }
-          return;
-        }
-
-        if (status === "available" || status === "downloading" || status === "downloaded") {
-          if (status === "available") void markUpdateChecked();
-          setUpdateModalManual(isManual);
-          setUpdateModalOpen(true);
-          return;
-        }
-
-        if (status === "cancelled") {
-          // 点「关闭」已 dismiss：不再重开；点「停止更新」则保留提示
-          if (updateModalDismissedRef.current) {
-            setUpdateModalOpen(false);
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-            return;
-          }
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          } else {
-            setUpdateModalOpen(false);
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-          }
-          return;
-        }
-
-        if (status === "not-available") {
-          void markUpdateChecked();
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          } else {
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-          }
-          return;
-        }
-
-        if (status === "error") {
-          // 检查失败不刷新 last_update_check_at，便于下次启动重试
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          } else {
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-          }
-        }
-      });
-      if (typeof unsub === "function") {
-        updateStatusUnsubRef.current = unsub;
-      }
-
-      setUpdateInfo({
-        status: "checking",
-        current_version: currentVersion,
-        latest_version: null,
-        release_notes: "",
-        error: "",
-      });
-      if (manual) {
-        setUpdateModalManual(true);
-        setUpdateModalOpen(true);
-      }
-
-      // 先挂上 awaitDismiss，再发 IPC，避免 not-available 极快返回时丢 resume
-      const dismissWait = awaitDismiss ? waitForUpdateModalDismiss() : null;
-      window.electron.checkForUpdates();
-      if (dismissWait) await dismissWait;
-    },
-    [t, waitForUpdateModalDismiss, markUpdateChecked],
-  );
-
-  useEffect(() => {
-    return () => {
-      if (updateStatusUnsubRef.current) {
-        updateStatusUnsubRef.current();
-        updateStatusUnsubRef.current = null;
-      }
-    };
-  }, []);
-
   useEffect(() => {
     if (!backendReady || startupInitStartedRef.current) return;
     startupInitStartedRef.current = true;
@@ -2614,13 +2359,6 @@ export default function App() {
     let cancelled = false;
     const runStartupInit = async () => {
       try {
-        if ((await shouldCheckAppUpdates()) && shouldCheckUpdateRef.current) {
-          setStartupInitPhase("update");
-          await fetchUpdateInfo({ manual: false, awaitDismiss: true });
-          if (cancelled) return;
-        }
-
-        setStartupInitPhase("config");
         try {
           const { data } = await API.get("/config/quick-check");
           if (!cancelled) setInitialQuickCheckStatus(data);
@@ -2629,7 +2367,6 @@ export default function App() {
         }
       } finally {
         if (!cancelled) {
-          setStartupInitPhase(null);
           setStartupInitDone(true);
         }
       }
@@ -2639,7 +2376,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [backendReady, fetchUpdateInfo]);
+  }, [backendReady]);
 
   const hasDemos = uploadedDemos && uploadedDemos.length > 0;
   const currentFilename = currentUpload?.filename ?? "";
@@ -2679,7 +2416,6 @@ export default function App() {
     demoWatchPaths,
     setDemoWatchPaths,
     handleSaveConfig,
-    fetchUpdateInfo,
     startupInitDone,
     initialQuickCheckStatus,
     handleDetectCs2,
@@ -2827,11 +2563,7 @@ export default function App() {
               </div>
             </div>
           )}
-          <SidebarNav
-            queueLength={queue.length}
-            disabled={batchRecording}
-            onCheckUpdate={() => void fetchUpdateInfo({ manual: true })}
-          />
+          <SidebarNav queueLength={queue.length} disabled={batchRecording} />
           <main className="flex min-w-0 flex-1 flex-col overflow-hidden relative">
             {!backendReady ? (
               <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-cs2-bg-dark/80 backdrop-blur-sm">
@@ -2858,9 +2590,7 @@ export default function App() {
                   <Loader2 className="h-12 w-12 animate-spin text-cs2-orange" />
                   <div className="flex flex-col items-center gap-2">
                     <h2 className="text-xl font-bold tracking-tight text-dynamic-white">
-                      {startupInitPhase === "config"
-                        ? t("app.startupCheckingConfig")
-                        : t("app.startupCheckingUpdate")}
+                      {t("app.startupCheckingConfig")}
                     </h2>
                     <p className="text-sm text-dynamic-zinc-400">{t("app.startupPleaseWait")}</p>
                   </div>
@@ -2964,13 +2694,6 @@ export default function App() {
           }}
         />
 
-        <UpdateCheckModal
-          open={updateModalOpen}
-          info={updateInfo}
-          title={updateModalManual ? t("app.checkUpdate") : t("app.updateFound")}
-          onClose={handleUpdateModalClose}
-          onCancel={handleUpdateCancel}
-        />
       </div>
     </AppShellProvider>
   );

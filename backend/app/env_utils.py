@@ -48,7 +48,7 @@ _DEFAULT_RECORD_INJECT_CONSOLE_LINES = "\n".join((
 def get_data_dir() -> Path:
     """可写应用数据目录：OBS / 玩家配置备份、库边文件等（与正式配置文件同盘根树）。
 
-    默认：仓库根下 ``data/``。Electron 安装版通过 ``CS2_INSIGHT_DATA_DIR`` 指向
+    默认：仓库根下 ``data/``。桌面安装版通过 ``CS2_INSIGHT_DATA_DIR`` 指向
     ``%APPDATA%/<应用>/data``（与配置文件、SQLite、logs 同级），避免写入 ``Program Files`` 下的 ``resources``。
     """
     override = os.environ.get("CS2_INSIGHT_DATA_DIR", "").strip()
@@ -60,7 +60,7 @@ def get_data_dir() -> Path:
 def get_bundle_data_dir() -> Path:
     """只读随包资源：``cs2-insight.config.example.json``、``basic.ini`` 等。
 
-    开发/便携包：与 ``get_data_dir()`` 相同。Electron 安装版由 ``CS2_INSIGHT_BUNDLE_DATA_DIR``
+    开发/便携包：与 ``get_data_dir()`` 相同。桌面安装版由 ``CS2_INSIGHT_BUNDLE_DATA_DIR``
     指向 ``resources/data``（安装目录下只读副本）。
     """
     override = os.environ.get("CS2_INSIGHT_BUNDLE_DATA_DIR", "").strip()
@@ -404,12 +404,6 @@ class AppConfig(BaseModel):
     # False 表示仍沿用程序默认预热 cvar；True 表示用户已手动编辑过该字段，
     # 此时即便删空也尊重用户选择，不再自动回填默认 cvar。
     record_inject_console_lines_user_configured: bool = False
-    # 检查更新：auto=镜像与直连并发；on=仅用镜像；off=仅直连；或以 https:// 开头的自定义镜像前缀
-    update_github_mirror: str = "auto"
-    # 上次检查更新的时间（ISO 8601 UTC）
-    last_update_check_at: str = ""
-    # 检查更新频率：weekly / monthly / never；默认每周
-    update_check_frequency: str = "weekly"
     obs_transition_enabled: bool = False
     obs_transition_name: str = "Fade"
     obs_transition_duration_ms: int = 100

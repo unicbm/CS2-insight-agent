@@ -5,6 +5,7 @@ import { calibrateObs, getObsConfigStatus } from "../api/obsConfigCenter";
 import { useT } from "../i18n/useT.js";
 import { useLocaleStore } from "../i18n/localeStore.js";
 import { useAppShell } from "../context/AppShellContext";
+import { desktopBridge } from "../desktop/desktopBridge.js";
 import RecordingParamsPage from "./RecordingParamsPage";
 import SponsorModal from "../components/SponsorModal";
 import {
@@ -38,11 +39,9 @@ import {
  * ------------------------------------------------------------------------ */
 
 function openExternalLink(url) {
-  // Electron 环境：使用 shell.openExternal 打开系统默认浏览器
-  if (window.electron?.openExternal) {
-    window.electron.openExternal(url);
+  if (desktopBridge) {
+    void desktopBridge.openExternal(url);
   } else {
-    // 非 Electron 环境（浏览器）：使用 window.open
     window.open(url, '_blank', 'noopener,noreferrer');
   }
 }
@@ -190,7 +189,7 @@ function PathPicker({ value, onChange, placeholder, exeName, detectApi, detectFi
       }
     }
 
-    // 后端原生文件选择（Windows；Vite dev 与 Electron 均可返回完整路径）
+    // 后端原生文件选择（Windows；浏览器开发模式也可返回完整路径）
     try {
       const { data } = await API.post("file-picker", { file_type: "exe" });
       if (data?.path) {
@@ -201,11 +200,11 @@ function PathPicker({ value, onChange, placeholder, exeName, detectApi, detectFi
       // 非 Windows 或选择器不可用，继续 fallback
     }
 
-    // Electron 文件选择对话框
-    if (window.electron?.showOpenDialog) {
+    // 桌面壳文件选择对话框
+    if (desktopBridge) {
       try {
         const defaultPath = value && value.trim() ? value : undefined;
-        const result = await window.electron.showOpenDialog({
+        const result = await desktopBridge.showOpenDialog({
           title: t("settings.browseFileTitle"),
           defaultPath,
           filters: [{ name: exeName, extensions: ["exe"] }],
@@ -216,7 +215,7 @@ function PathPicker({ value, onChange, placeholder, exeName, detectApi, detectFi
         }
         return;
       } catch (e) {
-        console.error("Electron dialog error:", e);
+        console.error("Desktop dialog error:", e);
       }
     }
 
@@ -241,7 +240,7 @@ function PathPicker({ value, onChange, placeholder, exeName, detectApi, detectFi
       >
         {detecting ? <Loader2 className="h-3 w-3 animate-spin" /> : t("settings.browseBtn")}
       </button>
-      {/* Fallback file input for non-Electron environments */}
+      {/* 浏览器环境的最后兜底 */}
       <input
         ref={fileRef}
         type="file"
@@ -298,39 +297,12 @@ function TagList({ items, onChange, placeholder, addLabel }) {
  * Static dropdown options
  * ------------------------------------------------------------------------ */
 
-// 格式化上次检查时间（ISO 8601 UTC -> 本地友好显示）
-function formatLastCheckTime(isoUtc) {
-  if (!isoUtc) return "";
-  try {
-    const d = new Date(isoUtc);
-    if (isNaN(d.getTime())) return isoUtc;
-    const now = new Date();
-    const diffMs = now.getTime() - d.getTime();
-    const diffMin = Math.floor(diffMs / 60000);
-    const diffHour = Math.floor(diffMs / 3600000);
-    const diffDay = Math.floor(diffMs / 86400000);
-    if (diffMin < 1) return "刚刚";
-    if (diffMin < 60) return `${diffMin} 分钟前`;
-    if (diffHour < 24) return `${diffHour} 小时前`;
-    if (diffDay < 7) return `${diffDay} 天前`;
-    // 超过一周显示具体日期
-    return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  } catch {
-    return isoUtc;
-  }
-}
 const ENCODER_OPTIONS = [
   { value: "auto", key: "settings.encoderAuto" },
   { value: "h264_nvenc", key: "settings.encoderNvenc" },
   { value: "h264_qsv", key: "settings.encoderQsv" },
   { value: "h264_amf", key: "settings.encoderAmf" },
   { value: "libx264", key: "settings.encoderX264" },
-];
-
-const UPDATE_FREQUENCY_OPTIONS = [
-  { value: "weekly", key: "settings.updateFreqWeekly" },
-  { value: "monthly", key: "settings.updateFreqMonthly" },
-  { value: "never", key: "settings.updateFreqNever" },
 ];
 
 /* ---------------------------------------------------------------------------
@@ -417,11 +389,11 @@ export default function SettingsPage() {
     return () => { cancelled = true; };
   }, []);
 
-  // Get app version (Electron only, fallback to "dev")
-  const [appVersion, setAppVersion] = useState("dev");
+  // 桌面包读取 Tauri 版本；浏览器预览使用 Vite 构建版本。
+  const [appVersion, setAppVersion] = useState(__APP_VERSION__);
   useEffect(() => {
-    if (window.electron?.getVersion) {
-      window.electron.getVersion().then((v) => {
+    if (desktopBridge) {
+      desktopBridge.getVersion().then((v) => {
         if (v) setAppVersion(v);
       }).catch(() => {});
     }
@@ -481,7 +453,6 @@ export default function SettingsPage() {
       payload.demo_directory = config.demo_directory ?? "";
       payload.demo_watch_paths = config.demo_watch_paths ?? [];
       payload.expected_parse_players = config.expected_parse_players ?? [];
-      payload.update_check_frequency = config.update_check_frequency ?? "weekly";
       payload.steam_api_key = config.steam_api_key ?? "";
       payload.steam_id64 = config.steam_id64 ?? "";
       payload.match_mode = config.match_mode ?? "premier";
@@ -703,34 +674,19 @@ export default function SettingsPage() {
           {activeTab === "general" && (
             <div className="space-y-4">
               {/* System + Language */}
-              <SectionCard title={t("settings.sectionSystem")} hint={t("settings.sectionSystemHint")} search={search && !matches(t("settings.sectionSystem") + " " + t("settings.currentVersion") + " " + t("settings.labelUpdateFrequency"))}>
+              <SectionCard title={t("settings.sectionSystem")} hint={t("settings.sectionSystemHint")} search={search && !matches(t("settings.sectionSystem") + " " + t("settings.currentVersion") + " " + t("settings.downloadLatest"))}>
                 <FieldRow label={t("settings.currentVersion")} search={search && !matches(t("settings.currentVersion") + " version")}>
-                  <div className="flex items-center gap-3">
-                    <p className="text-xs text-cs2-text-primary font-mono">{appVersion}</p>
-                    {config.last_update_check_at && (
-                      <span className="text-xs text-cs2-text-muted">
-                        ({t("settings.lastCheckTime")}: {formatLastCheckTime(config.last_update_check_at)})
-                      </span>
-                    )}
-                  </div>
+                  <p className="text-xs text-cs2-text-primary font-mono">{appVersion}</p>
                 </FieldRow>
-                <FieldRow label={t("settings.labelUpdateFrequency")} hint={t("settings.hintUpdateFrequency")} search={search && !matches(t("settings.labelUpdateFrequency"))}>
-                  <div className="flex gap-2">
-                    <SelectInput
-                      value={config.update_check_frequency ?? "weekly"}
-                      onChange={(v) => set("update_check_frequency", v)}
-                      options={UPDATE_FREQUENCY_OPTIONS.map((o) => ({ value: o.value, label: t(o.key) }))}
-                      className="flex-1"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => void shell.fetchUpdateInfo({ manual: true })}
-                      className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-cs2-border bg-cs2-bg-input px-3 py-2 text-xs font-medium text-cs2-text-secondary transition-colors hover:border-cs2-accent/50 hover:text-cs2-accent"
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      {t("settings.checkUpdateBtn")}
-                    </button>
-                  </div>
+                <FieldRow label={t("settings.downloadLatest")} hint={t("settings.downloadLatestHint")} search={search && !matches(t("settings.downloadLatest"))}>
+                  <button
+                    type="button"
+                    onClick={() => openExternalLink('https://github.com/DrEAmSs59/CS2-insight-agent/releases/latest')}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-cs2-border bg-cs2-bg-input px-3 py-2 text-xs font-medium text-cs2-text-secondary transition-colors hover:border-cs2-accent/50 hover:text-cs2-accent"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    {t("settings.openReleasePage")}
+                  </button>
                 </FieldRow>
 
                 {/* GitHub 地址 */}

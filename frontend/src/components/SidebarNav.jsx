@@ -5,7 +5,6 @@ import {
   Microscope,
   Package,
   Clapperboard,
-  Download,
   Settings,
   Sun,
   Moon,
@@ -18,7 +17,7 @@ const linkBase =
 const linkIdle = "text-cs2-text-secondary hover:border-cs2-border hover:bg-cs2-bg-input/50 hover:text-cs2-text-primary";
 const linkActive = "border-cs2-accent/45 bg-cs2-accent-soft text-cs2-accent";
 
-export default function SidebarNav({ queueLength = 0, disabled = false, onCheckUpdate }) {
+export default function SidebarNav({ queueLength = 0, disabled = false }) {
   const theme = useThemeStore((s) => s.theme);
   const toggleTheme = useThemeStore((s) => s.toggleTheme);
   const t = useT();
@@ -79,15 +78,6 @@ export default function SidebarNav({ queueLength = 0, disabled = false, onCheckU
           <Settings className="h-4 w-4 shrink-0 opacity-90" />
           {t("nav.settings")}
         </NavLink>
-        {/* <button
-          type="button"
-          disabled={disabled || !onCheckUpdate}
-          onClick={() => onCheckUpdate?.()}
-          className={`${linkBase} w-full text-cs2-text-secondary hover:border-cs2-border hover:bg-cs2-bg-input/50 hover:text-cs2-text-primary disabled:pointer-events-none disabled:opacity-40`}
-        >
-          <Download className="h-4 w-4 shrink-0 opacity-90" />
-          检查更新
-        </button> */}
         <button
           type="button"
           onClick={toggleTheme}
