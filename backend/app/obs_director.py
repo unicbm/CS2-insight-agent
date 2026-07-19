@@ -56,7 +56,7 @@ from .recording.platform_utils import (
     normalize_voice_filter,
     select_voice_listen_mask,
 )
-from .win_cs2_console import ensure_cs2_foreground, find_cs2_hwnd, inject_console_sequence, send_cs2_space_taps
+from .win_cs2_console import ensure_cs2_foreground, find_cs2_hwnd, inject_console_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -427,24 +427,28 @@ TICK_RATE = 64
 PRE_ROLL_TICKS = 300  # ~5 seconds of pre-roll（无 kill_ticks 时的传统 seek）
 # 智能跳跃分段阈值见 ``build_smart_jump_segments`` 内 _env_int 默认值。
 
-# 录制开始时把玩家所有按键解绑并恢复到一组最小默认绑定。配合下面的「文件级用户配置
-# 快照 + 恢复」机制使用：本次 CS2 进程内按键还原为下方默认，让玩家自定义的奇葩 bind
-# 不会在 demo 回放/控制台注入期间触发；录制结束（或异常杀进程后下次启动）时再用
-# 磁盘备份把用户原配置整体回滚。bind 顺序中 toggleconsole / space 必须保留，否则
-# `inject_console_sequence` 与 `send_cs2_space_taps` 会失效。
-_RECORDING_KEYBIND_RESET_LINES: tuple[str, ...] = (
-    "unbindall",
-    "bind F10 toggleconsole",
-    "bind ` toggleconsole",
-    'bind "SPACE" "+jump"',
-    'bind "ESCAPE" "cancelselect"',
-    'bind "w" "+forward"',
-    'bind "a" "+moveleft"',
-    'bind "s" "+back"',
-    'bind "d" "+moveright"',
-    "unbind alt",
+# 录制只接管自动化实际使用的三个按键。绝不能 ``unbindall`` 或重建玩家的整套
+# 键鼠配置：一旦 CS2 未正常退出，破坏性全量重置会被游戏/Steam Cloud 持久化。
+# 启动 CFG 绑定一个控制台键；KP_5 / KP_6 在 OBS 活跃时静默暂停、继续 Demo。
+_V3_DEMO_CONTROL_BIND_LINES: tuple[str, ...] = (
+    "bind KP_5 demo_pause",
+    "bind KP_6 demo_resume",
 )
 _RECORDING_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".flv", ".ts", ".m2ts", ".avi"}
+
+
+def _recording_console_toggle_key() -> str:
+    """Return the single console key reserved by the recording launch CFG."""
+    key = (os.environ.get("CS2_INSIGHT_CONSOLE_TOGGLE_KEY") or "F10").strip().upper()
+    if key in {"~", "OEM_3"}:
+        return "`"
+    if key == "`" or key in {f"F{i}" for i in range(1, 13)}:
+        return key
+    return "F10"
+
+
+def _recording_console_bind_line() -> str:
+    return f'bind "{_recording_console_toggle_key()}" "toggleconsole"'
 
 
 # 用户配置磁盘备份 / ``recording_state.json`` 见 ``cs2_config_backup`` 模块；
@@ -2198,19 +2202,10 @@ class OBSDirector:
         stem = dest.stem  # _insight_<uuid>
         cfg_path = cfg_dir / f"{stem}.cfg"
         # 用 cfg 里 playdemo 比单独 +playdemo 在 CS2 上更稳；路径仅 ASCII
-        console_toggle_key = (os.environ.get("CS2_INSIGHT_CONSOLE_TOGGLE_KEY") or "F10").strip().upper()
-        if console_toggle_key in {"~", "OEM_3"}:
-            console_toggle_key = "`"
-        elif console_toggle_key not in {"`", *{f"F{i}" for i in range(1, 13)}}:
-            console_toggle_key = "F10"
-        console_bind_lines = [f'bind "{console_toggle_key}" "toggleconsole"']
-        if console_toggle_key != "F10":
-            console_bind_lines.append('bind "F10" "toggleconsole"')
         cfg_lines = [
             "cl_spec_show_bindings 0",
             "con_enable 1",
-            *console_bind_lines,
-            "unbind alt",
+            _recording_console_bind_line(),
             f'playdemo "{stem}.dem"',
         ]
         cfg_path.write_text("\n".join(cfg_lines) + "\n", encoding="ascii")
@@ -3344,22 +3339,16 @@ class OBSDirector:
         return [*lines, *self._extra_warmup_console_lines]
 
     def _recording_warmup_console_lines(self, w: RecordingWarmupExtras) -> list[str]:
-        """录制会话首次 seek 前注入的观战 cvar（与空格预热后的控制台批次合并）。
+        """录制会话首次 seek 前注入的观战 cvar。
 
-        在所有 cvar 之前注入 ``unbindall`` + 一组最小默认绑定，把玩家自定义
-        按键统一恢复为安全默认；用户原 ``config.cfg`` / ``cs2_user_keys.cfg`` 等
-        已被 ``_snapshot_user_configs`` 落盘，录制结束 / 进程崩溃后都能完整还原。
-        ``unbindall`` 必须在第一行：避免玩家把 toggleconsole 改绑到非常规键时，
-        我们 SendInput 投到默认 F10 / ``~`` 失效。
+        控制台键已经由启动 CFG 绑定，这里不重复修改任何玩家键位。磁盘快照仍
+        作为 CS2 archive 写入的最后保险，而不是全量清键的许可。
         """
         if w.console_cmds:
             cmds = _without_voice_console_lines(w.console_cmds)
-            lines = self._append_config_warmup_console_lines(
-                [*_RECORDING_KEYBIND_RESET_LINES, *cmds]
-            )
+            lines = self._append_config_warmup_console_lines(cmds)
             return [*lines, *_voice_filter_warmup_console_lines(w.voice_filter)]
         lines: list[str] = []
-        lines.extend(_RECORDING_KEYBIND_RESET_LINES)
         if w.cl_draw_only_deathnotices:
             lines.append("cl_draw_only_deathnotices true")
         else:
@@ -3410,6 +3399,21 @@ class OBSDirector:
             lines.append("sv_grenade_trajectory_time_spectator 0")
         lines = self._append_config_warmup_console_lines(lines)
         return [*lines, *_voice_filter_warmup_console_lines(w.voice_filter)]
+
+    def _recording_session_warmup_console_lines(
+        self,
+        warmup: Optional[RecordingWarmupExtras],
+    ) -> list[str]:
+        """Compose one warmup batch, including only the two Demo control binds."""
+        if warmup is None:
+            return [
+                *_V3_DEMO_CONTROL_BIND_LINES,
+                *_voice_filter_warmup_console_lines("mute"),
+            ]
+        return [
+            *self._recording_warmup_console_lines(warmup),
+            *_V3_DEMO_CONTROL_BIND_LINES,
+        ]
 
     async def execute_plan_queue(
         self,
@@ -3673,51 +3677,34 @@ class OBSDirector:
                 # then POV HUD forced commands last (so POV overrides any conflicting warmup cvars).
                 # KP_5/KP_6 are bound here so that demo_pause_silent/demo_resume_silent
                 # can send a keypress instead of opening the console during recording.
-                _V3_DEMO_KEY_BINDINGS = ["bind KP_5 demo_pause", "bind KP_6 demo_resume"]
                 _voice_mode = normalize_voice_filter(
                     getattr(warmup, "voice_filter", "mute") if warmup else "mute"
                 )
                 _warmup_inject_ok = False
-                if warmup is not None:
-                    warmup_cmds = self._recording_warmup_console_lines(warmup)
-                    warmup_cmds = [*warmup_cmds, *_V3_DEMO_KEY_BINDINGS]
-                    if self._pov_enabled:
-                        pov_cmds = [
-                            *POV_CORE_FORCED_COMMANDS,
-                            *pov_tail_commands(
-                                teamcounter_numeric=warmup.pov_teamcounter_numeric,
-                                radar_mode=warmup.pov_radar_mode,
-                            ),
-                        ]
-                        warmup_cmds = [*warmup_cmds, *pov_cmds]
-                    if warmup_cmds:
-                        logger.info("[RecordingV3] applying warmup console commands: %d", len(warmup_cmds))
-                        if self._pov_enabled:
-                            logger.info("[RecordingV3][POV] applying POV HUD commands after warmup")
-                            for _cmd in pov_cmds:
-                                logger.info("[RecordingV3][POV] inject command: %s", _cmd)
-                        try:
-                            _warmup_inject_ok = bool(
-                                await asyncio.to_thread(inject_console_sequence, warmup_cmds)
-                            )
-                            if not _warmup_inject_ok:
-                                logger.warning("[RecordingV3] warmup console injection returned false")
-                        except Exception as _wce:
-                            logger.warning("[RecordingV3] warmup console inject failed: %s", _wce)
-                else:
-                    # No warmup object means the safe default: mute via both mask halves.
+                warmup_cmds = self._recording_session_warmup_console_lines(warmup)
+                if warmup is not None and self._pov_enabled:
+                    pov_cmds = [
+                        *POV_CORE_FORCED_COMMANDS,
+                        *pov_tail_commands(
+                            teamcounter_numeric=warmup.pov_teamcounter_numeric,
+                            radar_mode=warmup.pov_radar_mode,
+                        ),
+                    ]
+                    warmup_cmds = [*warmup_cmds, *pov_cmds]
+                if warmup_cmds:
+                    logger.info("[RecordingV3] applying warmup console commands: %d", len(warmup_cmds))
+                    if warmup is not None and self._pov_enabled:
+                        logger.info("[RecordingV3][POV] applying POV HUD commands after warmup")
+                        for _cmd in pov_cmds:
+                            logger.info("[RecordingV3][POV] inject command: %s", _cmd)
                     try:
-                        _warmup_inject_ok = bool(await asyncio.to_thread(
-                            inject_console_sequence,
-                            [
-                                *_V3_DEMO_KEY_BINDINGS,
-                                *_voice_filter_warmup_console_lines("mute"),
-                            ],
-                        ))
+                        _warmup_inject_ok = bool(
+                            await asyncio.to_thread(inject_console_sequence, warmup_cmds)
+                        )
                         if not _warmup_inject_ok:
-                            logger.warning("[RecordingV3] default mute warmup injection returned false")
+                            logger.warning("[RecordingV3] warmup console injection returned false")
                     except Exception as _wce:
-                        logger.warning("[RecordingV3] demo key bindings inject failed: %s", _wce)
+                        logger.warning("[RecordingV3] warmup console inject failed: %s", _wce)
 
                 if _voice_mode in ("mute", "team", "enemy") and not _warmup_inject_ok:
                     error = "voice isolation warmup injection failed; recording aborted fail-closed"

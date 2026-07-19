@@ -37,12 +37,39 @@ def test_fixed_cvars_injected_from_config():
         assert cvar in lines
 
 
-def test_keybind_reset_still_forced():
-    # 安全闸门不受影响：解绑 + toggleconsole 始终注入
+def test_warmup_does_not_touch_player_keybinds():
     director = _director("")
-    lines = director._recording_warmup_console_lines(RecordingWarmupExtras())
-    assert "unbindall" in lines
-    assert any("toggleconsole" in l for l in lines)
+    warmup_lines = director._recording_warmup_console_lines(RecordingWarmupExtras())
+    session_lines = director._recording_session_warmup_console_lines(RecordingWarmupExtras())
+
+    assert [line for line in warmup_lines if line.startswith(("bind ", "unbind"))] == []
+    assert [line for line in session_lines if line.startswith(("bind ", "unbind"))] == [
+        "bind KP_5 demo_pause",
+        "bind KP_6 demo_resume",
+    ]
+
+
+def test_missing_warmup_still_builds_the_safe_default_batch():
+    director = _director("")
+
+    assert director._recording_session_warmup_console_lines(None) == [
+        "bind KP_5 demo_pause",
+        "bind KP_6 demo_resume",
+        "tv_listen_voice_indices 0",
+        "tv_listen_voice_indices_h 0",
+        "voice_modenable 0",
+        "snd_voipvolume 0",
+    ]
+
+
+def test_custom_console_lines_do_not_reintroduce_global_key_reset():
+    director = _director("")
+    lines = director._recording_warmup_console_lines(
+        RecordingWarmupExtras(console_cmds=("cl_draw_only_deathnotices true",)),
+    )
+
+    assert lines[:1] == ["cl_draw_only_deathnotices true"]
+    assert "unbindall" not in lines
 
 
 def test_third_person_camera_injects_the_configured_camera_commands():

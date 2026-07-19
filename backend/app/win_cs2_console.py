@@ -262,12 +262,19 @@ else:
         挂接目标（CS2）线程。完成后撤销挂接，再短暂轮询 ``GetForegroundWindow``
         等待前台切换真正到位。
         """
+        if user32.GetForegroundWindow() == hwnd:
+            return hwnd
+
         SW_RESTORE = 9
         SW_SHOW = 5
         user32.ShowWindowAsync(hwnd, SW_SHOW)
         user32.ShowWindow(hwnd, SW_RESTORE)
         _topmost_pulse(hwnd)
-        _unlock_foreground()
+        # Alt 只用于解锁另一个前台窗口。若 ShowWindow 已让 CS2 获得前台，
+        # 再发送 Alt 会触发玩家自己的 Alt 绑定；录制不应为规避这一副作用而
+        # 持久化 ``unbind alt``。
+        if user32.GetForegroundWindow() != hwnd:
+            _unlock_foreground()
 
         get_wtp = user32.GetWindowThreadProcessId
         get_wtp.restype = wintypes.DWORD
