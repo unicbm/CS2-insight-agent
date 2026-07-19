@@ -30,6 +30,7 @@ def _game_capture_settings() -> dict:
     - capture_mode: window (env CS2_INSIGHT_OBS_GAME_CAPTURE_MODE)
     - window: Counter-Strike 2:SDL_app:cs2.exe (env CS2_INSIGHT_OBS_GAME_CAPTURE_WINDOW)
     - capture_cursor: False  (always — hides mouse pointer from the recording)
+    - capture_audio: True    (always — records CS2 directly into the managed source)
     """
     window = (
         os.environ.get("CS2_INSIGHT_OBS_GAME_CAPTURE_WINDOW", "").strip()
@@ -43,6 +44,7 @@ def _game_capture_settings() -> dict:
         "capture_mode": capture_mode,
         "window": window,
         "capture_cursor": False,
+        "capture_audio": True,
     }
 
 
@@ -151,8 +153,9 @@ class OBSFadeController:
                 _GAME_CAPTURE_INPUT_NAME,
                 input_settings=_game_capture_settings(),
             )
+            client.ensure_input_audio_track(_GAME_CAPTURE_INPUT_NAME, 1)
         except Exception as exc:
-            logger.warning("[OBSFade] ensure game capture failed: %s", exc)
+            logger.warning("[OBSFade] ensure game capture/audio failed: %s", exc)
             # non-fatal — scene exists but capture may need manual setup
 
         # Stretch game capture to fill the OBS canvas.

@@ -1,5 +1,4 @@
 import { useState } from "react";
-import DemoUpload from "../components/DemoUpload";
 import PlayerSelect from "../components/PlayerSelect";
 import MatchScoreboard from "../components/MatchScoreboard";
 import ClipList from "../components/ClipList";
@@ -8,7 +7,7 @@ import WeaponKillsView from "../components/analysis/WeaponKillsView";
 import ProgressBar from "../components/ProgressBar";
 import ActionBar from "../components/ActionBar";
 import MatchSwitcher from "../components/MatchSwitcher";
-import { Loader2, RefreshCw, Film, User } from "lucide-react";
+import { Loader2, Film, User, Library } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useAppShell } from "../context/AppShellContext";
 import { useT } from "../i18n/useT.js";
@@ -36,29 +35,33 @@ export default function AnalysisPage() {
             <span className="font-mono text-cs2-text-secondary">{s.uploadedDemos.length}</span>{" "}
             {t("analysis.demosImportedSuffix")}
           </p>
-          <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <Link
-              to="/library"
-              className="rounded-md border border-cs2-border px-2.5 py-1.5 text-[11px] font-semibold text-cs2-text-secondary hover:border-cs2-accent/45 hover:text-cs2-text-primary"
-            >
-              {t("analysis.linkDemoLibrary")}
-            </Link>
-            <button
-              type="button"
-              onClick={s.handleResetDemo}
-              disabled={s.anyDemoParsing || s.batchRecording}
-              className="flex items-center gap-1.5 rounded-md border border-cs2-border bg-cs2-bg-input px-2.5 py-1.5 text-[11px] font-semibold text-cs2-text-secondary transition-colors hover:border-cs2-accent/45 hover:text-cs2-text-primary disabled:opacity-40"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              {t("analysis.btnSwapDemo")}
-            </button>
-          </div>
+          <Link
+            to="/library"
+            className="flex shrink-0 items-center gap-1.5 rounded-md border border-cs2-border bg-cs2-bg-input px-2.5 py-1.5 text-[11px] font-semibold text-cs2-text-secondary transition-colors hover:border-cs2-accent/45 hover:text-cs2-text-primary"
+          >
+            <Library className="h-3.5 w-3.5" />
+            {t("analysis.linkDemoLibrary")}
+          </Link>
         </header>
       )}
 
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-5 pb-6 pt-3 sm:px-6 sm:pt-4">
         <div className="mx-auto w-full max-w-[1200px] space-y-5">
-        {!s.hasDemos && !s.parsing && <DemoUpload onUpload={s.handleUpload} />}
+        {!s.hasDemos && !s.parsing && (
+          <div className="flex min-h-[260px] flex-col items-center justify-center rounded-lg border border-dashed border-cs2-border bg-cs2-bg-card px-6 text-center">
+            <Library className="h-8 w-8 text-cs2-text-muted" aria-hidden />
+            <h2 className="mt-3 text-sm font-bold text-cs2-text-primary">{t("analysis.libraryOnlyTitle")}</h2>
+            <p className="mt-1 max-w-md text-[11px] leading-relaxed text-cs2-text-muted">
+              {t("analysis.libraryOnlyBody")}
+            </p>
+            <Link
+              to="/library"
+              className="mt-4 rounded-md bg-cs2-accent px-3 py-2 text-[11px] font-bold text-cs2-text-on-accent hover:bg-cs2-accent-light"
+            >
+              {t("analysis.libraryOnlyAction")}
+            </Link>
+          </div>
+        )}
         {!s.hasDemos && s.parsing && (
           <div className="flex flex-col items-center justify-center rounded-xl border border-cs2-border bg-cs2-bg-card py-16 text-center">
             <Loader2 className="h-9 w-9 animate-spin text-cs2-accent" aria-hidden />

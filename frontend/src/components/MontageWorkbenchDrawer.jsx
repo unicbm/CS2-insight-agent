@@ -38,6 +38,15 @@ const FILTER_TABS = [
 ];
 
 const DEFAULT_REL_EXPORT_DIR = "exports/montage";
+const MONTAGE_WORKSPACE_STORAGE_KEY = "cs2-insight.montage-workspace";
+const MONTAGE_WORKSPACE_STORAGE_VERSION = 1;
+
+function makeExportJobId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `montage-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 const TRANSITION_TYPES = [
   { id: "none", labelKey: "montage.transitionNone" },
@@ -108,6 +117,59 @@ function hydrateTransitionsFromApi(raw) {
     if (v && typeof v === "object") out[String(k)] = normalizeTransition(v);
   }
   return out;
+}
+
+function getMontageWorkspaceStorage() {
+  try {
+    return typeof window !== "undefined" ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function readMontageWorkspace() {
+  const storage = getMontageWorkspaceStorage();
+  const empty = { orderedIds: [], transitionByClipId: {} };
+  if (!storage) return empty;
+  try {
+    const raw = storage.getItem(MONTAGE_WORKSPACE_STORAGE_KEY);
+    if (!raw) return empty;
+    const parsed = JSON.parse(raw);
+    if (parsed?.version !== MONTAGE_WORKSPACE_STORAGE_VERSION || !parsed.state) {
+      storage.removeItem(MONTAGE_WORKSPACE_STORAGE_KEY);
+      return empty;
+    }
+    const orderedIds = Array.isArray(parsed.state.orderedIds)
+      ? [...new Set(parsed.state.orderedIds.filter((id) => typeof id === "string" || typeof id === "number"))]
+      : [];
+    return {
+      orderedIds,
+      transitionByClipId: hydrateTransitionsFromApi(parsed.state.transitionByClipId),
+    };
+  } catch {
+    try {
+      storage.removeItem(MONTAGE_WORKSPACE_STORAGE_KEY);
+    } catch {
+      // Storage may become unavailable between reads and cleanup.
+    }
+    return empty;
+  }
+}
+
+function writeMontageWorkspace(orderedIds, transitionByClipId) {
+  const storage = getMontageWorkspaceStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(
+      MONTAGE_WORKSPACE_STORAGE_KEY,
+      JSON.stringify({
+        version: MONTAGE_WORKSPACE_STORAGE_VERSION,
+        state: { orderedIds, transitionByClipId },
+      }),
+    );
+  } catch {
+    // The workbench remains usable when storage is unavailable or full.
+  }
 }
 
 function pruneTransitionsToOrderedIds(prev, orderedIds) {
@@ -265,7 +327,8 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
   const [ffmpegGate, setFfmpegGate] = useState(FFMPEG_GATE_IDLE);
   const [loading, setLoading] = useState(false);
   const [items, setItems] = useState([]);
-  const [orderedIds, setOrderedIds] = useState([]);
+  const [restoredWorkspace] = useState(() => readMontageWorkspace());
+  const [orderedIds, setOrderedIds] = useState(() => restoredWorkspace.orderedIds);
   const [bgmPath, setBgmPath] = useState("");
   const [bgmStartSec, setBgmStartSec] = useState(0);
   const [introPath, setIntroPath] = useState("");
@@ -276,6 +339,8 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
   const [outputDir, setOutputDir] = useState("");
   const exporting = useMontageStore((s) => s.exporting);
   const setExporting = useMontageStore((s) => s.setExporting);
+  const exportProgress = useMontageStore((s) => s.exportProgress);
+  const setExportProgress = useMontageStore((s) => s.setExportProgress);
   const lastExport = useMontageStore((s) => s.lastExport);
   const setLastExport = useMontageStore((s) => s.setLastExport);
   const markExportRead = useMontageStore((s) => s.markExportRead);
@@ -288,7 +353,9 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
   const [toast, setToast] = useState(null);
   const [savingDraft, setSavingDraft] = useState(false);
   const [dragId, setDragId] = useState(null);
-  const [transitionByClipId, setTransitionByClipId] = useState({});
+  const [transitionByClipId, setTransitionByClipId] = useState(
+    () => restoredWorkspace.transitionByClipId,
+  );
   const [historyOpen, setHistoryOpen] = useState(false);
   const [deleteClipPrompt, setDeleteClipPrompt] = useState(null);
   const [batchDeleteLibraryPrompt, setBatchDeleteLibraryPrompt] = useState(null);
@@ -296,6 +363,7 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
   const [selectedTimelineClipId, setSelectedTimelineClipId] = useState(null);
   const [timelineMultiSelectedIds, setTimelineMultiSelectedIds] = useState(() => new Set());
   const [transitionEdgeSourceId, setTransitionEdgeSourceId] = useState(null);
+  const [timelineUndoSnapshot, setTimelineUndoSnapshot] = useState(null);
   const [draftDirty, setDraftDirty] = useState(false);
   const [lastDraftSavedAt, setLastDraftSavedAt] = useState(null);
   const draftDirtyBoot = useRef(true);
@@ -431,6 +499,10 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
       setTransitionEdgeSourceId(null);
     }
   }, [orderedIds, transitionEdgeSourceId]);
+
+  useEffect(() => {
+    writeMontageWorkspace(orderedIds, transitionByClipId);
+  }, [orderedIds, transitionByClipId]);
 
   useEffect(() => {
     if (draftDirtyBoot.current) {
@@ -793,7 +865,7 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
         output_filename: ensureMp4Filename(outputFilename.trim()) || "montage_export.mp4",
         transitions: transitionsPayload,
         theme_id: selectedThemeId,
-        bgm_volume: bgmVolume / 100,
+        ...(bgmPath.trim() ? { bgm_volume: bgmVolume / 100 } : {}),
         player_avatars: playerAvatarsPayload,
         name_cards_enabled: nameCardsEnabled,
       });
@@ -866,8 +938,35 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
     const fn = ensureMp4Filename(outputFilename.trim());
     const sep = dir.includes("\\") ? "\\" : "/";
     const outPath = dir.replace(/[/\\]+$/, "") + sep + fn;
+    const jobId = makeExportJobId();
     setExporting(true);
+    setExportProgress({
+      job_id: jobId,
+      status: "running",
+      stage: "preparing",
+      processed: 0,
+      total: orderedIds.length,
+      fraction: 0,
+    });
     setLastExport(null);
+    let requestSettled = false;
+    let pollInFlight = false;
+    const pollProgress = async () => {
+      if (requestSettled || pollInFlight) return;
+      pollInFlight = true;
+      try {
+        const { data } = await API.get(`/montage/export-progress/${jobId}`);
+        if (!requestSettled) setExportProgress(data);
+      } catch (e) {
+        // The export POST may not have registered the job before the first poll.
+        if (e?.response?.status && e.response.status !== 404) {
+          // Progress is best-effort; the primary POST still owns success/error.
+        }
+      } finally {
+        pollInFlight = false;
+      }
+    };
+    const pollTimer = window.setInterval(() => void pollProgress(), 500);
     try {
       const playerList = derivePlayerAssetsFromClips(orderedClips);
       const playerAvatarsPayload = playerList.map((p) => ({
@@ -893,14 +992,33 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
         theme_id: selectedThemeId,
         player_avatars: playerAvatarsPayload,
         name_cards_enabled: nameCardsEnabled,
+        client_job_id: jobId,
+      });
+      requestSettled = true;
+      setExportProgress({
+        job_id: jobId,
+        status: "done",
+        stage: "done",
+        processed: orderedIds.length,
+        total: orderedIds.length,
+        fraction: 1,
+        output_path: data.output_path,
       });
       setLastExport({ ok: true, ...data });
       showToast(t("montage.toastExportComplete"));
     } catch (e) {
+      requestSettled = true;
       const errMsg = formatMontageApiError(e, t, t("montage.exportErrorGeneric"));
+      setExportProgress((prev) => ({
+        ...(prev || {}),
+        job_id: jobId,
+        status: "error",
+        stage: "error",
+      }));
       setLastExport({ ok: false, err: errMsg });
       showToast(errMsg);
     } finally {
+      window.clearInterval(pollTimer);
       setExporting(false);
     }
   }, [
@@ -922,6 +1040,7 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
     bgmVolume,
     playerAvatars,
     nameCardsEnabled,
+    setExportProgress,
     showToast,
     t,
   ]);
@@ -938,16 +1057,36 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
     [showToast, t],
   );
 
+  const rememberTimelineForUndo = useCallback((affectedCount) => {
+    setTimelineUndoSnapshot({
+      orderedIds: [...orderedIds],
+      transitionByClipId: { ...transitionByClipId },
+      selectedTimelineClipId,
+      timelineMultiSelectedIds: [...timelineMultiSelectedIds],
+      transitionEdgeSourceId,
+      affectedCount,
+    });
+  }, [
+    orderedIds,
+    selectedTimelineClipId,
+    timelineMultiSelectedIds,
+    transitionByClipId,
+    transitionEdgeSourceId,
+  ]);
+
   const clearTimeline = useCallback(() => {
+    if (orderedIds.length === 0) return;
+    rememberTimelineForUndo(orderedIds.length);
     setOrderedIds([]);
     setTransitionByClipId({});
     setSelectedTimelineClipId(null);
     setTimelineMultiSelectedIds(new Set());
     setTransitionEdgeSourceId(null);
-  }, []);
+  }, [orderedIds.length, rememberTimelineForUndo]);
 
   const removeTimelineMulti = useCallback(() => {
     if (timelineMultiSelectedIds.size === 0) return;
+    rememberTimelineForUndo(timelineMultiSelectedIds.size);
     const drop = new Set(timelineMultiSelectedIds);
     setOrderedIds((prev) => prev.filter((id) => !drop.has(id)));
     setTransitionByClipId((prev) => {
@@ -956,7 +1095,35 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
       return next;
     });
     setTimelineMultiSelectedIds(new Set());
-  }, [timelineMultiSelectedIds]);
+    setSelectedTimelineClipId(null);
+    setTransitionEdgeSourceId(null);
+  }, [timelineMultiSelectedIds, rememberTimelineForUndo]);
+
+  const undoTimelineChange = useCallback(() => {
+    if (!timelineUndoSnapshot) return;
+    const snapshotIds = timelineUndoSnapshot.orderedIds || [];
+    const snapshotIdSet = new Set(snapshotIds);
+    const currentIdSet = new Set(orderedIds);
+    const restoredIds = snapshotIds.filter((id) => !currentIdSet.has(id));
+    setOrderedIds([
+      ...snapshotIds,
+      ...orderedIds.filter((id) => !snapshotIdSet.has(id)),
+    ]);
+    setTransitionByClipId((current) => {
+      const next = { ...current };
+      for (const id of restoredIds) {
+        const key = String(id);
+        if (Object.prototype.hasOwnProperty.call(timelineUndoSnapshot.transitionByClipId || {}, key)) {
+          next[key] = timelineUndoSnapshot.transitionByClipId[key];
+        }
+      }
+      return next;
+    });
+    setSelectedTimelineClipId(timelineUndoSnapshot.selectedTimelineClipId ?? null);
+    setTimelineMultiSelectedIds(new Set(timelineUndoSnapshot.timelineMultiSelectedIds || []));
+    setTransitionEdgeSourceId(timelineUndoSnapshot.transitionEdgeSourceId ?? null);
+    setTimelineUndoSnapshot(null);
+  }, [orderedIds, timelineUndoSnapshot]);
 
   const onOrchestrationRowClick = useCallback((e, id) => {
     setTransitionEdgeSourceId(null);
@@ -1374,6 +1541,9 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
                 onBulkMoveDown={() => shiftTimelineSelection(1)}
                 onClearTimeline={clearTimeline}
                 timelineClipCount={orderedIds.length}
+                undoCount={timelineUndoSnapshot?.affectedCount || 0}
+                onUndoTimeline={undoTimelineChange}
+                onDismissUndo={() => setTimelineUndoSnapshot(null)}
               />
             </section>
 
@@ -1419,6 +1589,7 @@ export default function MontageWorkbenchDrawer({ open, onClose, layout = "drawer
                 onOutputDirClear={() => setOutputDir("")}
                 effectiveOutputDirHint={!outputDir.trim() && effectiveOutputDir ? effectiveOutputDir : ""}
                 exportingBanner={exporting}
+                exportProgress={exportProgress}
                 exportOk={exportOk}
                 lastExport={lastExport}
                 exportDirForButton={exportDirForButton}

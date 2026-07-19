@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import API from "../api/api";
 import { useT } from "../i18n/useT.js";
+import { desktopBridge } from "../desktop/desktopBridge.js";
 import {
   Settings,
   Brain,
@@ -75,6 +76,23 @@ export default function Sidebar({
   const [systemOpen, setSystemOpen] = useState(true);
   const [updateStatus, setUpdateStatus] = useState(null);
   const [isPackaged, setIsPackaged] = useState(false);
+
+  const chooseWatchDirectories = async () => {
+    if (!desktopBridge) return;
+    try {
+      const result = await desktopBridge.showOpenDialog({
+        title: t("library.watchPathsChooseTitle"),
+        properties: ["openDirectory", "multiSelections"],
+      });
+      const selected = (result?.filePaths || []).map((path) => String(path).trim()).filter(Boolean);
+      if (!selected.length) return;
+      const next = Array.from(new Set([...(demoWatchPaths || []), ...selected]));
+      onDemoWatchPathsChange?.(next);
+      onSaveConfig?.({ demo_watch_paths: next });
+    } catch (error) {
+      console.error("Choose demo watch directories failed", error);
+    }
+  };
 
   useEffect(() => {
     if (window.electron?.isPackaged) {
@@ -367,6 +385,20 @@ export default function Sidebar({
         </button>
         {watchOpen && (
           <div className="space-y-2 px-4 pb-4">
+            <button
+              type="button"
+              disabled={!desktopBridge}
+              onClick={() => void chooseWatchDirectories()}
+              className="flex w-full items-center justify-center gap-1.5 rounded-md border border-cs2-accent/40 bg-cs2-accent/10 py-2 text-xs font-semibold text-cs2-accent transition-colors hover:bg-cs2-accent/20 disabled:opacity-45"
+            >
+              <FolderOpen className="h-3.5 w-3.5" />
+              {t("library.watchPathsChoose")}
+            </button>
+            <div className="flex items-center gap-2 text-[10px] text-cs2-text-muted">
+              <span className="h-px flex-1 bg-cs2-border" />
+              {t("library.watchPathsManual")}
+              <span className="h-px flex-1 bg-cs2-border" />
+            </div>
             <div className="flex gap-2">
               <input
                 type="text"

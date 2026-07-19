@@ -6,7 +6,10 @@ import {
   Copy,
   Check,
   FolderOpen,
+  VolumeX,
+  CircleHelp,
 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import Modal from "../ui/Modal";
 import API from "../../api/api";
 import {
@@ -36,6 +39,14 @@ function isAborted(result) {
   );
 }
 
+function hasAudioIssue(result) {
+  return result?.success && result?.audio_health?.audible === false;
+}
+
+function hasUnverifiedAudio(result) {
+  return result?.success && result?.audio_health?.audible == null;
+}
+
 // ─── component ──────────────────────────────────────────────────────────────
 
 export default function RecordingResultModal({
@@ -45,10 +56,15 @@ export default function RecordingResultModal({
   results = [],
 }) {
   const t = useT();
+  const navigate = useNavigate();
   const locale = useLocaleStore((s) => s.locale);
   const [copiedIdx, setCopiedIdx] = useState(null);
 
-  const successCount = results.filter((r) => r.success).length;
+  const successCount = results.filter(
+    (r) => r.success && !hasAudioIssue(r) && !hasUnverifiedAudio(r),
+  ).length;
+  const audioIssueCount = results.filter(hasAudioIssue).length;
+  const audioUnverifiedCount = results.filter(hasUnverifiedAudio).length;
   const abortedCount = results.filter((r) => isAborted(r)).length;
   const failCount = results.filter((r) => !r.success && !isAborted(r)).length;
   const total = results.length;
@@ -107,6 +123,18 @@ export default function RecordingResultModal({
             {t("queue.modalFailed", { n: failCount })}
           </span>
         )}
+        {audioIssueCount > 0 && (
+          <span className="flex items-center gap-1.5 text-amber-300">
+            <VolumeX className="h-4 w-4" />
+            {t("queue.modalAudioIssue", { n: audioIssueCount })}
+          </span>
+        )}
+        {audioUnverifiedCount > 0 && (
+          <span className="flex items-center gap-1.5 text-amber-200">
+            <CircleHelp className="h-4 w-4" />
+            {t("queue.modalAudioUnverifiedCount", { n: audioUnverifiedCount })}
+          </span>
+        )}
         {abortedCount > 0 && (
           <span className="flex items-center gap-1.5 text-cs2-text-muted">
             <Ban className="h-4 w-4" />
@@ -119,6 +147,8 @@ export default function RecordingResultModal({
       <ul className="divide-y divide-cs2-border">
         {results.map((result) => {
           const aborted = isAborted(result);
+          const audioIssue = hasAudioIssue(result);
+          const audioUnverified = hasUnverifiedAudio(result);
           const cd = result._queueItem?.clipData ?? null;
           const title = cd ? friendlyClipTitleForQueue(cd, t) : t("queue.modalDefaultClipTitle", { n: result._index + 1 });
           const combatLine = cd ? formatClipCombatSummaryLine(cd, t, locale) : "";
@@ -128,7 +158,11 @@ export default function RecordingResultModal({
           const playerName = String(result._queueItem?.targetPlayer || "").trim();
 
           /* ── 状态图标 ── */
-          const statusIcon = result.success ? (
+          const statusIcon = audioIssue ? (
+            <VolumeX className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+          ) : audioUnverified ? (
+            <CircleHelp className="mt-0.5 h-4 w-4 shrink-0 text-amber-200" />
+          ) : result.success ? (
             <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-cs2-text-success" />
           ) : aborted ? (
             <Ban className="mt-0.5 h-4 w-4 shrink-0 text-cs2-text-muted" />
@@ -201,6 +235,34 @@ export default function RecordingResultModal({
                       className="shrink-0 rounded p-0.5 text-cs2-text-muted hover:text-cs2-text-primary"
                     >
                       <FolderOpen className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )}
+
+                {audioIssue && (
+                  <div className="mt-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-amber-200">
+                    {result.audio_health?.status === "missing"
+                      ? t("queue.modalAudioMissing")
+                      : t("queue.modalAudioSilent")}
+                    <button
+                      type="button"
+                      onClick={() => { onClose(); navigate("/settings?tab=video"); }}
+                      className="ml-2 font-bold text-cs2-accent underline underline-offset-2"
+                    >
+                      {t("queue.modalOpenObsConfig")}
+                    </button>
+                  </div>
+                )}
+
+                {audioUnverified && (
+                  <div className="mt-1 rounded-md border border-amber-500/25 bg-amber-500/[0.08] px-2 py-1.5 text-[11px] leading-relaxed text-amber-100">
+                    {t("queue.modalAudioUnverified")}
+                    <button
+                      type="button"
+                      onClick={() => { onClose(); navigate("/settings?tab=video"); }}
+                      className="ml-2 font-bold text-cs2-accent underline underline-offset-2"
+                    >
+                      {t("queue.modalOpenObsConfig")}
                     </button>
                   </div>
                 )}

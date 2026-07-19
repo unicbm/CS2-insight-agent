@@ -10,13 +10,11 @@ import { useT } from "../../i18n/useT.js";
 import { useLocaleStore } from "../../i18n/localeStore";
 import { labelTag } from "../../utils/tagDescriptions";
 import { weaponUsedTokens } from "../../i18n/weaponNames.js";
-import { AiScoreBadge } from "../ClipCard";
 import {
   getMontageBlockShortLabel,
   blockShortLabelI18nKey,
   isClipPacingAndPovLocked,
   isRoundTimelineRoundClip,
-  isTimelineSourceClip,
 } from "../../utils/montageUtils";
 import {
   freezeToDeathQueueRoundBadgeText,
@@ -83,7 +81,6 @@ export default function QueueInspectorPanel({ selectedId: _selectedId, selectedI
   }
 
   const cd = selectedItem.clipData || {};
-  const hideQueueAi = isTimelineSourceClip(cd) || cd.category === "compilation";
   const killBadge = t(blockShortLabelI18nKey(getMontageBlockShortLabel(cd)));
   const playerName = String(selectedItem.targetPlayer || cd.player_name || "—").trim() || "—";
   const round = cd.round != null && Number.isFinite(Number(cd.round)) ? Number(cd.round) : null;
@@ -92,7 +89,6 @@ export default function QueueInspectorPanel({ selectedId: _selectedId, selectedI
   const opp = cd.score_opp != null ? Number(cd.score_opp) : null;
   const hasScorePair = own != null && opp != null && Number.isFinite(own) && Number.isFinite(opp);
   const mapName = String(cd.map_name || cd.map || "").trim();
-  const aiScore = cd.ai_score;
   const weaponPrimary = weaponUsedTokens(cd.weapon_used, locale)[0];
   const tags = Array.isArray(cd.context_tags) ? cd.context_tags.slice(0, 5) : [];
   const estSec = estimateItemRecordSeconds(selectedItem, globalPacing);
@@ -122,9 +118,6 @@ export default function QueueInspectorPanel({ selectedId: _selectedId, selectedI
               <span className="min-w-0 flex-1 truncate text-[13px] font-bold text-cs2-text-primary">
                 {playerName}
               </span>
-              <div className="ml-auto shrink-0">
-                {hideQueueAi ? null : <AiScoreBadge score={aiScore} />}
-              </div>
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               {hasScorePair ? (

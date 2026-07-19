@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   ChevronDown,
@@ -7,6 +8,7 @@ import {
   GripVertical,
   History,
   Loader2,
+  RotateCcw,
   Save,
   Shuffle,
   Trash2,
@@ -16,7 +18,6 @@ import {
   ArrowUpDown,
   ArrowDownUp,
 } from "lucide-react";
-import { AiScoreBadge } from "../ClipCard";
 import {
   getClipDurationSeconds,
   getClipRoundLabel,
@@ -25,7 +26,6 @@ import {
   blockShortLabelI18nKey,
   getMontageClipFactLine,
   getMontageTimelineVariant,
-  isTimelineSourceClip,
   getRecordedClipPerspectiveZh,
   getRecordedClipPerspectivePrimaryZh,
   mapNameFromClip,
@@ -33,22 +33,12 @@ import {
   mapNameAccentDotClass,
   getMontageExtraVictimPovCount,
   getVictimPovSegmentsTooltip,
-  getClipComment,
-  getClipScore,
   stripTagEmoji,
 } from "../../utils/montageUtils";
 import { useT } from "../../i18n/useT.js";
 import { useLocaleStore } from "../../i18n/localeStore";
 import { labelTag } from "../../utils/tagDescriptions";
 import { weaponUsedTokens } from "../../i18n/weaponNames.js";
-
-function montageAiExplainText(clip, t) {
-  const c = getClipComment(clip);
-  if (c) return c.length > 80 ? `${c.slice(0, 78)}…` : c;
-  const s = getClipScore(clip);
-  if (s != null && Number.isFinite(Number(s))) return t("montage.orchAiScore", { n: Math.round(Number(s)) });
-  return "";
-}
 
 const VARIANT_BAR = {
   ace: "bg-cs2-rose-on-surface",
@@ -365,9 +355,17 @@ export function MontageOrchestrationTimeline({
   onBulkMoveDown,
   onClearTimeline,
   timelineClipCount,
+  undoCount = 0,
+  onUndoTimeline,
+  onDismissUndo,
 }) {
   const t = useT();
   const locale = useLocaleStore((s) => s.locale);
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+
+  useEffect(() => {
+    if (!timelineClipCount) setClearConfirmOpen(false);
+  }, [timelineClipCount]);
   const rows = useMemo(() => {
     return clips.map((clip, idx) => {
       const next = clips[idx + 1];
@@ -413,16 +411,15 @@ export function MontageOrchestrationTimeline({
           <p className="text-xs text-cs2-text-muted mt-0.5">{t("montage.orchHint")}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={onClearTimeline}
-            disabled={!timelineClipCount}
-            className="rounded-lg border border-cs2-border-subtle bg-cs2-surface-1 px-3 py-1.5 text-xs font-medium text-cs2-text-secondary hover:border-cs2-border-focus hover:text-cs2-text-primary transition-all disabled:opacity-30"
-          >
-            {t("montage.orchClearBtn")}
-          </button>
           {multiCount > 0 ? (
             <>
+              <button
+                type="button"
+                onClick={onBulkRemove}
+                className="rounded-lg bg-cs2-accent px-3 py-1.5 text-xs font-bold text-cs2-text-on-accent shadow-sm shadow-cs2-accent/20 transition-colors hover:bg-cs2-accent-light"
+              >
+                {t("montage.orchBulkRemoveBtn", { n: multiCount })}
+              </button>
               <button
                 type="button"
                 onClick={onBulkMoveUp}
@@ -441,17 +438,42 @@ export function MontageOrchestrationTimeline({
                 <ArrowDown className="h-3.5 w-3.5" />
                 {t("montage.orchMoveDownBtn")}
               </button>
-              <button
-                type="button"
-                onClick={onBulkRemove}
-                className="rounded-lg border border-rose-500/30 bg-rose-500 px-3 py-1.5 text-xs font-bold text-dynamic-white hover:bg-rose-600 transition-all shadow-sm"
-              >
-                {t("montage.orchBulkRemoveBtn", { n: multiCount })}
-              </button>
             </>
           ) : null}
+          <button
+            type="button"
+            onClick={() => setClearConfirmOpen(true)}
+            disabled={!timelineClipCount}
+            className="rounded-lg border border-red-500/25 bg-transparent px-3 py-1.5 text-xs font-medium text-cs2-text-muted transition-colors hover:border-red-500/45 hover:bg-red-500/5 hover:text-rose-300 disabled:opacity-30"
+          >
+            {t("montage.orchClearAllBtn", { n: timelineClipCount })}
+          </button>
         </div>
       </div>
+      {undoCount > 0 ? (
+        <div
+          role="status"
+          className="mx-3 mt-3 flex shrink-0 items-center gap-3 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-cs2-text-secondary"
+        >
+          <RotateCcw className="h-4 w-4 shrink-0 text-amber-300" />
+          <span className="min-w-0 flex-1">{t("montage.orchClearUndoMessage", { n: undoCount })}</span>
+          <button
+            type="button"
+            onClick={onUndoTimeline}
+            className="shrink-0 rounded border border-amber-300/35 px-2.5 py-1 font-bold text-amber-200 transition-colors hover:bg-amber-300/10"
+          >
+            {t("common.undo")}
+          </button>
+          <button
+            type="button"
+            onClick={onDismissUndo}
+            className="rounded p-1 text-cs2-text-muted transition-colors hover:bg-cs2-surface-2 hover:text-cs2-text-primary"
+            aria-label={t("common.close")}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ) : null}
       {timelineClipCount >= 2 ? (
         <div className="shrink-0 border-b border-cs2-border-subtle bg-cs2-surface-2/60 px-4 py-2">
           <CollapsibleSection title={t("montage.orchGlobalTransTitle")} hint={t("montage.orchGlobalTransHint")} defaultOpen={false}>
@@ -543,8 +565,6 @@ export function MontageOrchestrationTimeline({
               const dragging = dragId === clip.id;
               const vCls = VARIANT_RING[variant] || VARIANT_RING.neutral;
               const killBadge = t(blockShortLabelI18nKey(getMontageBlockShortLabel(clip)));
-              const suppressMontageAi = isTimelineSourceClip(clip) || variant === "compilation";
-              const aiLine = suppressMontageAi ? "" : montageAiExplainText(clip, t);
               const outBase = pathBasenameQuick(clip?.output_path);
               return (
                 <li key={clip.id} className="flex flex-col">
@@ -625,11 +645,6 @@ export function MontageOrchestrationTimeline({
                           <span className="rounded bg-cs2-cyan-surface px-2 py-0.5 text-xs font-bold text-cs2-cyan-on-surface">HUD</span>
                         ) : null}
                       </div>
-                      {aiLine ? (
-                        <p className="mt-1.5 text-[11px] leading-relaxed italic text-cs2-text-muted break-words">
-                          {aiLine}
-                        </p>
-                      ) : null}
                       {outBase ? (
                         <p
                           className="mt-1.5 font-mono text-[10px] text-cs2-text-muted/90 break-all"
@@ -707,6 +722,52 @@ export function MontageOrchestrationTimeline({
           </ul>
         )}
       </div>
+      {clearConfirmOpen ? (
+        <div
+          className="fixed inset-0 z-[140] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="montage-clear-timeline-title"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setClearConfirmOpen(false);
+          }}
+        >
+          <div className="w-full max-w-md rounded-xl border border-red-500/25 bg-cs2-bg-card p-5 shadow-2xl shadow-black/50">
+            <div className="flex items-start gap-3">
+              <span className="rounded-lg bg-red-500/10 p-2 text-red-300">
+                <AlertTriangle className="h-5 w-5" />
+              </span>
+              <div className="min-w-0">
+                <h2 id="montage-clear-timeline-title" className="text-[15px] font-bold text-cs2-text-primary">
+                  {t("montage.orchClearConfirmTitle")}
+                </h2>
+                <p className="mt-1.5 text-xs leading-relaxed text-cs2-text-secondary">
+                  {t("montage.orchClearConfirmBody", { n: timelineClipCount })}
+                </p>
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setClearConfirmOpen(false)}
+                className="rounded-md border border-cs2-border px-3 py-2 text-xs font-semibold text-cs2-text-secondary transition-colors hover:bg-cs2-surface-2"
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setClearConfirmOpen(false);
+                  onClearTimeline();
+                }}
+                className="rounded-md bg-red-500 px-3 py-2 text-xs font-bold text-white transition-colors hover:bg-red-400"
+              >
+                {t("montage.orchClearConfirmAction")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -760,12 +821,10 @@ export function MontageMaterialPoolCard({
   const factLine = getMontageClipFactLine(clip, { includeDemoName: false }, t, locale);
   const killBadge = t(blockShortLabelI18nKey(getMontageBlockShortLabel(clip)));
   const variant = getMontageTimelineVariant(clip);
-  const suppressMontageAi = isTimelineSourceClip(clip) || variant === "compilation";
   const scorePair = getMontageScorePair(clip);
   const rnd = clip.round != null && Number.isFinite(Number(clip.round)) ? Number(clip.round) : null;
   const victimSegCount = getMontageExtraVictimPovCount(clip);
   const povTip = victimSegCount > 0 ? getVictimPovSegmentsTooltip(clip, t) : "";
-  const aiExplain = suppressMontageAi ? "" : montageAiExplainText(clip, t);
   const demoLabel = demoShortLabel(clip);
 
   return (
@@ -799,7 +858,6 @@ export function MontageMaterialPoolCard({
               </span>
             </div>
             <div className="flex shrink-0 items-center gap-1">
-              {suppressMontageAi ? null : <AiScoreBadge score={clip.ai_score} />}
               <button
                 type="button"
                 title={t("montage.poolCardDeleteTitle")}
@@ -889,15 +947,7 @@ export function MontageMaterialPoolCard({
           >
             {added ? t("montage.poolCardAddedBtn") : t("montage.poolCardAddBtn")}
           </button>
-          <div className="min-w-0 flex-1 text-right">
-            {aiExplain ? (
-              <p className="truncate text-[11px] text-cs2-text-muted" title={aiExplain}>
-                {aiExplain}
-              </p>
-            ) : (
-              <span className="font-mono text-xs text-cs2-text-muted">#{index}</span>
-            )}
-          </div>
+          <span className="font-mono text-xs text-cs2-text-muted">#{index}</span>
         </div>
       </div>
     </li>

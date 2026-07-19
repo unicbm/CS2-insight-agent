@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -1659,28 +1660,82 @@ class DemoDB:
             row = await cur.fetchone()
             return int(row[0]) if row else 0
 
-    async def purge_deleted_demo_files(self, existing_paths: set[str]) -> int:
-        """删除 `demo_files` 中 ``path`` 不在 ``existing_paths`` 里的记录（物理文件已被手动删除）。
-
-        用临时表收集现有路径集合，然后单条 ``DELETE ... WHERE path NOT IN (SELECT ...)`` 级联清理，
-        避免全表预读和 ``NOT IN`` 参数数量限制。
-        """
-        if not existing_paths:
-            return 0
-        batch_size = 500
-        all_paths = list(existing_paths)
+    async def all_demo_paths(self) -> set[str]:
+        """返回库中全部 demo 路径，供目录索引跳过已登记文件。"""
         async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("CREATE TEMP TABLE IF NOT EXISTS _tmp_existing_paths (path TEXT PRIMARY KEY)")
-            await conn.execute("DELETE FROM _tmp_existing_paths")
-            for i in range(0, len(all_paths), batch_size):
-                chunk = all_paths[i:i + batch_size]
-                await conn.executemany("INSERT INTO _tmp_existing_paths(path) VALUES (?)", [(p,) for p in chunk])
-            await conn.execute("DELETE FROM match_results WHERE demo_path NOT IN (SELECT path FROM _tmp_existing_paths)")
-            await conn.execute("DELETE FROM demo_result_summaries WHERE demo_path NOT IN (SELECT path FROM _tmp_existing_paths)")
-            await conn.execute("DELETE FROM demo_timeline_events WHERE demo_path NOT IN (SELECT path FROM _tmp_existing_paths)")
-            await conn.execute("DELETE FROM demo_roster_cache WHERE demo_id NOT IN (SELECT d.id FROM demo_files d WHERE d.path IN (SELECT path FROM _tmp_existing_paths))")
-            await conn.execute("DELETE FROM demo_player_stats WHERE demo_id NOT IN (SELECT d.id FROM demo_files d WHERE d.path IN (SELECT path FROM _tmp_existing_paths))")
-            cur = await conn.execute("DELETE FROM demo_files WHERE path NOT IN (SELECT path FROM _tmp_existing_paths)")
+            cur = await conn.execute("SELECT path FROM demo_files")
+            rows = await cur.fetchall()
+        return {str(row[0]) for row in rows if row and row[0]}
+
+    async def purge_deleted_demo_files(
+        self,
+        existing_paths: set[str],
+        *,
+        scanned_directories: set[str],
+    ) -> int:
+        """清理本轮已遍历目录中已从磁盘删除的 demo 记录。
+
+        ``existing_paths`` 只是当前扫描范围内的快照，不能再用它对整张表执行
+        ``NOT IN``，否则会误删上传文件、其它监听根或超出深度范围的记录。
+        """
+        normalized_existing = {
+            os.path.normcase(os.path.normpath(path))
+            for path in existing_paths
+        }
+        normalized_directories = {
+            os.path.normcase(os.path.normpath(path))
+            for path in scanned_directories
+        }
+        if not normalized_directories:
+            return 0
+
+        batch_size = 500
+        async with aiosqlite.connect(self.db_path) as conn:
+            cur = await conn.execute("SELECT path FROM demo_files")
+            rows = await cur.fetchall()
+            deleted_paths = [
+                str(row[0])
+                for row in rows
+                if row
+                and row[0]
+                and os.path.normcase(os.path.normpath(str(Path(str(row[0])).parent)))
+                in normalized_directories
+                and os.path.normcase(os.path.normpath(str(row[0])))
+                not in normalized_existing
+            ]
+            if not deleted_paths:
+                return 0
+
+            await conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _tmp_deleted_demo_paths (path TEXT PRIMARY KEY)"
+            )
+            await conn.execute("DELETE FROM _tmp_deleted_demo_paths")
+            for i in range(0, len(deleted_paths), batch_size):
+                chunk = deleted_paths[i:i + batch_size]
+                await conn.executemany(
+                    "INSERT INTO _tmp_deleted_demo_paths(path) VALUES (?)",
+                    [(path,) for path in chunk],
+                )
+            await conn.execute(
+                "DELETE FROM match_results WHERE demo_path IN (SELECT path FROM _tmp_deleted_demo_paths)"
+            )
+            await conn.execute(
+                "DELETE FROM demo_result_summaries WHERE demo_path IN (SELECT path FROM _tmp_deleted_demo_paths)"
+            )
+            await conn.execute(
+                "DELETE FROM demo_timeline_events WHERE demo_path IN (SELECT path FROM _tmp_deleted_demo_paths)"
+            )
+            await conn.execute(
+                "DELETE FROM demo_roster_cache WHERE demo_id IN "
+                "(SELECT id FROM demo_files WHERE path IN (SELECT path FROM _tmp_deleted_demo_paths))"
+            )
+            await conn.execute(
+                "DELETE FROM demo_player_stats WHERE demo_id IN "
+                "(SELECT id FROM demo_files WHERE path IN (SELECT path FROM _tmp_deleted_demo_paths))"
+            )
+            cur = await conn.execute(
+                "DELETE FROM demo_files WHERE path IN (SELECT path FROM _tmp_deleted_demo_paths)"
+            )
             await conn.commit()
             total = cur.rowcount
             if total:

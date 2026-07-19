@@ -7,6 +7,7 @@ export default function DemoLibraryToolbar({
   onOpenIngest,
   libraryLoading,
   libraryScanning,
+  libraryScanStatus,
   pageSelectableCount,
   libraryTotal,
   onSelectPage,
@@ -15,6 +16,12 @@ export default function DemoLibraryToolbar({
   onViewModeChange,
 }) {
   const t = useT();
+  const scanTotal = Number(libraryScanStatus?.total || 0);
+  const scanProcessed = Number(libraryScanStatus?.processed || 0);
+  const scanPercent = scanTotal > 0
+    ? Math.max(0, Math.min(100, Math.round((scanProcessed / scanTotal) * 100)))
+    : 0;
+  const showScanStatus = libraryScanning || ["done", "error"].includes(libraryScanStatus?.state);
 
   const viewBtn = (mode, Icon) => (
     <button
@@ -27,7 +34,8 @@ export default function DemoLibraryToolbar({
     </button>
   );
   return (
-    <div className="flex shrink-0 flex-col gap-3 border-b border-cs2-border pb-3 sm:flex-row sm:items-start sm:justify-between">
+    <div className="flex shrink-0 flex-col gap-2 border-b border-cs2-border pb-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
       <div className="min-w-0">
         <h1 className="text-lg font-bold text-cs2-text-primary">{t("library.pageTitle")}</h1>
         <p className="mt-0.5 text-[12px] leading-relaxed text-cs2-text-muted">
@@ -87,6 +95,38 @@ export default function DemoLibraryToolbar({
           {t("library.btnSelectAll")}
         </button>
       </div>
+      </div>
+      {showScanStatus ? (
+        <div
+          className={`rounded-md border px-3 py-2 ${libraryScanStatus?.state === "error" ? "border-cs2-fail/35 bg-cs2-fail/5" : "border-cs2-accent/25 bg-cs2-accent/5"}`}
+          role="status"
+          aria-live="polite"
+        >
+          <div className="flex items-center justify-between gap-3 text-[11px]">
+            <span className="min-w-0 truncate font-semibold text-cs2-text-secondary">
+              {t(`library.scanPhase.${libraryScanStatus?.phase || "indexing"}`)}
+              {libraryScanStatus?.current_file ? ` · ${libraryScanStatus.current_file}` : ""}
+            </span>
+            <span className="shrink-0 font-mono text-cs2-text-muted">
+              {scanTotal > 0 ? `${scanProcessed}/${scanTotal} · ${scanPercent}%` : t("library.scanIndexing")}
+            </span>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-cs2-bg-input">
+            <div
+              className={`h-full rounded-full transition-[width] duration-300 ${libraryScanStatus?.state === "error" ? "bg-cs2-fail" : "bg-cs2-accent"}`}
+              style={{ width: libraryScanStatus?.state === "done" ? "100%" : `${scanPercent}%` }}
+            />
+          </div>
+          {libraryScanStatus?.skipped_existing > 0 ? (
+            <p className="mt-1.5 text-[10px] text-cs2-text-muted">
+              {t("library.scanSkippedExisting", { count: libraryScanStatus.skipped_existing })}
+            </p>
+          ) : null}
+          {libraryScanStatus?.error ? (
+            <p className="mt-1.5 text-[10px] text-cs2-fail">{libraryScanStatus.error}</p>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

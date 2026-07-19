@@ -9,7 +9,6 @@ import {
   BookOpen,
   Clapperboard,
   Library,
-  Microscope,
   Package,
   SlidersHorizontal,
   Settings,
@@ -64,14 +63,6 @@ function SetupChecklist() {
       required: false,
       label: t("guide.setupFfmpegLabel"),
       desc: t("guide.setupFfmpegDesc"),
-      to: "/settings",
-      linkLabel: t("guide.setupSettingsLink"),
-    },
-    {
-      key: "ai_key_ok",
-      required: false,
-      label: t("guide.setupAiLabel"),
-      desc: t("guide.setupAiDesc"),
       to: "/settings",
       linkLabel: t("guide.setupSettingsLink"),
     },
@@ -286,7 +277,6 @@ function FeatureCards() {
 
   const NAV_CARDS = [
     { to: "/library", label: t("guide.navLibrary"), desc: t("guide.navLibraryDesc"), icon: Library },
-    { to: "/analysis", label: t("guide.navAnalysis"), desc: t("guide.navAnalysisDesc"), icon: Microscope },
     { to: "/queue", label: t("guide.navQueue"), desc: t("guide.navQueueDesc"), icon: Package },
     { to: "/montage", label: t("guide.navMontage"), desc: t("guide.navMontageDesc"), icon: Clapperboard },
     { to: "/settings?tab=video", label: t("guide.navObsConfig"), desc: t("guide.navObsConfigDesc"), icon: RadioTower },

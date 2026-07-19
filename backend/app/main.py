@@ -40,10 +40,12 @@ from .env_utils import (
     detect_cs2_path,
     detect_ffmpeg_path,
     detect_obs_path,
+    find_windows_process_pids,
     minimize_obs_window,
     resolve_config_path,
     llm_api_key_configured,
     llm_base_url_is_local_host,
+    llm_requests_enabled,
     get_data_dir,
 )
 from .demo_db import DemoDB, DemoListFilters, utc_now_iso
@@ -82,6 +84,11 @@ from .steam_match_history import (
     is_demo_expired,
 )
 
+
+def _legacy_llm_review_enabled(cfg: AppConfig) -> bool:
+    """Keep reviewer calls opt-in and outside the default product path."""
+    return llm_requests_enabled(cfg.ai_mode, cfg.llm)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 install_gsi_access_log_filter()
 
@@ -112,6 +119,17 @@ DB_PATH = resolve_config_path().parent / "cs2-insight.db"
 demo_db = DemoDB(DB_PATH)
 montage_db = MontageDB(DB_PATH)
 demo_watcher: DemoWatcher | None = None
+_demo_scan_lock = asyncio.Lock()
+_demo_scan_status: dict[str, Any] = {
+    "state": "idle",
+    "phase": "idle",
+    "processed": 0,
+    "total": 0,
+    "current_file": None,
+    "skipped_existing": 0,
+    "discovered_count": 0,
+    "error": None,
+}
 _demo_roster_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -187,6 +205,9 @@ async def _enqueue_demo_path(path: Path, origin_zip: str | None = None) -> None:
         return
     stripe = (hash(demo_path) & 0x7FFFFFFF) % _ENQUEUE_STRIPE_COUNT
     async with _enqueue_striped_locks[stripe]:
+        if await demo_db.get_demo_by_path(demo_path):
+            logger.debug("Skip enqueue (already indexed): %s", demo_path)
+            return
         size: int | None = None
         mtime_iso: str | None = None
         try:
@@ -268,7 +289,12 @@ async def lifespan(_: FastAPI):
     removed_gsi_configs = cleanup_stale_gsi_configs(cfg.cs2_path)
     if removed_gsi_configs:
         logger.info("Removed %d stale CS2 Insight GSI config(s)", len(removed_gsi_configs))
-    demo_watcher = DemoWatcher(cfg.demo_watch_paths or [], _enqueue_demo_path, demo_db)
+    demo_watcher = DemoWatcher(
+        cfg.demo_watch_paths or [],
+        _enqueue_demo_path,
+        demo_db,
+        max_depth=cfg.demo_scan_depth,
+    )
     from .pov_hud_manager import try_restore_stale_pov_on_startup
 
     for _msg in try_restore_stale_pov_on_startup(cfg):
@@ -584,7 +610,7 @@ async def _run_library_demo_analyze(
         raise HTTPException(500, msg)
 
     cfg = load_config()
-    if cfg.ai_mode and cfg.llm.api_key:
+    if _legacy_llm_review_enabled(cfg):
         from .ai_reviewer import enrich_clips_dicts_with_reviewer
 
         async def _enrich_library_player(player: str) -> None:
@@ -639,6 +665,7 @@ async def _run_library_demo_analyze(
 
 class ExperimentalPayload(BaseModel):
     pov_enabled: Optional[bool] = None
+    legacy_llm_enabled: Optional[bool] = None
 
 
 class ConfigPayload(BaseModel):
@@ -648,6 +675,7 @@ class ConfigPayload(BaseModel):
     montage_encoder: Optional[str] = None
     cs2_path: Optional[str] = None
     demo_watch_paths: Optional[list[str]] = None
+    demo_scan_depth: Optional[int] = Field(default=None, ge=-1, le=12)
     ai_mode: Optional[bool] = None
     locale: Optional[str] = None
     expected_parse_players: Optional[list[str]] = None
@@ -681,6 +709,7 @@ def get_config():
     cfg = load_config()
     cfg = ensure_cs2_path(cfg)
     data = cfg.model_dump()
+    data["ai_mode"] = bool(data.get("ai_mode"))
     if data["llm"]["api_key"]:
         data["llm"]["api_key"] = "****" + data["llm"]["api_key"][-4:]
     if data.get("steam_api_key"):
@@ -921,6 +950,8 @@ async def update_config(payload: ConfigPayload):
         cfg.cs2_path = payload.cs2_path
     if payload.demo_watch_paths is not None:
         cfg.demo_watch_paths = [str(Path(p).expanduser()) for p in payload.demo_watch_paths if str(p).strip()]
+    if payload.demo_scan_depth is not None:
+        cfg.demo_scan_depth = int(payload.demo_scan_depth)
     if payload.ai_mode is not None:
         cfg.ai_mode = payload.ai_mode
     if payload.locale is not None and payload.locale in ("zh", "en", "auto"):
@@ -999,6 +1030,8 @@ async def update_config(payload: ConfigPayload):
     if payload.experimental is not None:
         if payload.experimental.pov_enabled is not None:
             cfg.experimental.pov_enabled = bool(payload.experimental.pov_enabled)
+        if payload.experimental.legacy_llm_enabled is not None:
+            cfg.experimental.legacy_llm_enabled = bool(payload.experimental.legacy_llm_enabled)
     if payload.steam_api_key is not None and payload.steam_api_key and not payload.steam_api_key.startswith("****"):
         cfg.steam_api_key = payload.steam_api_key.strip()
     if payload.steam_id64 is not None and payload.steam_id64:
@@ -1008,11 +1041,12 @@ async def update_config(payload: ConfigPayload):
     if payload.match_count is not None and payload.match_count in (20, 50, 100):
         cfg.match_count = payload.match_count
     save_config(cfg)
-    if demo_watcher is not None and payload.demo_watch_paths is not None:
-        # 只更新路径配置（供后续 /api/demos/scan 手动扫描使用）；
-        # 不再 restart watchdog、也不再自动 scan_existing，避免配置保存瞬间触发
-        # 大量重型解析抢占 CS2 录制时的系统资源。
-        demo_watcher._paths = list(cfg.demo_watch_paths or [])
+    if demo_watcher is not None and (
+        payload.demo_watch_paths is not None or payload.demo_scan_depth is not None
+    ):
+        # 仅重启轻量文件监听，让新增目录/深度立即生效；不自动扫描或解析已有文件。
+        demo_watcher._max_depth = int(cfg.demo_scan_depth)
+        await demo_watcher.restart(list(cfg.demo_watch_paths or []))
     return {"status": "ok"}
 
 
@@ -1198,7 +1232,7 @@ def setup_status():
 
 @app.post("/api/obs/config-check")
 def obs_config_check(payload: OBSConfig | None = Body(default=None)):
-    """配置检查：先测路径（拉起 OBS），再测连接。"""
+    """检查 OBS：优先复用已连接实例，仅在确认进程不存在时自动启动。"""
     import time as _time
 
     cfg = load_config()
@@ -1210,85 +1244,164 @@ def obs_config_check(payload: OBSConfig | None = Body(default=None)):
     obs_version = None
 
     obs_path = (obs_use.obs_path or cfg.obs.obs_path or "").strip()
+    connection = obs_config_center.get_connection_readiness(obs_use)
     logger.info("[OBS config-check] obs_path=%r", obs_path)
 
-    if obs_path and Path(obs_path).is_file():
+    path_ok = bool(obs_path and Path(obs_path).is_file())
+
+    # WebSocket is the strongest signal that the instance the app needs is
+    # already alive.  Never let a flaky Windows process probe override it.
+    connected = _test_obs_websocket_connection(obs_use, cfg.cs2_path)
+    process_state: OBSProcessState | None = None
+
+    if not connected:
+        if obs_path and not path_ok:
+            logger.warning("[OBS config-check] Path configured but file not found: %s", obs_path)
+            return {
+                "path_ok": False,
+                "connected": False,
+                "launched_obs": False,
+                "error": "OBS 路径不存在",
+                "connection": connection,
+            }
+        if not obs_path:
+            logger.info("[OBS config-check] No obs_path configured, skipping launch")
+            return {
+                "path_ok": False,
+                "connected": False,
+                "launched_obs": False,
+                "error": "请先配置 OBS 路径，再点击配置检查",
+                "connection": connection,
+            }
+
+        static_blockers = {
+            "OBS_WEBSOCKET_DISABLED",
+            "OBS_PORT_MISMATCH",
+            "OBS_PASSWORD_REQUIRED",
+        }.intersection(connection.get("blockers", []))
+        if static_blockers:
+            return {
+                "path_ok": True,
+                "connected": False,
+                "launched_obs": False,
+                "connection": connection,
+            }
+
         with _obs_launch_lock:
-            # 双重检查：第一个请求可能已经拉起了 OBS
-            running = _is_obs_process_running(obs_path)
-            logger.info("[OBS config-check] Path OK, OBS already running=%s", running)
-            if not running:
-                logger.info("[OBS config-check] Launching OBS: %s", obs_path)
-                try:
-                    subprocess.Popen([obs_path], cwd=str(Path(obs_path).parent))
-                    launched_obs = True
-                    path_ok = True
-                    # 轮询等待 OBS 进程出现，最多 15 秒
-                    for _attempt in range(30):
-                        if _is_obs_process_running(obs_path):
-                            break
-                        _time.sleep(0.5)
-                    else:
-                        logger.warning("[OBS config-check] OBS did not appear after 15s; continuing anyway")
-                    _time.sleep(1)
-                except Exception as e:
-                    logger.error("[OBS config-check] Failed to launch OBS: %s", e)
-                    return {"path_ok": False, "error": f"无法启动 OBS: {e}"}
-            else:
-                path_ok = True
-    elif obs_path:
-        logger.warning("[OBS config-check] Path configured but file not found: %s", obs_path)
-        return {"path_ok": False, "error": "OBS 路径不存在"}
-    else:
-        logger.info("[OBS config-check] No obs_path configured, skipping launch")
-        return {"path_ok": False, "connected": False, "error": "请先配置 OBS 路径，再点击配置检查"}
+            # Double-check inside the lock: another request may have launched
+            # OBS while this request was waiting.
+            connected = _test_obs_websocket_connection(obs_use, cfg.cs2_path)
+            if not connected:
+                process_state = _obs_process_state(obs_path)
+                logger.info("[OBS config-check] OBS process state=%s", process_state)
+                if process_state == "absent":
+                    logger.info("[OBS config-check] Launching OBS: %s", obs_path)
+                    try:
+                        subprocess.Popen([obs_path], cwd=str(Path(obs_path).parent))
+                        launched_obs = True
+                        # Keep the launch lock until either WebSocket is ready or
+                        # Windows can see the new process.  This closes the short
+                        # Popen-to-process-probe race where a concurrent request could
+                        # otherwise launch a second instance.
+                        for _attempt in range(20):
+                            if _test_obs_websocket_connection(obs_use, cfg.cs2_path):
+                                connected = True
+                                break
+                            post_launch_state = _obs_process_state(obs_path)
+                            if post_launch_state in {"running", "unknown"}:
+                                break
+                            _time.sleep(0.25)
+                    except Exception as e:
+                        logger.error("[OBS config-check] Failed to launch OBS: %s", e)
+                        return {
+                            "path_ok": False,
+                            "connected": False,
+                            "launched_obs": False,
+                            "process_state": process_state,
+                            "error": f"无法启动 OBS: {e}",
+                            "connection": connection,
+                        }
+                elif process_state == "unknown":
+                    # A failed process enumeration is not proof that OBS is absent.
+                    # Starting in this state is exactly how duplicate instances
+                    # were created on machines under memory pressure.
+                    logger.warning(
+                        "[OBS config-check] Process state unknown; refusing duplicate launch"
+                    )
+                    return {
+                        "path_ok": True,
+                        "connected": False,
+                        "launched_obs": False,
+                        "process_state": process_state,
+                        "error": "无法可靠判断 OBS 是否已运行，已阻止重复启动；请确认 OBS 状态后重试",
+                        "connection": connection,
+                    }
 
-    # 2) 测试 WebSocket 连接 — 15s 内每 1s 重试一次
-    try:
-        from .obs_director import OBSDirector
-        director = OBSDirector(obs_use, cfg.cs2_path)
-
-        connected = False
+    # OBS may be starting, or a running instance may still be bringing up its
+    # WebSocket server. Retry without ever launching a second process.
+    if not connected:
         for _attempt in range(15):
-            result = director.test_obs_connection()
-            if result.get("ok"):
+            if _test_obs_websocket_connection(obs_use, cfg.cs2_path):
                 connected = True
                 break
-            _time.sleep(1)
+            if _attempt < 14:
+                _time.sleep(1)
         else:
             logger.warning("[OBS config-check] WebSocket connection failed after 15 retries")
 
-        if connected:
-            _normalize_obs_path_auto_detect(cfg)
-            cfg.obs.obs_config_verified = True
-            save_config(cfg)
-    except Exception as e:
-        logger.warning("[OBS config-check] OBS connection test exception: %s", e)
-        connected = False
+    if connected:
+        _normalize_obs_path_auto_detect(cfg)
+        cfg.obs.obs_config_verified = True
+        save_config(cfg)
 
     # 连接成功后最小化 OBS 窗口（放在 try 外确保执行）
     if connected:
         minimize_obs_window()
 
+    connection = obs_config_center.get_connection_readiness(obs_use)
+    connection["connected"] = connected
+    if connected:
+        connection["port_open"] = True
+        connection["blockers"] = []
+
     return {
         "path_ok": path_ok,
         "connected": connected,
         "launched_obs": launched_obs,
+        "process_state": process_state,
+        "connection": connection,
     }
 
 
-def _is_obs_process_running(obs_path: str) -> bool:
-    """检查 OBS 进程是否已在运行（Windows 上按可执行文件名匹配）。"""
-    import subprocess as _sp
+OBSProcessState = Literal["running", "absent", "unknown"]
+
+
+def _test_obs_websocket_connection(obs_cfg: OBSConfig, cs2_path: str) -> bool:
+    """Bounded, side-effect-free OBS handshake used before every launch decision."""
+    try:
+        from .obs_director import OBSDirector
+
+        director = OBSDirector(obs_cfg, cs2_path)
+        return bool(
+            director.test_obs_connection(handshake_timeout_sec=1.5).get("ok", False)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.info("[OBS config-check] WebSocket probe failed: %s", exc)
+        return False
+
+
+def _obs_process_state(obs_path: str) -> OBSProcessState:
+    """Return a three-state OBS process result; probe failures are never absence."""
     try:
         exe_name = Path(obs_path).name
-        result = _sp.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {exe_name}", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return exe_name.lower() in result.stdout.lower()
-    except Exception:
-        return False
+        pids = find_windows_process_pids(exe_name)
+        if pids is None:
+            logger.warning("OBS process probe failed for %s", exe_name)
+            return "unknown"
+        return "running" if pids else "absent"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OBS process probe unavailable: %s", exc)
+        return "unknown"
 
 
 @app.post("/api/obs/is-running")
@@ -1296,24 +1409,50 @@ def obs_is_running():
     """检查 OBS 进程是否在运行（不尝试连接 WebSocket）。"""
     cfg = load_config()
     obs_path = (cfg.obs.obs_path or "").strip()
-    running = _is_obs_process_running(obs_path) if obs_path else False
-    return {"running": running, "obs_path": obs_path}
+    state: OBSProcessState = _obs_process_state(obs_path) if obs_path else "absent"
+    return {"running": state == "running", "process_state": state, "obs_path": obs_path}
 
 
 @app.post("/api/obs/launch")
 def obs_launch():
-    """拉起 OBS 进程（不等待 WebSocket）。"""
+    """拉起 OBS 进程；已连接、已运行或状态未知时都不会重复启动。"""
     import time as _t
     cfg = load_config()
     obs_path = (cfg.obs.obs_path or "").strip()
     if not obs_path or not Path(obs_path).is_file():
         raise HTTPException(400, "OBS 路径未配置或文件不存在")
-    try:
-        subprocess.Popen([obs_path], cwd=str(Path(obs_path).parent))
-        _t.sleep(2)
-    except Exception as e:
-        raise HTTPException(400, f"无法启动 OBS: {e}")
-    return {"ok": True}
+    with _obs_launch_lock:
+        if _test_obs_websocket_connection(cfg.obs, cfg.cs2_path):
+            return {
+                "ok": True,
+                "launched_obs": False,
+                "already_running": True,
+                "process_state": "running",
+            }
+        state = _obs_process_state(obs_path)
+        if state == "running":
+            return {
+                "ok": True,
+                "launched_obs": False,
+                "already_running": True,
+                "process_state": state,
+            }
+        if state == "unknown":
+            raise HTTPException(
+                503,
+                "无法可靠判断 OBS 是否已运行，已阻止重复启动；请确认 OBS 状态后重试",
+            )
+        try:
+            subprocess.Popen([obs_path], cwd=str(Path(obs_path).parent))
+            _t.sleep(2)
+        except Exception as e:
+            raise HTTPException(400, f"无法启动 OBS: {e}")
+    return {
+        "ok": True,
+        "launched_obs": True,
+        "already_running": False,
+        "process_state": "absent",
+    }
 
 
 @app.get("/api/obs-config/status")
@@ -1445,7 +1584,7 @@ async def parse_demo(req: ParseRequest, filename: str):
         raise HTTPException(500, f"Demo 解析失败：{e}") from e
 
     cfg = load_config()
-    if cfg.ai_mode and cfg.llm.api_key:
+    if _legacy_llm_review_enabled(cfg):
         try:
             from .ai_reviewer import enrich_clips_dicts_with_reviewer
 
@@ -1488,7 +1627,7 @@ async def parse_demo_multi(req: ParseMultiRequest, filename: str):
     except IsolatedParseError as e:
         raise HTTPException(500, f"Demo 解析失败：{e}") from e
 
-    if cfg.ai_mode and cfg.llm.api_key:
+    if _legacy_llm_review_enabled(cfg):
         from .ai_reviewer import enrich_clips_dicts_with_reviewer
 
         async def _review(player: str, result) -> None:
@@ -1551,7 +1690,7 @@ async def parse_demo_batch(req: BatchParseRequest):
         response = dict(response)
         response["demo_path"] = str(dem_path)
         response["demo_filename"] = dem_path.name
-        if cfg.ai_mode and cfg.llm.api_key:
+        if _legacy_llm_review_enabled(cfg):
             try:
                 from .ai_reviewer import enrich_clips_dicts_with_reviewer
 
@@ -2381,16 +2520,65 @@ async def patch_demo_display_name(demo_id: int, body: DemoDisplayNamePatch):
 
 @app.post("/api/demos/scan")
 async def scan_watch_paths():
+    global _demo_scan_status
     if demo_watcher is None:
         return {"scanned": 0, "player_stats_index": None, "discovered_count": 0}
-    scanned = await demo_watcher.scan_existing()
+    if _demo_scan_lock.locked():
+        return {**_demo_scan_status, "already_running": True}
+
+    async with _demo_scan_lock:
+        _demo_scan_status = {
+            "state": "running",
+            "phase": "indexing",
+            "processed": 0,
+            "total": 0,
+            "current_file": None,
+            "skipped_existing": 0,
+            "discovered_count": 0,
+            "error": None,
+            "depth": demo_watcher.max_depth,
+        }
+
+        def _scan_progress(update: dict[str, Any]) -> None:
+            _demo_scan_status.update(update)
+            _demo_scan_status["state"] = "running"
+
+        try:
+            scanned = await demo_watcher.scan_existing(progress=_scan_progress)
+            discovered_count = await demo_db.count_discovered_demos()
+            _demo_scan_status.update(
+                {
+                    "state": "done",
+                    "phase": "done",
+                    "processed": int(_demo_scan_status.get("total") or scanned),
+                    "current_file": None,
+                    "discovered_count": discovered_count,
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            logger.exception("POST /api/demos/scan failed")
+            _demo_scan_status.update(
+                {
+                    "state": "error",
+                    "phase": "error",
+                    "current_file": None,
+                    "error": str(exc),
+                }
+            )
+            raise HTTPException(500, str(exc)) from exc
     logger.info("POST /api/demos/scan: scan_existing finished scanned=%s", scanned)
-    try:
-        discovered_count = await demo_db.count_discovered_demos()
-    except Exception:
-        logger.exception("count discovered demos after scan failed")
-        discovered_count = 0
-    return {"scanned": scanned, "player_stats_index": None, "discovered_count": discovered_count}
+    return {
+        "scanned": scanned,
+        "player_stats_index": None,
+        "discovered_count": discovered_count,
+        "scan": dict(_demo_scan_status),
+    }
+
+
+@app.get("/api/demos/scan/status")
+async def scan_watch_paths_status():
+    return dict(_demo_scan_status)
 
 
 @app.post("/api/demos/{demo_id}/parse")
@@ -2633,14 +2821,15 @@ def config_backup_restore():
             status_code=409,
             detail={"code": "CS2_RUNNING"},
         )
-    res = restore_latest_user_config_backup()
+    cfg = ensure_cs2_path(load_config())
+    res = restore_latest_user_config_backup(cs2_path=cfg.cs2_path)
     if res.get("code") == "CS2_RUNNING":
         raise HTTPException(status_code=409, detail={"code": "CS2_RUNNING"})
     if res.get("ok"):
         return {"ok": True, "code": "CONFIG_RESTORE_OK", "restored": res.get("restored", 0)}
     return {
         "ok": False,
-        "code": "CONFIG_RESTORE_PARTIAL",
+        "code": res.get("code") or "CONFIG_RESTORE_PARTIAL",
         "failed": res.get("failed") or [],
     }
 
@@ -2822,10 +3011,57 @@ class MontageExportBody(BaseModel):
     radar_overlay: Optional[RadarOverlayOptions] = None
     player_avatars: list[PlayerAvatar] = Field(default_factory=list)
     name_cards_enabled: Optional[bool] = None  # None = inherit from project extras
+    client_job_id: Optional[str] = Field(
+        default=None,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9._-]+$",
+    )
+
+
+_montage_export_progress_lock = threading.Lock()
+_montage_export_progress: dict[str, dict[str, Any]] = {}
+
+
+def _set_montage_export_progress(job_id: str | None, **patch: Any) -> None:
+    """Thread-safe in-memory progress for the currently running desktop export.
+
+    FFmpeg work runs in ``asyncio.to_thread``; keeping this lightweight avoids
+    turning every progress tick into a SQLite write while still giving the UI a
+    reliable heartbeat and stage/count feedback.
+    """
+    key = str(job_id or "").strip()
+    if not key:
+        return
+    with _montage_export_progress_lock:
+        row = dict(_montage_export_progress.get(key) or {})
+        row.update(patch)
+        row["job_id"] = key
+        row["updated_at"] = utc_now_iso()
+        _montage_export_progress[key] = row
+        if len(_montage_export_progress) > 64:
+            stale = sorted(
+                _montage_export_progress,
+                key=lambda item: str(_montage_export_progress[item].get("updated_at") or ""),
+            )[:-48]
+            for old_key in stale:
+                _montage_export_progress.pop(old_key, None)
+
+
+@app.get("/api/montage/export-progress/{job_id}")
+def montage_export_progress(job_id: str):
+    key = str(job_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", key):
+        raise HTTPException(400, "invalid job id")
+    with _montage_export_progress_lock:
+        row = _montage_export_progress.get(key)
+        if row is None:
+            raise HTTPException(404, "export progress not found")
+        return dict(row)
 
 
 @app.post("/api/montage/export")
 async def montage_export(body: MontageExportBody):
+    progress_job_id = str(body.client_job_id or "").strip() or None
     cfg = load_config()
     try:
         from .video_composer import MontageComposerError, resolve_ffmpeg_binary
@@ -2852,7 +3088,11 @@ async def montage_export(body: MontageExportBody):
         raise HTTPException(400, error_detail("MONTAGE_NO_CLIPS"))
 
     def _coalesce(req_val: Optional[str], key: str) -> Optional[str]:
-        if req_val is not None:
+        # Explicit null means "clear this optional asset".  Only an omitted
+        # field inherits the saved project value.
+        if key in body.model_fields_set:
+            if req_val is None:
+                return None
             s = str(req_val).strip()
             return s or None
         v = extras.get(key)
@@ -3014,6 +3254,27 @@ async def montage_export(body: MontageExportBody):
         body=snap,
         status="running",
     )
+    _set_montage_export_progress(
+        progress_job_id,
+        status="running",
+        stage="preparing",
+        processed=0,
+        export_id=export_id,
+        total=len(clip_paths),
+        fraction=0.0,
+    )
+
+    def _report_export_progress(update: dict[str, Any]) -> None:
+        safe = dict(update or {})
+        safe.pop("job_id", None)
+        safe.pop("export_id", None)
+        try:
+            processed = max(0, int(safe.get("processed") or 0))
+            total = max(0, int(safe.get("total") or 0))
+        except (TypeError, ValueError):
+            processed, total = 0, 0
+        safe["fraction"] = min(1.0, processed / total) if total > 0 else 0.0
+        _set_montage_export_progress(progress_job_id, status="running", **safe)
 
     try:
         from .video_composer import MontageComposerError, compose_montage
@@ -3034,17 +3295,74 @@ async def montage_export(body: MontageExportBody):
             outro_image_duration=outro_img_dur_eff,
             montage_encoder=cfg.montage_encoder or "auto",
             name_cards=name_cards_arg,
+            progress_callback=_report_export_progress if progress_job_id else None,
         )
     except MontageComposerError as e:
         from .montage_errors import montage_detail_from_exception
 
         detail = montage_detail_from_exception(e)
-        await montage_db.update_export(
-            export_id, status="error", error_msg=str(detail.get("code") or "MONTAGE_EXPORT_FAILED"), output_path=None,
+        error_code = str(detail.get("code") or "MONTAGE_EXPORT_FAILED")
+        _set_montage_export_progress(
+            progress_job_id,
+            status="error",
+            stage="error",
+            error_code=error_code,
         )
+        try:
+            await montage_db.update_export(
+                export_id,
+                status="error",
+                error_msg=error_code,
+                output_path=None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not persist montage error status export_id=%s", export_id)
         raise HTTPException(400, detail) from e
+    except Exception as e:  # noqa: BLE001
+        from .montage_errors import montage_detail_from_exception
 
-    await montage_db.update_export(export_id, status="done", error_msg="", output_path=str(out))
+        detail = montage_detail_from_exception(e)
+        code = str(detail.get("code") or "MONTAGE_EXPORT_FAILED")
+        logger.exception("Unexpected montage export failure export_id=%s", export_id)
+        _set_montage_export_progress(
+            progress_job_id,
+            status="error",
+            stage="error",
+            error_code=code,
+        )
+        try:
+            await montage_db.update_export(
+                export_id,
+                status="error",
+                error_msg=code,
+                output_path=None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not persist montage error status export_id=%s", export_id)
+        raise HTTPException(500, detail) from e
+
+    try:
+        await montage_db.update_export(export_id, status="done", error_msg="", output_path=str(out))
+    except Exception as e:  # noqa: BLE001
+        from .api_errors import error_detail
+
+        logger.exception("Could not persist completed montage export_id=%s", export_id)
+        _set_montage_export_progress(
+            progress_job_id,
+            status="error",
+            stage="error",
+            error_code="MONTAGE_EXPORT_FAILED",
+        )
+        raise HTTPException(500, error_detail("MONTAGE_EXPORT_FAILED")) from e
+    _set_montage_export_progress(
+        progress_job_id,
+        status="done",
+        stage="done",
+        processed=len(clip_paths),
+        total=len(clip_paths),
+        fraction=1.0,
+        output_path=str(out),
+    )
     return {"export_id": export_id, "status": "done", "output_path": str(out)}
 
 

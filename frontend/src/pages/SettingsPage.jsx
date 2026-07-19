@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import API from "../api/api";
 import { calibrateObs, getObsConfigStatus } from "../api/obsConfigCenter";
+import { obsConfigHasAutoFixableIssues, obsConfigHasIssues } from "../utils/obsConfigHealth";
 import { useT } from "../i18n/useT.js";
 import { useLocaleStore } from "../i18n/localeStore.js";
 import { useAppShell } from "../context/AppShellContext";
 import { desktopBridge } from "../desktop/desktopBridge.js";
 import RecordingParamsPage from "./RecordingParamsPage";
 import SponsorModal from "../components/SponsorModal";
+import OptionalAiReviewSettings from "../components/OptionalAiReviewSettings";
 import {
   Settings as SettingsIcon,
   Search,
@@ -434,6 +436,16 @@ export default function SettingsPage() {
     });
   }, []);
 
+  const setAiReviewEnabled = useCallback((enabled) => {
+    setConfig((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        ai_mode: Boolean(enabled),
+      };
+    });
+  }, []);
+
   // ─── Save handler (defined early because handleCalibrate depends on it) ───
 
   const handleSave = useCallback(async () => {
@@ -473,6 +485,8 @@ export default function SettingsPage() {
       };
 
       await API.put("config", payload);
+      shell.setAiMode?.(!!config.ai_mode);
+      shell.setLlmConfig?.(payload.llm);
       useLocaleStore.getState().hydrate(payload.locale);
       setSaveMsg({ text: t("app.settingsSaved") ?? "Saved", tone: "ok" });
     } catch (e) {
@@ -480,7 +494,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [config, saving, t]);
+  }, [config, saving, shell.setAiMode, shell.setLlmConfig, t]);
 
   // ─── OBS Config Check / Calibrate ──────────────────────────────
 
@@ -505,9 +519,7 @@ export default function SettingsPage() {
         obs_path: obs.obs_path ?? "",
       });
       setCheckResult(data);
-      if (data.connected) {
-        await fetchObsStatus();
-      }
+      await fetchObsStatus();
     } catch (e) {
       setCheckResult({ error: e.response?.data?.detail || e.message || t("obscfg.errorCheckFail") });
     } finally {
@@ -523,10 +535,10 @@ export default function SettingsPage() {
       await handleSave();
       const data = await calibrateObs();
       setCalibrateResult(data);
-      await refreshStatusSilent();
     } catch (e) {
       setCalibrateResult({ error: e.response?.data?.detail || e.message || t("obscfg.errorCalibrateFail") });
     } finally {
+      await refreshStatusSilent();
       setCalibrating(false);
     }
   }, [handleSave, refreshStatusSilent, t]);
@@ -534,6 +546,10 @@ export default function SettingsPage() {
   const handleRefreshStatus = useCallback(async () => {
     setStatusRefreshing(true);
     try { await refreshStatusSilent(); } finally { setStatusRefreshing(false); }
+  }, [refreshStatusSilent]);
+
+  useEffect(() => {
+    void refreshStatusSilent();
   }, [refreshStatusSilent]);
 
   const obsStatusRows = useCallback((s) => {
@@ -569,6 +585,58 @@ export default function SettingsPage() {
         value: !s.scene?.capture_source_exists ? "—" : s.scene?.source_fit_to_canvas ? t("obscfg.stretchFit") : t("obscfg.stretchNotFit"),
         ok: s.scene?.capture_source_exists ? (s.scene?.source_fit_to_canvas ?? false) : true,
         issue: t("obscfg.stretchIssue"),
+        skip: !s.scene?.capture_source_exists,
+      },
+      {
+        label: t("obscfg.rowGameAudio"),
+        value: !s.scene?.capture_source_exists
+          ? "—"
+          : s.audio?.capture_audio_enabled === true
+            ? t("obscfg.audioCaptureOn")
+            : s.audio?.capture_audio_enabled === false
+              ? t("obscfg.audioCaptureOff")
+              : t("obscfg.audioUnknown"),
+        ok: s.audio?.capture_audio_enabled === true,
+        issue: t("obscfg.audioCaptureIssue"),
+        skip: !s.scene?.capture_source_exists,
+      },
+      {
+        label: t("obscfg.rowAudioMute"),
+        value: !s.scene?.capture_source_exists
+          ? "—"
+          : s.audio?.capture_muted === false
+            ? t("obscfg.audioUnmuted")
+            : s.audio?.capture_muted === true
+              ? t("obscfg.audioMuted")
+              : t("obscfg.audioUnknown"),
+        ok: s.audio?.capture_muted === false,
+        issue: t("obscfg.audioMuteIssue"),
+        skip: !s.scene?.capture_source_exists,
+      },
+      {
+        label: t("obscfg.rowAudioTrack"),
+        value: !s.scene?.capture_source_exists
+          ? "—"
+          : s.audio?.exclusive_track1 === true && s.audio?.output_track1_enabled !== false
+            ? t("obscfg.audioTrackExclusive")
+            : (s.audio?.enabled_tracks?.length
+                ? t("obscfg.audioTrackList", { tracks: s.audio.enabled_tracks.join(", ") })
+                : t("obscfg.audioTrackMissing")),
+        ok: s.audio?.exclusive_track1 === true && s.audio?.output_track1_enabled !== false,
+        issue: t("obscfg.audioTrackExclusiveIssue"),
+        skip: !s.scene?.capture_source_exists,
+      },
+      {
+        label: t("obscfg.rowAudioIsolation"),
+        value: !s.scene?.capture_source_exists
+          ? "—"
+          : s.audio?.track1_isolated === true
+            ? t("obscfg.audioIsolationClean")
+            : s.audio?.track1_conflict_names?.length
+              ? t("obscfg.audioIsolationConflicts", { names: s.audio.track1_conflict_names.join("、") })
+              : t("obscfg.audioIsolationUnknown"),
+        ok: s.audio?.track1_isolated === true,
+        issue: t("obscfg.audioIsolationIssue"),
         skip: !s.scene?.capture_source_exists,
       },
       {
@@ -615,10 +683,7 @@ export default function SettingsPage() {
   }
 
   const obs = config.obs ?? {};
-  const llm = config.llm ?? {};
-  const isLocalEndpoint = llm.base_url && (
-    llm.base_url.includes("localhost") || llm.base_url.includes("127.0.0.1")
-  );
+  const obsConnection = checkResult?.connection || status?.connection || null;
 
   return (
     <div className="flex min-h-0 w-full flex-1 flex-col bg-cs2-bg-dark">
@@ -972,6 +1037,16 @@ export default function SettingsPage() {
                     )}
                   </div>
                 )}
+                {Array.isArray(obsConnection?.blockers) && obsConnection.blockers.length > 0 ? (
+                  <div className="mb-3 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 py-2.5">
+                    <div className="text-[11px] font-semibold text-amber-300">{t("obscfg.readyActionTitle")}</div>
+                    <ol className="mt-1 list-decimal space-y-1 pl-4 text-[11px] leading-relaxed text-cs2-text-secondary">
+                      {obsConnection.blockers.map((code) => (
+                        <li key={code}>{t(`obscfg.blocker.${code}`)}</li>
+                      ))}
+                    </ol>
+                  </div>
+                ) : null}
                 <FieldRow label={t("settings.labelObsHost")} search={search && !matches(t("settings.labelObsHost") + " " + (obs.host ?? ""))}>
                   <TextInput value={obs.host ?? "localhost"} onChange={(v) => set("obs.host", v)} />
                 </FieldRow>
@@ -984,7 +1059,7 @@ export default function SettingsPage() {
               </SectionCard>
 
               {/* OBS 校准 */}
-              <SectionCard title={t("obscfg.sectionCalibrate")} hint={t("obscfg.calibrateDesc")} search={search && !matches(t("obscfg.sectionCalibrate") + " " + t("obscfg.rowCanvas") + " " + t("obscfg.rowOutput") + " " + t("obscfg.rowScene"))}>
+              <SectionCard title={t("obscfg.sectionCalibrate")} hint={t("obscfg.calibrateDesc")} search={search && !matches(t("obscfg.sectionCalibrate") + " " + t("obscfg.rowCanvas") + " " + t("obscfg.rowOutput") + " " + t("obscfg.rowScene") + " " + t("obscfg.rowGameAudio"))}>
                 <div className="mb-2 flex items-center justify-between">
                   <span className="text-[11px] text-cs2-text-muted">{status?.obs_connected ? t("obscfg.connOk") : t("obscfg.connFail")}</span>
                   <button
@@ -1035,24 +1110,36 @@ export default function SettingsPage() {
                 )}
 
                 {(() => {
-                  const rows = obsStatusRows(status);
-                  const hasIssues = rows.some(r => !r.skip && !r.infoOnly && !r.ok);
+                  const hasIssues = obsConfigHasIssues(status);
+                  const hasAutoFixableIssues = obsConfigHasAutoFixableIssues(status);
                   return (
                     <button
                       type="button"
                       onClick={() => void handleCalibrate()}
-                      disabled={calibrating || !status?.obs_connected || !hasIssues}
+                      disabled={calibrating || !status?.obs_connected || !hasAutoFixableIssues}
                       title={
-                        !status?.obs_connected ? t("obscfg.btnTitleNotConnected") : !hasIssues ? t("obscfg.btnTitleAllOk") : ""
+                        !status?.obs_connected
+                          ? t("obscfg.btnTitleNotConnected")
+                          : !hasIssues
+                            ? t("obscfg.btnTitleAllOk")
+                            : !hasAutoFixableIssues
+                              ? t("obscfg.btnTitleManualIssues")
+                              : ""
                       }
                       className={`mt-1 inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-[11px] font-bold transition-colors ${
-                        hasIssues && status?.obs_connected && !calibrating
+                        hasAutoFixableIssues && status?.obs_connected && !calibrating
                           ? "bg-cs2-accent text-cs2-bg-dark hover:bg-cs2-accent/80"
                           : "border border-cs2-border/50 bg-cs2-bg-input text-cs2-text-muted cursor-not-allowed opacity-50"
                       }`}
                     >
                       {calibrating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-                      {hasIssues ? t("obscfg.btnFix") : t("obscfg.btnNoIssues")}
+                      {!status?.obs_connected
+                        ? t("obscfg.btnConnectFirst")
+                        : hasAutoFixableIssues
+                          ? t("obscfg.btnFix")
+                          : hasIssues
+                            ? t("obscfg.btnManualIssues")
+                            : t("obscfg.btnNoIssues")}
                     </button>
                   );
                 })()}
@@ -1062,6 +1149,22 @@ export default function SettingsPage() {
                     {calibrateResult.changed.map((msg, i) => (
                       <div key={i} className="flex items-start gap-1.5 text-[11px] text-green-400">
                         <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0" />{msg}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {calibrateResult?.error && (
+                  <div className="mt-2 flex items-start gap-1.5 rounded-lg border border-red-400/30 bg-red-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-red-300">
+                    <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                    <span>{calibrateResult.error}</span>
+                  </div>
+                )}
+                {calibrateResult?.manual_actions?.length > 0 && (
+                  <div className="mt-2 space-y-1 rounded-lg border border-amber-400/30 bg-amber-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-amber-300">
+                    {calibrateResult.manual_actions.map((message, i) => (
+                      <div key={i} className="flex items-start gap-1.5">
+                        <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                        <span>{message}</span>
                       </div>
                     ))}
                   </div>
@@ -1085,53 +1188,13 @@ export default function SettingsPage() {
           {/* ======================== 解析设置 ======================== */}
           {activeTab === "parse" && (
             <div className="space-y-4">
-              {/* Analysis Mode */}
-              <SectionCard title={t("settings.sectionAnalysisMode")} hint={t("settings.sectionAnalysisModeHint")} search={search && !matches(t("settings.sectionAnalysisMode") + " " + t("settings.modeAi") + " " + t("settings.modeLocal"))}>
-                <FieldRow search={search && !matches(t("settings.modeAi") + " " + t("settings.modeLocal"))}>
-                  <div className="flex gap-2">
-                    {[
-                      { val: false, label: t("settings.modeLocal"), desc: t("settings.modeLocalDesc") },
-                      { val: true, label: t("settings.modeAi"), desc: t("settings.modeAiDesc") },
-                    ].map((m) => (
-                      <button
-                        key={String(m.val)}
-                        type="button"
-                        onClick={() => set("ai_mode", m.val)}
-                        className={`flex-1 rounded-lg border p-3 text-left transition-colors ${
-                          config.ai_mode === m.val
-                            ? "border-cs2-accent/60 bg-cs2-accent/10"
-                            : "border-cs2-border bg-cs2-bg-input/30 hover:border-cs2-accent/30"
-                        }`}
-                      >
-                        <div className="text-xs font-semibold text-cs2-text-primary">{m.label}</div>
-                        <div className="mt-0.5 text-[11px] text-cs2-text-muted">{m.desc}</div>
-                      </button>
-                    ))}
-                  </div>
-                </FieldRow>
-              </SectionCard>
-
-              {/* LLM */}
-              {config.ai_mode && (
-                <SectionCard title={t("settings.sectionLlm")} hint={t("settings.sectionLlmHint")} search={search && !matches(t("settings.sectionLlm") + " " + t("settings.labelLlmBaseUrl") + " " + t("settings.labelLlmModel") + " " + t("settings.labelLlmApiKey"))}>
-                  {isLocalEndpoint && (
-                    <div style={hide(t("settings.localEndpointHint"))} className="mb-3">
-                      <div className="rounded-md border border-cs2-accent/30 bg-cs2-accent/5 px-3 py-2 text-[11px] text-cs2-accent">
-                        {t("settings.localEndpointHint")}
-                      </div>
-                    </div>
-                  )}
-                  <FieldRow label={t("settings.labelLlmBaseUrl")} search={search && !matches(t("settings.labelLlmBaseUrl") + " " + (llm.base_url ?? ""))}>
-                    <TextInput value={llm.base_url ?? ""} onChange={(v) => set("llm.base_url", v || null)} placeholder={t("settings.baseUrlPlaceholder")} />
-                  </FieldRow>
-                  <FieldRow label={t("settings.labelLlmModel")} search={search && !matches(t("settings.labelLlmModel") + " " + (llm.model ?? ""))}>
-                    <TextInput value={llm.model ?? ""} onChange={(v) => set("llm.model", v)} placeholder={t("settings.modelPlaceholder")} />
-                  </FieldRow>
-                  <FieldRow label={t("settings.labelLlmApiKey")} hint={llm.api_key ? t("settings.apiKeySaved") : ""} search={search && !matches(t("settings.labelLlmApiKey"))}>
-                    <TextInput type="password" value={llm.api_key ?? ""} onChange={(v) => set("llm.api_key", v)} placeholder={t("settings.apiKeyPlaceholderKeep")} />
-                  </FieldRow>
-                </SectionCard>
-              )}
+              <OptionalAiReviewSettings
+                enabled={!!config.ai_mode}
+                onEnabledChange={setAiReviewEnabled}
+                llm={config.llm ?? {}}
+                onLlmChange={(next) => set("llm", next)}
+                t={t}
+              />
 
               {/* Players */}
               <SectionCard title={t("settings.sectionPlayers")} hint={t("settings.sectionPlayersHint")} search={search && !matches(t("settings.sectionPlayers") + " " + (config.expected_parse_players ?? []).join(" "))}>
@@ -1148,12 +1211,32 @@ export default function SettingsPage() {
               {/* Watch Paths */}
               <SectionCard title={t("settings.sectionWatchPaths")} hint={t("settings.sectionWatchPathsHint")} search={search && !matches(t("settings.sectionWatchPaths") + " " + (config.demo_watch_paths ?? []).join(" "))}>
                 <FieldRow search={search && !matches(t("settings.sectionWatchPaths") + " " + (config.demo_watch_paths ?? []).join(" "))}>
-                  <TagList
-                    items={config.demo_watch_paths ?? []}
-                    onChange={(v) => set("demo_watch_paths", v)}
-                    placeholder="C:\\demos\\auto-watch"
-                    addLabel={t("settings.sidebarWatchAdd")}
-                  />
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      disabled={!desktopBridge}
+                      onClick={async () => {
+                        if (!desktopBridge) return;
+                        const result = await desktopBridge.showOpenDialog({
+                          title: t("library.watchPathsChooseTitle"),
+                          properties: ["openDirectory", "multiSelections"],
+                        });
+                        const selected = (result?.filePaths || []).map((path) => String(path).trim()).filter(Boolean);
+                        if (!selected.length) return;
+                        set("demo_watch_paths", Array.from(new Set([...(config.demo_watch_paths ?? []), ...selected])));
+                      }}
+                      className="flex w-full items-center justify-center gap-1.5 rounded-md border border-cs2-accent/40 bg-cs2-accent/10 py-2 text-[11px] font-semibold text-cs2-accent hover:bg-cs2-accent/20 disabled:opacity-45"
+                    >
+                      <FolderOpen className="h-3.5 w-3.5" />
+                      {t("library.watchPathsChoose")}
+                    </button>
+                    <TagList
+                      items={config.demo_watch_paths ?? []}
+                      onChange={(v) => set("demo_watch_paths", v)}
+                      placeholder="C:\\demos\\auto-watch"
+                      addLabel={t("settings.sidebarWatchAdd")}
+                    />
+                  </div>
                 </FieldRow>
               </SectionCard>
 

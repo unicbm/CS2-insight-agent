@@ -22,7 +22,7 @@ const SOURCE_I18N_KEYS = {
   "Matchmaking": "ingest.sourceMatchmaking",
 };
 
-export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
+export default function IngestModal({ isOpen, onClose, onIngest, onUpload, onComplete }) {
   const t = useT();
   const [items, setItems] = useState([]);
   const [listLoading, setListLoading] = useState(false);
@@ -32,8 +32,10 @@ export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [selectedIds, setSelectedIds] = useState(new Set());
+  const [selectingAll, setSelectingAll] = useState(false);
+  const [ingestProgress, setIngestProgress] = useState(null);
 
-  const limit = 10;
+  const limit = 25;
 
   const fileInputRef = React.useRef(null);
 
@@ -65,13 +67,21 @@ export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
     if (isOpen) {
       setIngestError(null);
       setIngesting(false);
-      fetchDiscovered();
+      setIngestProgress(null);
+      setSelectedIds(new Set());
     }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (isOpen) void fetchDiscovered();
   }, [isOpen, fetchDiscovered]);
 
   if (!isOpen) return null;
 
   const totalPages = Math.ceil(total / limit) || 1;
+  const ingestPercent = ingestProgress?.total > 0
+    ? Math.round((Number(ingestProgress.processed || 0) / ingestProgress.total) * 100)
+    : 0;
 
   const handleToggleSelect = (id) => {
     setSelectedIds((prev) => {
@@ -87,11 +97,43 @@ export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
     const ids = Array.from(selectedIds);
     setIngestError(null);
     setIngesting(true);
+    setIngestProgress({ status: "running", processed: 0, total: ids.length, ingested: 0, failed: 0 });
+    let processed = 0;
+    let ingested = 0;
+    const failedItems = [];
+    const completedIds = [];
     try {
-      await onIngest?.(ids);
-      setSelectedIds(new Set());
+      const chunkSize = 8;
+      for (let start = 0; start < ids.length; start += chunkSize) {
+        const chunk = ids.slice(start, start + chunkSize);
+        const result = await onIngest(chunk);
+        const chunkFailed = Array.isArray(result?.failed) ? result.failed : [];
+        const failedIdSet = new Set(chunkFailed.map((item) => Number(item.demo_id)));
+        failedItems.push(...chunkFailed);
+        ingested += Number(result?.ingested || 0);
+        completedIds.push(...chunk.filter((id) => !failedIdSet.has(Number(id))));
+        processed += chunk.length;
+        setIngestProgress({
+          status: "running",
+          processed,
+          total: ids.length,
+          ingested,
+          failed: failedItems.length,
+        });
+      }
+      setSelectedIds(new Set(failedItems.map((item) => Number(item.demo_id))));
       await fetchDiscovered();
-      onClose();
+      onComplete?.();
+      setIngestProgress({
+        status: "done",
+        processed: ids.length,
+        total: ids.length,
+        ingested,
+        failed: failedItems.length,
+      });
+      if (failedItems.length > 0) {
+        setIngestError(t("dialog.ingestPartialError", { count: failedItems.length }));
+      }
     } catch (e) {
       const d = e?.response?.data?.detail;
       const msg = Array.isArray(d)
@@ -100,13 +142,46 @@ export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
           ? d
           : e?.message || t("dialog.ingestFallbackError");
       setIngestError(msg);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of completedIds) next.delete(id);
+        return next;
+      });
+      setIngestProgress((prev) => ({ ...(prev || {}), status: "error" }));
+      await fetchDiscovered();
+      onComplete?.();
     } finally {
       setIngesting(false);
     }
   };
 
-  const handleSelectAll = () => {
-    setSelectedIds(new Set(items.map((it) => it.id)));
+  const handleSelectPage = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const item of items) next.add(item.id);
+      return next;
+    });
+  };
+
+  const handleSelectAll = async () => {
+    if (selectingAll || total <= 0) return;
+    setSelectingAll(true);
+    try {
+      const allIds = [];
+      const pageSize = 1000;
+      for (let offset = 0; offset < total; offset += pageSize) {
+        const params = { limit: pageSize, offset };
+        if (search.trim()) params.q = search.trim();
+        const { data } = await API.get("/demos/discovered", { params });
+        allIds.push(...(data.items || []).map((item) => item.id));
+        if ((data.items || []).length < pageSize) break;
+      }
+      setSelectedIds(new Set(allIds));
+    } catch (error) {
+      setIngestError(error?.response?.data?.detail || error?.message || t("dialog.ingestSelectAllFail"));
+    } finally {
+      setSelectingAll(false);
+    }
   };
 
   const handleClearSelection = () => {
@@ -123,7 +198,24 @@ export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
             aria-label={t("dialog.ingestIngesting")}
           >
             <Loader2 className="h-8 w-8 animate-spin text-cs2-accent" />
-            <p className="text-xs font-semibold text-cs2-text-primary">{t("dialog.ingestIngestingMsg")}</p>
+            <p className="text-xs font-semibold text-cs2-text-primary">
+              {t("dialog.ingestProgress", {
+                processed: ingestProgress?.processed || 0,
+                total: ingestProgress?.total || selectedIds.size,
+              })}
+            </p>
+            <div className="h-2 w-64 max-w-[70vw] overflow-hidden rounded-full bg-cs2-bg-input">
+              <div
+                className="h-full rounded-full bg-cs2-accent transition-[width] duration-300"
+                style={{ width: `${ingestPercent}%` }}
+              />
+            </div>
+            <p className="text-[11px] text-cs2-text-muted">
+              {t("dialog.ingestProgressDetail", {
+                ingested: ingestProgress?.ingested || 0,
+                failed: ingestProgress?.failed || 0,
+              })}
+            </p>
           </div>
         ) : null}
         {/* Header */}
@@ -189,14 +281,17 @@ export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
         {/* Selection bar */}
         {items.length > 0 && (
           <div className="flex items-center gap-2 border-b border-cs2-border bg-cs2-bg-input/30 px-5 py-2 text-[10px]">
-            <button type="button" disabled={ingesting} onClick={handleSelectAll} className="text-cs2-text-secondary hover:text-cs2-text-primary disabled:opacity-40">
-              {t("dialog.ingestSelectAll")}
+            <button type="button" disabled={ingesting} onClick={handleSelectPage} className="rounded border border-cs2-border px-2 py-1 font-semibold text-cs2-text-secondary hover:border-cs2-accent/35 hover:text-cs2-text-primary disabled:opacity-40">
+              {t("dialog.ingestSelectPage", { count: items.length })}
             </button>
-            <span className="text-cs2-text-muted">|</span>
-            <button type="button" disabled={ingesting} onClick={handleClearSelection} className="text-cs2-text-secondary hover:text-cs2-text-primary disabled:opacity-40">
+            <button type="button" disabled={ingesting || selectingAll} onClick={() => void handleSelectAll()} className="inline-flex items-center gap-1 rounded border border-cs2-accent/35 bg-cs2-accent/10 px-2 py-1 font-semibold text-cs2-accent hover:bg-cs2-accent/20 disabled:opacity-40">
+              {selectingAll ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+              {t("dialog.ingestSelectAll", { count: total })}
+            </button>
+            <button type="button" disabled={ingesting} onClick={handleClearSelection} className="ml-1 text-cs2-text-secondary hover:text-cs2-text-primary disabled:opacity-40">
               {t("dialog.ingestClear")}
             </button>
-            <span className="ml-auto text-cs2-text-muted">{t("dialog.ingestSelected", { sel: selectedIds.size, total: items.length })}</span>
+            <span className="ml-auto text-cs2-text-muted">{t("dialog.ingestSelected", { sel: selectedIds.size, total })}</span>
           </div>
         )}
 
@@ -266,6 +361,14 @@ export default function IngestModal({ isOpen, onClose, onIngest, onUpload }) {
 
         {/* Footer */}
         <div className="flex flex-col gap-2 border-t border-cs2-border bg-cs2-bg-page px-5 py-3">
+          {ingestProgress?.status === "done" ? (
+            <div className="rounded-md border border-cs2-accent/30 bg-cs2-accent/5 px-3 py-2 text-center text-[11px] text-cs2-text-secondary">
+              {t("dialog.ingestDoneSummary", {
+                ingested: ingestProgress.ingested,
+                failed: ingestProgress.failed,
+              })}
+            </div>
+          ) : null}
           {ingestError ? (
             <p className="text-center text-[12px] leading-snug text-cs2-text-error">{ingestError}</p>
           ) : null}

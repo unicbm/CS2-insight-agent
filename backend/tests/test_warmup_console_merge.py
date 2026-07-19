@@ -31,11 +31,13 @@ def test_fixed_cvars_injected_from_config():
 
 
 def test_keybind_reset_still_forced():
-    # 安全闸门不受影响：解绑 + toggleconsole 始终注入
+    # 只覆盖自动化占用键；绝不能再清空整张玩家键位表。
     director = _director("")
     lines = director._recording_warmup_console_lines(RecordingWarmupExtras())
-    assert "unbindall" in lines
+    assert "unbindall" not in lines
     assert any("toggleconsole" in l for l in lines)
+    assert 'bind "MOUSE_X" "yaw"' in lines
+    assert 'bind "MOUSE_Y" "pitch"' in lines
 
 
 def test_third_person_camera_injects_the_configured_camera_commands():

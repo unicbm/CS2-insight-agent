@@ -37,10 +37,14 @@ from .demo_parser import (
 )
 from .cs2_config_backup import (
     _atomic_write_bytes,
+    find_poisoned_keybind_backup_paths,
     is_cs2_running,
     is_restore_required,
+    migrate_legacy_poisoned_key_vcfg_targets,
+    probe_cs2_running,
     restore_latest_user_config_backup,
     write_persistent_backup_from_snap,
+    write_recording_state,
 )
 from .env_utils import OBSConfig, SpecPlayerVerifyConfig, _steam_install_from_registry as _get_steam_install_root
 from .gsi_ready import (
@@ -52,7 +56,13 @@ from .gsi_ready import (
     wait_gsi_payload_after,
 )
 from .pov_constants import POV_CORE_FORCED_COMMANDS, pov_tail_commands
-from .win_cs2_console import ensure_cs2_foreground, find_cs2_hwnd, inject_console_sequence, send_cs2_space_taps
+from .win_cs2_console import (
+    ensure_cs2_foreground,
+    find_cs2_hwnd,
+    inject_console_sequence,
+    release_cs2_synthetic_keys,
+    send_cs2_space_taps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -423,24 +433,59 @@ TICK_RATE = 64
 PRE_ROLL_TICKS = 300  # ~5 seconds of pre-roll（无 kill_ticks 时的传统 seek）
 # 智能跳跃分段阈值见 ``build_smart_jump_segments`` 内 _env_int 默认值。
 
-# 录制开始时把玩家所有按键解绑并恢复到一组最小默认绑定。配合下面的「文件级用户配置
-# 快照 + 恢复」机制使用：本次 CS2 进程内按键还原为下方默认，让玩家自定义的奇葩 bind
-# 不会在 demo 回放/控制台注入期间触发；录制结束（或异常杀进程后下次启动）时再用
-# 磁盘备份把用户原配置整体回滚。bind 顺序中 toggleconsole / space 必须保留，否则
-# `inject_console_sequence` 与 `send_cs2_space_taps` 会失效。
+# 只覆盖自动化实际占用的按键。旧实现先 ``unbindall`` 再补一小组键位，却漏掉
+# Source 2 用于视角的 MOUSE_X/yaw 与 MOUSE_Y/pitch；一旦异常路径没有及时杀掉
+# CS2，第一人称鼠标就会完全失效。这里不再清空玩家的整张键位表，同时显式补齐
+# 鼠标轴，既能自愈旧版本遗留状态，也保留控制台与 demo UI 所需绑定。
 _RECORDING_KEYBIND_RESET_LINES: tuple[str, ...] = (
-    "unbindall",
     "bind F10 toggleconsole",
     "bind ` toggleconsole",
     'bind "SPACE" "+jump"',
-    'bind "ESCAPE" "cancelselect"',
-    'bind "w" "+forward"',
-    'bind "a" "+moveleft"',
-    'bind "s" "+back"',
-    'bind "d" "+moveright"',
+    'bind "MOUSE_X" "yaw"',
+    'bind "MOUSE_Y" "pitch"',
     "unbind alt",
 )
 _RECORDING_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".flv", ".ts", ".m2ts", ".avi"}
+_CS2_TASKKILL_TIMEOUT_SEC = 10.0
+_CS2_PID_EXIT_WAIT_SEC = 8.0
+_CS2_IMAGE_EXIT_WAIT_SEC = 4.0
+_CS2_CONFIG_HANDLE_SETTLE_SEC = 1.5
+# Worst case inside ``_kill_cs2`` is two 10s taskkill calls + 8s/4s
+# confirmation windows + handle settling and final Popen wait (~34.5s).
+# Config restore may retry a locked file for 4.5s *per snapshot entry*.  The
+# number of Steam accounts / key files is not globally bounded, so a finite
+# outer ``wait_for`` can expire while its worker thread is still writing.  Use
+# no outer timeout for this one teardown step; its taskkill and file retries
+# already have their own bounded waits.
+_CS2_SHUTDOWN_CLEANUP_TIMEOUT_SEC: Optional[float] = None
+
+
+def _probe_cs2_absence() -> tuple[bool, Optional[bool], Optional[bool]]:
+    """Return ``(confirmed_absent, hwnd_present, process_present)``.
+
+    Either probe may be ``None`` when it failed.  Absence is confirmed only
+    when *both* independently report ``False``.
+    """
+    try:
+        hwnd_present: Optional[bool] = bool(find_cs2_hwnd())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not confirm CS2 window shutdown: %s", e)
+        hwnd_present = None
+    try:
+        process_present = probe_cs2_running()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not confirm cs2.exe shutdown: %s", e)
+        process_present = None
+    return hwnd_present is False and process_present is False, hwnd_present, process_present
+
+
+def _wait_for_cs2_absence(timeout: float) -> tuple[bool, Optional[bool], Optional[bool]]:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    last = _probe_cs2_absence()
+    while not last[0] and time.monotonic() < deadline:
+        time.sleep(0.15)
+        last = _probe_cs2_absence()
+    return last
 
 
 # 用户配置磁盘备份 / ``recording_state.json`` 见 ``cs2_config_backup`` 模块；
@@ -1944,18 +1989,35 @@ class OBSDirector:
         except Exception as e:
             logger.debug("StopRecord (abort cleanup): %s", e)
 
-    async def _run_cleanup_step(self, label: str, func: Callable[[], None], timeout: float = 20.0) -> None:
+    async def _run_cleanup_step(
+        self,
+        label: str,
+        func: Callable[[], None],
+        timeout: Optional[float] = 20.0,
+    ) -> None:
         """Run blocking teardown away from the FastAPI event loop."""
         try:
-            await asyncio.wait_for(asyncio.to_thread(func), timeout=max(1.0, float(timeout)))
+            worker = asyncio.to_thread(func)
+            if timeout is None:
+                await worker
+            else:
+                await asyncio.wait_for(worker, timeout=max(1.0, float(timeout)))
         except asyncio.TimeoutError:
-            logger.error("%s timed out after %.1fs; backend will stay alive and continue serving API", label, timeout)
+            logger.error(
+                "%s timed out after %.1fs; backend will stay alive and continue serving API",
+                label,
+                timeout,
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception("%s failed during recording cleanup: %s", label, e)
 
     async def _cleanup_recording_session(self) -> None:
         await self._run_cleanup_step("OBS disconnect", self.disconnect_obs, timeout=8.0)
-        await self._run_cleanup_step("CS2 shutdown", self._kill_cs2, timeout=30.0)
+        await self._run_cleanup_step(
+            "CS2 shutdown",
+            self._kill_cs2,
+            timeout=_CS2_SHUTDOWN_CLEANUP_TIMEOUT_SEC,
+        )
         await self._run_cleanup_step("CS2 artifact cleanup", self._cleanup_cs2_artifacts, timeout=8.0)
 
     @property
@@ -2090,8 +2152,12 @@ class OBSDirector:
         if not cs2.exists():
             raise FileNotFoundError(f"cs2.exe not found at {self.cs2_path}")
 
-        if is_cs2_running():
-            logger.warning("Recording blocked because CS2 is already running")
+        cs2_running = is_cs2_running()
+        if cs2_running is not False:
+            logger.warning(
+                "Recording blocked because CS2 is already running or process state is unknown: %s",
+                cs2_running,
+            )
             raise CS2AlreadyRunningError(CS2_RUNNING_MESSAGE)
 
         # 启动 CS2 前先对用户配置做快照；CS2 运行期的 archive cvar 写入在
@@ -2848,6 +2914,32 @@ class OBSDirector:
                         add_path(p, record_missing=False)
                 except OSError as e:
                     logger.warning("Snapshot user config glob %s failed: %s", d / pattern, e)
+        poisoned = find_poisoned_keybind_backup_paths(snap)
+        if poisoned:
+            migration = migrate_legacy_poisoned_key_vcfg_targets(
+                poisoned,
+                cs2_path=self.cs2_path,
+            )
+            if not migration.get("ok"):
+                self._user_config_snapshot = {}
+                raise RuntimeError(
+                    "检测到旧版录制遗留的 unbindall 键位污染，但无法从游戏自带默认键位安全迁移: "
+                    f"{migration.get('failed') or migration}"
+                )
+            try:
+                for path in poisoned:
+                    snap[path] = path.read_bytes()
+            except OSError as e:
+                self._user_config_snapshot = {}
+                raise RuntimeError("迁移旧版污染键位后无法重新读取配置，已中止 CS2 启动") from e
+            if find_poisoned_keybind_backup_paths(snap):
+                self._user_config_snapshot = {}
+                raise RuntimeError("旧版污染键位迁移后仍命中 unbindall 指纹，已中止 CS2 启动")
+            logger.warning(
+                "Migrated legacy poisoned key VCFG before recording snapshot: %s",
+                migration,
+            )
+
         self._user_config_snapshot = snap
         if snap:
             logger.info(
@@ -2859,27 +2951,64 @@ class OBSDirector:
             # 启动会清空目录再重写，项目里只保留"最近一次录制前"的玩家原始 cfg。
             # 玩家事后可以在该目录翻出 config.cfg / video.txt 自行覆盖回去。
             try:
-                write_persistent_backup_from_snap(snap)
+                backup_path = write_persistent_backup_from_snap(snap)
             except Exception as e:  # noqa: BLE001
-                logger.warning("Persistent disk backup failed (in-memory still active): %s", e)
+                self._user_config_snapshot = {}
+                raise RuntimeError("无法建立可靠的玩家配置备份，已中止 CS2 启动") from e
+            if backup_path is None:
+                # No recorder-owned config changes have happened yet, so this
+                # is the safe point to fail closed.  Continuing would let the
+                # warmup mutate live bindings without a trustworthy rollback.
+                self._user_config_snapshot = {}
+                raise RuntimeError("玩家配置备份不可用或已被旧版录制污染，已中止 CS2 启动")
 
     def _restore_user_configs(self) -> None:
         """强杀 CS2 后：若 ``recording_state`` 为 ``recording`` 则按 manifest 原子恢复；
         否则回退为内存快照对比（例如持久化备份未写入 state 的边缘情况）。"""
         snap = self._user_config_snapshot
+        manifest_failure: Optional[dict[str, Any]] = None
         if is_restore_required():
             try:
-                res = restore_latest_user_config_backup(skip_cs2_running_check=True)
+                res = restore_latest_user_config_backup(
+                    skip_cs2_running_check=True,
+                    cs2_path=self.cs2_path,
+                )
                 if res.get("ok"):
                     self._user_config_snapshot = {}
                     return
+                manifest_failure = res
                 logger.warning("Manifest restore failed post-kill: %s", res)
             except Exception as e:  # noqa: BLE001
+                manifest_failure = {"error": str(e)}
                 logger.warning("Manifest restore raised: %s", e)
         if not snap:
             self._user_config_snapshot = {}
+            if manifest_failure is not None:
+                raise RuntimeError(f"玩家配置恢复失败: {manifest_failure}")
             return
+
+        poisoned = find_poisoned_keybind_backup_paths(snap)
+        if poisoned:
+            migration = migrate_legacy_poisoned_key_vcfg_targets(
+                poisoned,
+                cs2_path=self.cs2_path,
+            )
+            if not migration.get("ok"):
+                # Keep both the in-memory snapshot and persistent recovery
+                # marker.  Never guess a custom binding when Valve's local
+                # default cannot be proven available.
+                raise RuntimeError(
+                    "拒绝恢复旧版 unbindall 污染的键位快照，官方默认键位迁移失败: "
+                    f"{migration.get('failed') or migration}"
+                )
+            # These poisoned originals must never be written back.  Their live
+            # targets are now either preserved healthy or replaced by the
+            # official local default; restore only the remaining snapshot.
+            poisoned_set = set(poisoned)
+            snap = {path: data for path, data in snap.items() if path not in poisoned_set}
+            self._user_config_snapshot = snap
         restored = 0
+        failed_paths: dict[Path, Optional[bytes]] = {}
         for p, original in snap.items():
             try:
                 current_exists = p.is_file()
@@ -2899,9 +3028,24 @@ class OBSDirector:
                     restored += 1
             except OSError as e:
                 logger.warning("Restore user config %s failed: %s", p, e)
+                failed_paths[p] = original
         if restored:
             logger.info("Restored %d user config file(s) post-kill (memory snapshot)", restored)
-        self._user_config_snapshot = {}
+        self._user_config_snapshot = failed_paths
+        if failed_paths:
+            raise RuntimeError(
+                "部分玩家配置恢复失败，已保留恢复状态: "
+                + ", ".join(str(path) for path in failed_paths)
+            )
+        if manifest_failure is not None and is_restore_required():
+            # The in-memory snapshot was captured from the same source set
+            # immediately before the persistent manifest.  A complete,
+            # non-poisoned in-memory restore is therefore a valid recovery;
+            # clear the marker only after every entry above succeeded.
+            write_recording_state(
+                "recorded",
+                {"recovered_via": "in_memory_snapshot"},
+            )
 
     def _voice_ban_paths(self) -> list[Path]:
         """返回所有 Steam 账号的 ``userdata/<id>/730/voice_ban.dt`` 路径。"""
@@ -2994,7 +3138,7 @@ class OBSDirector:
             )
 
     def _kill_cs2(self) -> None:
-        """强杀整棵 CS2 进程树并等待窗口真正消失。
+        """强杀整棵 CS2 进程树，并在双重确认退出后恢复配置。
 
         仅 ``Popen.terminate()`` 存在两个致命缺陷：
         1) Steam/启动器链路下 ``self._cs2_process`` 可能是短命 launcher，
@@ -3003,11 +3147,17 @@ class OBSDirector:
         2) 即便杀到本体，窗口从"进程退出"到"hwnd 被销毁"仍有数百毫秒
            延迟。此期间 ``EnumWindows`` 仍可枚举到旧 hwnd，``PostMessage``
            向旧队列灌字符 → 表现为第二次录制"龟速输入 / 命令缺字符"。
-        这里用 ``taskkill /F /T`` 递归结束进程树，再轮询确认窗口消失。
+        这里用 ``taskkill /F /T`` 递归结束进程树，再分别确认窗口和
+        ``cs2.exe`` 进程均消失。任何探测失败都不能被当作已经退出。
 
         等窗口彻底消失后调用 ``_restore_user_configs``，把录制期可能被 CS2
         auto-save 到用户 config 文件里的脏 archive cvar 全部回滚回录制前的样子。
         """
+        try:
+            release_cs2_synthetic_keys()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Release synthetic CS2 keys before shutdown failed: %s", e)
+
         pid = self._cs2_process.pid if self._cs2_process else 0
         if sys.platform == "win32":
             if pid:
@@ -3016,40 +3166,48 @@ class OBSDirector:
                         ["taskkill", "/F", "/T", "/PID", str(pid)],
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=10,
+                        timeout=_CS2_TASKKILL_TIMEOUT_SEC,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("taskkill /PID %s 失败: %s", pid, e)
-                deadline = time.monotonic() + 8.0
-                while time.monotonic() < deadline:
-                    if not find_cs2_hwnd():
-                        break
-                    time.sleep(0.15)
+                confirmed, _hwnd_present, _process_present = _wait_for_cs2_absence(
+                    _CS2_PID_EXIT_WAIT_SEC,
+                )
 
-                if find_cs2_hwnd() or is_cs2_running():
+                if not confirmed:
                     logger.info("Cleaning recorder-owned CS2 residual process before next launch")
                     try:
                         subprocess.run(
                             ["taskkill", "/F", "/IM", "cs2.exe"],
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            timeout=10,
+                            timeout=_CS2_TASKKILL_TIMEOUT_SEC,
                         )
                     except Exception as e:  # noqa: BLE001
                         logger.warning("taskkill /IM cs2.exe 兜底失败: %s", e)
-                    deadline2 = time.monotonic() + 4.0
-                    while time.monotonic() < deadline2 and is_cs2_running():
-                        time.sleep(0.15)
-
-                # hwnd / 进程均已消失，但 Windows 内核还可能短暂持有 cfg 文件句柄
-                # （CS2 exit autosave、Steam Cloud 初始上传），等待释放再恢复。
-                time.sleep(1.5)
+                    confirmed, _hwnd_present, _process_present = _wait_for_cs2_absence(
+                        _CS2_IMAGE_EXIT_WAIT_SEC,
+                    )
             else:
                 logger.info("Skip CS2 shutdown: no recorder-owned CS2 process")
+
+            # A fresh final probe closes the race between the last polling
+            # iteration and restore.  Unknown is intentionally not success.
+            confirmed, hwnd_present, process_present = _probe_cs2_absence()
+            if not confirmed:
+                raise RuntimeError(
+                    "未能确认 CS2 已完全退出；为防止 exit autosave 覆盖玩家配置，"
+                    "已保留恢复状态且未执行恢复 "
+                    f"(hwnd_present={hwnd_present}, process_present={process_present})"
+                )
+
+            # hwnd / 进程均已消失，但 Windows 内核还可能短暂持有 cfg 文件句柄
+            # （CS2 exit autosave、Steam Cloud 初始上传），等待释放再恢复。
+            time.sleep(_CS2_CONFIG_HANDLE_SETTLE_SEC)
         elif self._cs2_process:
             try:
                 self._cs2_process.terminate()
-                self._cs2_process.wait(timeout=10)
+                self._cs2_process.wait(timeout=_CS2_TASKKILL_TIMEOUT_SEC)
             except Exception:
                 self._cs2_process.kill()
 
@@ -3062,10 +3220,7 @@ class OBSDirector:
 
         # CS2 进程已结束，文件锁已释放。此时回滚用户配置，确保我们的 archive cvar
         # 修改不会泄漏到用户下一次启动（包括 5E / 竞技服的正式对局）。
-        try:
-            self._restore_user_configs()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Restore user configs after kill failed: %s", e)
+        self._restore_user_configs()
 
     async def _await_cs2_window(self, timeout: float = 45.0) -> bool:
         """录制前等待 CS2 主窗口出现（便于后续 SendInput 注入 demo_gototick）。"""
@@ -3277,11 +3432,9 @@ class OBSDirector:
     def _recording_warmup_console_lines(self, w: RecordingWarmupExtras) -> list[str]:
         """录制会话首次 seek 前注入的观战 cvar（与空格预热后的控制台批次合并）。
 
-        在所有 cvar 之前注入 ``unbindall`` + 一组最小默认绑定，把玩家自定义
-        按键统一恢复为安全默认；用户原 ``config.cfg`` / ``cs2_user_keys.cfg`` 等
-        已被 ``_snapshot_user_configs`` 落盘，录制结束 / 进程崩溃后都能完整还原。
-        ``unbindall`` 必须在第一行：避免玩家把 toggleconsole 改绑到非常规键时，
-        我们 SendInput 投到默认 F10 / ``~`` 失效。
+        在所有 cvar 之前只覆盖自动化占用的控制台、空格与鼠标轴绑定。用户原
+        ``config.cfg`` / ``cs2_user_keys.cfg`` 等仍会被快照并在录制结束时还原，
+        但这里绝不能再用 ``unbindall`` 把一个仍可能存活的 CS2 会话变成不可操作状态。
         """
         if w.console_cmds:
             cmds = [str(x).strip() for x in w.console_cmds if str(x).strip()]
@@ -3503,7 +3656,11 @@ class OBSDirector:
                             "request_id": dto.request_id, "success": False,
                             "error": f"CS2 launch failed: {e}", "segment_results": [], "warnings": [],
                         })
-                    await self._run_cleanup_step("CS2 shutdown after launch failure", self._kill_cs2, timeout=30.0)
+                    await self._run_cleanup_step(
+                        "CS2 shutdown after launch failure",
+                        self._kill_cs2,
+                        timeout=_CS2_SHUTDOWN_CLEANUP_TIMEOUT_SEC,
+                    )
                     await self._run_cleanup_step("CS2 artifact cleanup", self._cleanup_cs2_artifacts, timeout=8.0)
                     continue
 
@@ -3519,7 +3676,11 @@ class OBSDirector:
                             await self._sleep_abortable(settle)
                 except CS2NotReadyError:
                     logger.error("[RecordingV3] GSI not ready for %s; aborting", demo_name)
-                    await self._run_cleanup_step("CS2 shutdown after GSI timeout", self._kill_cs2, timeout=30.0)
+                    await self._run_cleanup_step(
+                        "CS2 shutdown after GSI timeout",
+                        self._kill_cs2,
+                        timeout=_CS2_SHUTDOWN_CLEANUP_TIMEOUT_SEC,
+                    )
                     await self._run_cleanup_step("CS2 artifact cleanup after GSI timeout", self._cleanup_cs2_artifacts, timeout=8.0)
                     raise
 
@@ -3573,7 +3734,11 @@ class OBSDirector:
                             "request_id": dto.request_id, "success": False,
                             "error": f"OBS connection failed: {e}", "segment_results": [], "warnings": [],
                         })
-                    await self._run_cleanup_step("CS2 shutdown after OBS failure", self._kill_cs2, timeout=30.0)
+                    await self._run_cleanup_step(
+                        "CS2 shutdown after OBS failure",
+                        self._kill_cs2,
+                        timeout=_CS2_SHUTDOWN_CLEANUP_TIMEOUT_SEC,
+                    )
                     await self._run_cleanup_step("CS2 artifact cleanup after OBS failure", self._cleanup_cs2_artifacts, timeout=8.0)
                     continue
 
@@ -3584,6 +3749,7 @@ class OBSDirector:
                     abort_event=self._abort_event,
                     fade_controller=fade_controller,
                     post_spec_console_lines=post_spec_lines,
+                    disconnect_obs_on_finish=False,
                 )
                 for dto in demo_requests:
                     if self._abort_requested():
@@ -3809,7 +3975,11 @@ class OBSDirector:
                 # ── Kill CS2 after this demo group ────────────────────────────
                 # Always kill CS2 and restore user configs, even when aborted;
                 # _kill_cs2 calls _restore_user_configs internally.
-                await self._run_cleanup_step("CS2 shutdown after plan queue job", self._kill_cs2, timeout=30.0)
+                await self._run_cleanup_step(
+                    "CS2 shutdown after plan queue job",
+                    self._kill_cs2,
+                    timeout=_CS2_SHUTDOWN_CLEANUP_TIMEOUT_SEC,
+                )
                 await self._run_cleanup_step("CS2 artifact cleanup after plan queue job", self._cleanup_cs2_artifacts, timeout=8.0)
 
         except (CS2AlreadyRunningError, CS2NotReadyError):
@@ -3830,6 +4000,23 @@ class OBSDirector:
                 await asyncio.to_thread(obs_client.disconnect)
             except Exception:
                 pass
+            # This is the last-resort owner cleanup for every exception and
+            # cancellation path.  Per-demo cleanup normally clears these
+            # fields first, so the repeated call is harmless; if an exception
+            # escaped between warmup (which changes live CS2 bindings) and the
+            # normal group teardown, this closes the console/menu with the
+            # process, releases synthetic keys, kills CS2, restores the config
+            # snapshot, and clears the persistent ``recording`` state.
+            await self._run_cleanup_step(
+                "CS2 shutdown in final plan-queue cleanup",
+                self._kill_cs2,
+                timeout=_CS2_SHUTDOWN_CLEANUP_TIMEOUT_SEC,
+            )
+            await self._run_cleanup_step(
+                "CS2 artifact cleanup in final plan-queue cleanup",
+                self._cleanup_cs2_artifacts,
+                timeout=8.0,
+            )
             if pov_mgr_v3 is not None:
                 try:
                     logger.info("[RecordingV3][POV] restore gameinfo.gi")

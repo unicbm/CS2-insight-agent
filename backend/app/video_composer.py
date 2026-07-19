@@ -6,11 +6,12 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .montage_encoder import h264_encode_cli_args, resolve_h264_codec_name
 from .env_utils import (
@@ -21,6 +22,18 @@ from .env_utils import (
 
 logger = logging.getLogger(__name__)
 
+MontageProgressCallback = Callable[[dict[str, Any]], None]
+
+_AUDIBLE_MAX_VOLUME_DB = -45.0
+_AUDIBLE_MEAN_VOLUME_DB = -50.0
+_AUDIBLE_MAX_CREST_DB = 40.0
+_VOLUMEDETECT_LINE_RE = re.compile(
+    r"\[Parsed_volumedetect_(?P<filter_index>\d+)[^\]]*\]\s+"
+    r"(?P<metric>mean_volume|max_volume):\s+"
+    r"(?P<value>-?inf|[-+]?\d+(?:\.\d+)?)\s+dB",
+    re.IGNORECASE,
+)
+
 
 class MontageComposerError(Exception):
     """可映射为 HTTP 400/500 的合成错误（code 由前端 i18n 展示）。"""
@@ -29,6 +42,29 @@ class MontageComposerError(Exception):
         self.code = code
         self.params = params
         super().__init__(code)
+
+
+def _emit_montage_progress(
+    callback: MontageProgressCallback | None,
+    *,
+    stage: str,
+    processed: int,
+    total: int,
+    message: str,
+) -> None:
+    """Best-effort progress notification; observers must never break an export."""
+    if callback is None:
+        return
+    update = {
+        "stage": str(stage),
+        "processed": max(0, int(processed)),
+        "total": max(0, int(total)),
+        "message": str(message),
+    }
+    try:
+        callback(update)
+    except Exception:
+        logger.debug("montage progress callback failed", exc_info=True)
 
 
 def resolve_ffmpeg_binary(ffmpeg_path: str | None) -> Path:
@@ -60,8 +96,8 @@ def resolve_ffprobe_binary(ffmpeg_bin: Path) -> Path:
     raise MontageComposerError("MONTAGE_FFPROBE_NOT_FOUND")
 
 
-def _run_json(cmd: list[str]) -> dict[str, Any]:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+def _run_json(cmd: list[str], *, timeout_sec: float = 120.0) -> dict[str, Any]:
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()[-800:]
         logger.error("ffprobe failed (exit %s): %s", proc.returncode, tail)
@@ -73,7 +109,12 @@ def _run_json(cmd: list[str]) -> dict[str, Any]:
         raise MontageComposerError("MONTAGE_FFPROBE_FAILED") from e
 
 
-def ffprobe_streams(path: Path, ffprobe: Path) -> dict[str, Any]:
+def ffprobe_streams(
+    path: Path,
+    ffprobe: Path,
+    *,
+    timeout_sec: float = 120.0,
+) -> dict[str, Any]:
     return _run_json(
         [
             str(ffprobe),
@@ -85,6 +126,7 @@ def ffprobe_streams(path: Path, ffprobe: Path) -> dict[str, Any]:
             "json",
             str(path),
         ],
+        timeout_sec=timeout_sec,
     )
 
 
@@ -105,8 +147,13 @@ def parse_r_frame_rate(s: str) -> float:
         return 60.0
 
 
-def probe_video_audio_summary(path: Path, ffprobe: Path) -> dict[str, Any]:
-    data = ffprobe_streams(path, ffprobe)
+def probe_video_audio_summary(
+    path: Path,
+    ffprobe: Path,
+    *,
+    timeout_sec: float = 120.0,
+) -> dict[str, Any]:
+    data = ffprobe_streams(path, ffprobe, timeout_sec=timeout_sec)
     fmt = data.get("format") or {}
     dur_s: Optional[float] = None
     try:
@@ -115,9 +162,9 @@ def probe_video_audio_summary(path: Path, ffprobe: Path) -> dict[str, Any]:
     except (TypeError, ValueError):
         dur_s = None
     streams = data.get("streams") or []
-    vw = vh = 1920, 1080
+    vw, vh = 1920, 1080
     fps = 60.0
-    has_audio = False
+    audio_stream_indices: list[int] = []
     for st in streams:
         if not isinstance(st, dict):
             continue
@@ -130,8 +177,175 @@ def probe_video_audio_summary(path: Path, ffprobe: Path) -> dict[str, Any]:
                 pass
             fps = parse_r_frame_rate(str(st.get("r_frame_rate") or ""))
         elif ct == "audio":
-            has_audio = True
-    return {"width": vw, "height": vh, "fps": fps, "has_audio": has_audio, "duration": dur_s}
+            try:
+                audio_stream_indices.append(int(st.get("index")))
+            except (TypeError, ValueError):
+                continue
+    return {
+        "width": vw,
+        "height": vh,
+        "fps": fps,
+        "has_audio": bool(audio_stream_indices),
+        "audio_stream_indices": audio_stream_indices,
+        "duration": dur_s,
+    }
+
+
+def _parse_volume_db(raw: str) -> float:
+    value = str(raw or "").strip().lower()
+    if value == "-inf":
+        return float("-inf")
+    if value == "inf":
+        return float("inf")
+    return float(value)
+
+
+def _probe_audio_stream_loudness(
+    ffmpeg_bin: Path,
+    path: Path,
+    audio_stream_indices: list[int],
+    *,
+    timeout_sec: float = 600.0,
+) -> dict[int, dict[str, float]]:
+    """
+    Decode every audio stream in one FFmpeg process and measure its full-duration
+    mean/max level. Audio decoding is cheap compared with the video encode passes,
+    while a full scan avoids selecting a track whose first few seconds are silent.
+    """
+    indices = [int(x) for x in audio_stream_indices]
+    if not indices:
+        return {}
+
+    filter_parts = [f"[0:{stream_index}]volumedetect[aud{i}]" for i, stream_index in enumerate(indices)]
+    cmd: list[str] = [
+        str(ffmpeg_bin),
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "info",
+        "-i",
+        str(path),
+        "-filter_complex",
+        ";".join(filter_parts),
+    ]
+    for i in range(len(indices)):
+        cmd += ["-map", f"[aud{i}]", "-vn", "-sn", "-dn", "-f", "null", os.devnull]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("audio loudness probe failed for %s: %s", path.name, exc)
+        raise MontageComposerError("MONTAGE_AUDIO_PROBE_FAILED", name=path.name) from exc
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-900:]
+        logger.error("audio loudness probe failed for %s: %s", path.name, tail)
+        raise MontageComposerError("MONTAGE_AUDIO_PROBE_FAILED", name=path.name)
+
+    by_filter: dict[int, dict[str, float]] = {}
+    for match in _VOLUMEDETECT_LINE_RE.finditer((proc.stderr or "") + "\n" + (proc.stdout or "")):
+        filter_index = int(match.group("filter_index"))
+        if filter_index < 0 or filter_index >= len(indices):
+            continue
+        by_filter.setdefault(filter_index, {})[match.group("metric").lower()] = _parse_volume_db(
+            match.group("value")
+        )
+
+    levels: dict[int, dict[str, float]] = {}
+    for filter_index, stream_index in enumerate(indices):
+        row = by_filter.get(filter_index) or {}
+        if "mean_volume" not in row or "max_volume" not in row:
+            logger.error(
+                "audio loudness probe returned no complete metrics for %s stream %s",
+                path.name,
+                stream_index,
+            )
+            raise MontageComposerError("MONTAGE_AUDIO_PROBE_FAILED", name=path.name)
+        levels[stream_index] = row
+    return levels
+
+
+def _select_audible_audio_stream(
+    ffmpeg_bin: Path,
+    path: Path,
+    audio_stream_indices: list[int],
+    *,
+    timeout_sec: float = 600.0,
+) -> int | None:
+    """Prefer the first audible global stream, falling back only when silent.
+
+    OBS Track 1 is the first audio stream in its recording output.  Choosing the
+    loudest stream can accidentally select a later track that contains both the
+    managed game source and Desktop Audio, causing duplicate audio, clipping,
+    and comb filtering.  Stream order is therefore the trust boundary; loudness
+    is used only to decide whether each stream is genuinely audible.
+    """
+    if not audio_stream_indices:
+        return None
+    levels = _probe_audio_stream_loudness(
+        ffmpeg_bin,
+        path,
+        audio_stream_indices,
+        timeout_sec=timeout_sec,
+    )
+    for stream_index in audio_stream_indices:
+        row = levels.get(int(stream_index)) or {}
+        mean_db = float(row.get("mean_volume", float("-inf")))
+        max_db = float(row.get("max_volume", float("-inf")))
+        # Peak + sustained energy + a bounded crest factor reject digital silence
+        # and click/pop-only tracks while retaining intermittent game sound.
+        crest_db = max_db - mean_db
+        if (
+            max_db > _AUDIBLE_MAX_VOLUME_DB
+            and mean_db > _AUDIBLE_MEAN_VOLUME_DB
+            and crest_db <= _AUDIBLE_MAX_CREST_DB
+        ):
+            return int(stream_index)
+    return None
+
+
+def inspect_media_audio(
+    ffmpeg_bin: Path,
+    path: Path,
+    *,
+    timeout_sec: float = 600.0,
+) -> dict[str, Any]:
+    """Inspect all audio tracks and report whether at least one is audible.
+
+    Recording uses this immediately after OBS closes an output file, while the
+    montage exporter uses the same underlying detector before encoding. Keeping
+    one detector prevents the two stages from disagreeing about digital silence.
+    """
+    ffprobe = resolve_ffprobe_binary(ffmpeg_bin)
+    info = probe_video_audio_summary(path, ffprobe, timeout_sec=timeout_sec)
+    indices = list(info.get("audio_stream_indices") or [])
+    if not indices:
+        return {
+            "status": "missing",
+            "audible": False,
+            "stream_index": None,
+            "audio_stream_count": 0,
+        }
+    selected = _select_audible_audio_stream(
+        ffmpeg_bin,
+        path,
+        indices,
+        timeout_sec=timeout_sec,
+    )
+    return {
+        "status": "audible" if selected is not None else "silent",
+        "audible": selected is not None,
+        "stream_index": selected,
+        "audio_stream_count": len(indices),
+    }
+
+
+def _normalized_audio_filter(audio_stream_index: int | None, duration: float) -> str:
+    if audio_stream_index is not None:
+        return (
+            f"[0:{int(audio_stream_index)}]"
+            "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a]"
+        )
+    return f"anullsrc=r=48000:cl=stereo,atrim=0:{float(duration):.6f},asetpts=N/SR/TB[a]"
 
 
 def validate_output_path(path_str: str) -> Path:
@@ -187,17 +401,88 @@ def _concat_file_line(p: Path) -> str:
     return f"file '{s}'"
 
 
+def _validate_finalized_mp4(src: Path, dst: Path, ffprobe: Path) -> bool:
+    """Lightweight ffprobe validation for a stream-copy finalization attempt."""
+    try:
+        if not dst.is_file() or dst.stat().st_size <= 0:
+            return False
+        src_info = probe_video_audio_summary(src, ffprobe)
+        dst_info = probe_video_audio_summary(dst, ffprobe)
+    except (OSError, subprocess.TimeoutExpired, MontageComposerError):
+        logger.warning("montage finalized mp4 probe failed", exc_info=True)
+        return False
+
+    if not dst_info.get("has_audio"):
+        return False
+    if int(src_info.get("width") or 0) != int(dst_info.get("width") or 0):
+        return False
+    if int(src_info.get("height") or 0) != int(dst_info.get("height") or 0):
+        return False
+
+    src_fps = float(src_info.get("fps") or 0.0)
+    dst_fps = float(dst_info.get("fps") or 0.0)
+    if src_fps <= 0 or dst_fps <= 0 or abs(src_fps - dst_fps) > max(0.05, src_fps * 0.01):
+        return False
+
+    src_dur = float(src_info.get("duration") or 0.0)
+    dst_dur = float(dst_info.get("duration") or 0.0)
+    if src_dur <= 0 or dst_dur <= 0:
+        return False
+    return abs(src_dur - dst_dur) <= max(0.5, src_dur * 0.02)
+
+
 def _finalize_mp4_for_common_players(
     ffmpeg_bin: Path,
+    ffprobe: Path,
     src: Path,
     dst: Path,
     video_encode_fast: list[str],
-) -> None:
+) -> str:
     """
-    concat 直拷 .ts → .mp4 在部分播放器上不可靠（moov/时间基/流封装）。
-    统一重编码为 H.264（Main/High 依编码器）+ AAC-LC，并写入 faststart 便于随机访问。
+    First remux the already-normalized intermediate MP4 with faststart and verify
+    it using ffprobe. Only fall back to the historical full re-encode when the
+    remux fails validation.
+
+    Returns ``"stream_copy"`` or ``"reencode"`` for progress/UI diagnostics.
     """
-    cmd = [
+    copy_cmd = [
+        str(ffmpeg_bin),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(dst),
+    ]
+    copy_result: subprocess.CompletedProcess[str] | None = None
+    try:
+        copy_result = subprocess.run(copy_cmd, capture_output=True, text=True, timeout=7200)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("montage stream-copy finalization failed; falling back to re-encode: %s", exc)
+    if copy_result is not None and copy_result.returncode == 0 and _validate_finalized_mp4(src, dst, ffprobe):
+        logger.info("montage finalization used stream copy")
+        return "stream_copy"
+
+    tail = "" if copy_result is None else (copy_result.stderr or copy_result.stdout or "").strip()[-900:]
+    if copy_result is not None and copy_result.returncode != 0:
+        logger.warning("montage stream-copy finalization failed; falling back to re-encode: %s", tail)
+    elif copy_result is not None:
+        logger.warning("montage stream-copy finalization failed ffprobe validation; falling back to re-encode")
+    try:
+        dst.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("could not remove invalid stream-copy output", exc_info=True)
+
+    encode_cmd = [
         str(ffmpeg_bin),
         "-y",
         "-hide_banner",
@@ -222,11 +507,19 @@ def _finalize_mp4_for_common_players(
         "+faststart",
         str(dst),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    try:
+        r = subprocess.run(encode_cmd, capture_output=True, text=True, timeout=7200)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("montage finalize mp4 failed: %s", exc)
+        raise MontageComposerError("MONTAGE_FINALIZE_FAILED") from exc
     if r.returncode != 0:
         tail = (r.stderr or r.stdout or "").strip()[-900:]
         logger.error("montage finalize mp4 failed: %s", tail)
         raise MontageComposerError("MONTAGE_FINALIZE_FAILED")
+    if not _validate_finalized_mp4(src, dst, ffprobe):
+        logger.error("montage re-encoded mp4 failed ffprobe validation")
+        raise MontageComposerError("MONTAGE_FINALIZE_FAILED")
+    return "reencode"
 
 
 _VALID_XFADE_TYPES = frozenset({"fade", "cut", "flash", "dip_black", "zoom", "none"})
@@ -312,9 +605,9 @@ def _parse_transition_for_edge(transitions: dict[str, Any], clip_row_id: int) ->
 
 
 def _is_hard_cut(t_type: str, t_dur: float, fps: float = 60.0) -> bool:
-    """低于 1 帧时长或 type=none → 硬切，调用方直接 concat 而不走 xfade。"""
+    """``cut``/``none`` or a sub-frame duration is always a true hard cut."""
     min_xfade = max(1.0 / max(fps, 24.0), 0.02)
-    return t_dur < min_xfade or t_type == "none"
+    return t_type in {"cut", "none"} or t_dur < min_xfade
 
 
 def _clamp_xfade_duration(
@@ -366,8 +659,12 @@ def _montage_xfade_chain_to_ts(
     for i in range(1, n):
         tid = int(clip_row_ids[i - 1])
         t_type, t_req = _parse_transition_for_edge(transitions, tid)
+        # The caller splits at hard-cut boundaries. Keep this invariant here too
+        # so a future direct caller can never silently turn "cut" into a fade.
+        if _is_hard_cut(t_type, t_req, fps):
+            raise MontageComposerError("MONTAGE_TRANSITION_FAILED")
         td = _clamp_xfade_duration(t_type, t_req, out_len, durs[i], fps)
-        if t_type in ("cut", "fade"):
+        if t_type == "fade":
             xname = "fade"
         else:
             xname = _xfade_transition_name(t_type)
@@ -1150,7 +1447,22 @@ def compose_montage(
     outro_image_duration: Optional[float] = None,
     montage_encoder: str = "auto",
     name_cards: Optional[list[dict | None]] = None,
+    progress_callback: MontageProgressCallback | None = None,
 ) -> None:
+    progress = progress_callback
+    validation_total = (
+        len(clip_paths)
+        + int(intro_path is not None)
+        + int(outro_path is not None)
+        + int(bgm_path is not None)
+    )
+    _emit_montage_progress(
+        progress,
+        stage="validate",
+        processed=0,
+        total=validation_total,
+        message="正在校验合辑素材",
+    )
     if not clip_paths:
         raise MontageComposerError("MONTAGE_CLIPS_EMPTY")
     for c in clip_paths:
@@ -1168,6 +1480,14 @@ def compose_montage(
     video_encode_fast = h264_encode_cli_args(_codec, "fast")
 
     ffprobe = resolve_ffprobe_binary(ffmpeg_bin)
+
+    _emit_montage_progress(
+        progress,
+        stage="validate",
+        processed=validation_total,
+        total=validation_total,
+        message="素材路径与编码器校验完成",
+    )
 
     _font_path = resolve_name_card_font()
     _font_semi_path, _font_bold_path = resolve_rajdhani_fonts()
@@ -1194,12 +1514,88 @@ def compose_montage(
         if outro_path is not None:
             segments.append(outro_path)
 
+        # Preflight every non-image segment once. Recorded OBS clips must contain
+        # at least one genuinely audible stream; optional intro/outro videos may
+        # intentionally be silent and receive a synthetic compatibility track.
+        segment_infos: list[dict[str, Any] | None] = [None] * len(segments)
+        segment_audio_streams: list[int | None] = [None] * len(segments)
+        info_cache: dict[str, dict[str, Any]] = {
+            str(working_clip_paths[0].resolve()): ref,
+        }
+        audio_cache: dict[str, int | None] = {}
+        audio_probe_total = sum(1 for seg in segments if not _is_image_path(seg)) + int(
+            bgm_path is not None
+        )
+        audio_probe_done = 0
+        _emit_montage_progress(
+            progress,
+            stage="audio_preflight",
+            processed=0,
+            total=audio_probe_total,
+            message="正在检查素材音轨",
+        )
+        for i, seg in enumerate(segments):
+            if _is_image_path(seg):
+                continue
+            cache_key = str(seg.resolve())
+            info = info_cache.get(cache_key)
+            if info is None:
+                info = probe_video_audio_summary(seg, ffprobe)
+                info_cache[cache_key] = info
+            if cache_key not in audio_cache:
+                audio_cache[cache_key] = _select_audible_audio_stream(
+                    ffmpeg_bin,
+                    seg,
+                    list(info.get("audio_stream_indices") or []),
+                )
+            selected_audio = audio_cache[cache_key]
+            is_recorded_clip = intro_n <= i < intro_n + n_clips
+            if is_recorded_clip and not info.get("audio_stream_indices"):
+                raise MontageComposerError("MONTAGE_CLIP_AUDIO_MISSING", name=seg.name)
+            if is_recorded_clip and selected_audio is None:
+                raise MontageComposerError("MONTAGE_CLIP_AUDIO_SILENT", name=seg.name)
+            segment_infos[i] = info
+            segment_audio_streams[i] = selected_audio
+            audio_probe_done += 1
+            _emit_montage_progress(
+                progress,
+                stage="audio_preflight",
+                processed=audio_probe_done,
+                total=audio_probe_total,
+                message=f"已检查音轨：{seg.name}",
+            )
+
+        bgm_audio_stream: int | None = None
+        if bgm_path is not None:
+            bgm_info = probe_video_audio_summary(bgm_path, ffprobe)
+            bgm_indices = list(bgm_info.get("audio_stream_indices") or [])
+            if not bgm_indices:
+                raise MontageComposerError("MONTAGE_BGM_AUDIO_MISSING", name=bgm_path.name)
+            bgm_audio_stream = _select_audible_audio_stream(ffmpeg_bin, bgm_path, bgm_indices)
+            if bgm_audio_stream is None:
+                raise MontageComposerError("MONTAGE_BGM_AUDIO_SILENT", name=bgm_path.name)
+            audio_probe_done += 1
+            _emit_montage_progress(
+                progress,
+                stage="audio_preflight",
+                processed=audio_probe_done,
+                total=audio_probe_total,
+                message=f"已检查背景音乐：{bgm_path.name}",
+            )
+
         _intro_img_dur = max(1.0, float(intro_image_duration)) if intro_image_duration is not None else 3.0
         _outro_img_dur = max(1.0, float(outro_image_duration)) if outro_image_duration is not None else 3.0
         _intro_idx = 0 if intro_path is not None else -1
         _outro_idx = len(segments) - 1 if outro_path is not None else -1
 
         normed: list[Path] = []
+        _emit_montage_progress(
+            progress,
+            stage="normalize",
+            processed=0,
+            total=len(segments),
+            message="正在统一素材格式",
+        )
         for i, seg in enumerate(segments):
             out_ts = Path(tmpdir) / f"norm_{i:03d}.ts"
             if _is_image_path(seg):
@@ -1215,8 +1611,18 @@ def compose_montage(
                     duration=img_dur,
                 )
                 normed.append(out_ts)
+                _emit_montage_progress(
+                    progress,
+                    stage="normalize",
+                    processed=i + 1,
+                    total=len(segments),
+                    message=f"已处理素材 {i + 1}/{len(segments)}：{seg.name}",
+                )
                 continue
-            info = probe_video_audio_summary(seg, ffprobe)
+            info = segment_infos[i]
+            if info is None:
+                raise MontageComposerError("MONTAGE_FFPROBE_FAILED")
+            selected_audio_stream = segment_audio_streams[i]
             dur = info.get("duration")
             if dur is None or dur <= 0:
                 dur = 0.1
@@ -1297,28 +1703,16 @@ def compose_montage(
                 )
                 _card_y = card_h + int(_NAME_CARD_BOTTOM_MARGIN * _name_card_scale)
                 overlay_opts = f"0:H-{_card_y}:enable='between(t,0,{_display})'"
-                if info["has_audio"]:
-                    fc = (
-                        f"[0:v]{vf}[_scaled];"
-                        f"[1:v]{fade_flt}[_card];"
-                        f"[_scaled][_card]overlay={overlay_opts}[v];"
-                        f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a]"
-                    )
-                else:
-                    fc = (
-                        f"[0:v]{vf}[_scaled];"
-                        f"[1:v]{fade_flt}[_card];"
-                        f"[_scaled][_card]overlay={overlay_opts}[v];"
-                        f"anullsrc=r=48000:cl=stereo,atrim=0:{float(dur):.6f},asetpts=N/SR/TB[a]"
-                    )
+                audio_filter = _normalized_audio_filter(selected_audio_stream, float(dur))
+                fc = (
+                    f"[0:v]{vf}[_scaled];"
+                    f"[1:v]{fade_flt}[_card];"
+                    f"[_scaled][_card]overlay={overlay_opts}[v];"
+                    f"{audio_filter}"
+                )
             else:
-                if info["has_audio"]:
-                    fc = f"[0:v]{vf}[v];[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a]"
-                else:
-                    fc = (
-                        f"[0:v]{vf}[v];"
-                        f"anullsrc=r=48000:cl=stereo,atrim=0:{float(dur):.6f},asetpts=N/SR/TB[a]"
-                    )
+                audio_filter = _normalized_audio_filter(selected_audio_stream, float(dur))
+                fc = f"[0:v]{vf}[v];{audio_filter}"
 
             cmd = [
                 str(ffmpeg_bin),
@@ -1353,6 +1747,13 @@ def compose_montage(
                 logger.error("clip normalize failed %s: %s", seg.name, tail)
                 raise MontageComposerError("MONTAGE_CLIP_NORMALIZE_FAILED", name=seg.name)
             normed.append(out_ts)
+            _emit_montage_progress(
+                progress,
+                stage="normalize",
+                processed=i + 1,
+                total=len(segments),
+                message=f"已处理素材 {i + 1}/{len(segments)}：{seg.name}",
+            )
 
         has_transitions = bool(
             transitions is not None
@@ -1363,8 +1764,8 @@ def compose_montage(
         )
 
         if has_transitions:
-            # 按硬切边界（duration=0 或 type=none）拆成若干组；
-            # 组内片段用 xfade 连接，组间直接 concat——这样 0s 转场就是真正的硬切。
+            # 按硬切边界（cut / none / 小于一帧）拆成若干组；
+            # 组内仅保留真正的视觉转场，组间直接 concat。
             clip_norm = normed[intro_n : intro_n + n_clips]
             ids = [int(x) for x in clip_row_ids]
 
@@ -1384,6 +1785,13 @@ def compose_montage(
             groups.append((grp_clips, grp_ids))
 
             processed: list[Path] = []
+            _emit_montage_progress(
+                progress,
+                stage="transitions",
+                processed=0,
+                total=len(groups),
+                message="正在生成片段转场",
+            )
             for gi, (g_clips, g_ids) in enumerate(groups):
                 if len(g_clips) == 1:
                     processed.append(g_clips[0])
@@ -1400,6 +1808,13 @@ def compose_montage(
                         video_encode_quality=video_encode_quality,
                     )
                     processed.append(grp_ts)
+                _emit_montage_progress(
+                    progress,
+                    stage="transitions",
+                    processed=gi + 1,
+                    total=len(groups),
+                    message=f"已处理转场组 {gi + 1}/{len(groups)}",
+                )
 
             concat_paths: list[Path] = []
             if intro_path is not None:
@@ -1409,12 +1824,26 @@ def compose_montage(
                 concat_paths.append(normed[-1])
         else:
             concat_paths = normed
+            _emit_montage_progress(
+                progress,
+                stage="transitions",
+                processed=1,
+                total=1,
+                message="未配置视觉转场，使用硬切拼接",
+            )
 
         concat_list = Path(tmpdir) / "concat.txt"
         lines = [_concat_file_line(p) for p in concat_paths]
         concat_list.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         mid_mp4 = Path(tmpdir) / "mid.mp4"
+        _emit_montage_progress(
+            progress,
+            stage="concat",
+            processed=0,
+            total=1,
+            message="正在拼接已处理片段",
+        )
         cmd_concat = [
             str(ffmpeg_bin),
             "-y",
@@ -1436,9 +1865,36 @@ def compose_montage(
             tail = (r2.stderr or r2.stdout or "").strip()[-600:]
             logger.error("montage concat failed: %s", tail)
             raise MontageComposerError("MONTAGE_CONCAT_FAILED")
+        _emit_montage_progress(
+            progress,
+            stage="concat",
+            processed=1,
+            total=1,
+            message="片段拼接完成",
+        )
 
         mid_playable = Path(tmpdir) / "mid_playable.mp4"
-        _finalize_mp4_for_common_players(ffmpeg_bin, mid_mp4, mid_playable, video_encode_fast)
+        _emit_montage_progress(
+            progress,
+            stage="finalize",
+            processed=0,
+            total=1,
+            message="正在封装最终 MP4",
+        )
+        finalize_mode = _finalize_mp4_for_common_players(
+            ffmpeg_bin,
+            ffprobe,
+            mid_mp4,
+            mid_playable,
+            video_encode_fast,
+        )
+        _emit_montage_progress(
+            progress,
+            stage="finalize",
+            processed=1,
+            total=1,
+            message=("MP4 无损封装完成" if finalize_mode == "stream_copy" else "MP4 兼容重编码完成"),
+        )
 
         mid_info = ffprobe_streams(mid_playable, ffprobe)
         try:
@@ -1450,14 +1906,30 @@ def compose_montage(
 
         if bgm_path is None:
             shutil.move(str(mid_playable), str(output_path))
+            _emit_montage_progress(
+                progress,
+                stage="done",
+                processed=1,
+                total=1,
+                message="合辑导出完成",
+            )
             return
 
         bgm_vol = 1.0 if bgm_volume is None else max(0.0, min(2.0, float(bgm_volume)))
         bgm_start = 0.0 if bgm_start_sec is None else max(0.0, float(bgm_start_sec))
 
+        _emit_montage_progress(
+            progress,
+            stage="bgm_mix",
+            processed=0,
+            total=1,
+            message="正在混合背景音乐",
+        )
+        if bgm_audio_stream is None:
+            raise MontageComposerError("MONTAGE_BGM_AUDIO_SILENT", name=bgm_path.name)
         fc_mix = (
             f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ga];"
-            f"{build_bgm_filter(vdur, '[1:a]', volume=bgm_vol, start_sec=bgm_start)};"
+            f"{build_bgm_filter(vdur, f'[1:{bgm_audio_stream}]', volume=bgm_vol, start_sec=bgm_start)};"
             f"[ga][bgmtrim]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         )
         cmd_mix = [
@@ -1491,6 +1963,20 @@ def compose_montage(
             tail = (r3.stderr or r3.stdout or "").strip()[-600:]
             logger.error("montage bgm mix failed: %s", tail)
             raise MontageComposerError("MONTAGE_BGM_MIX_FAILED")
+        _emit_montage_progress(
+            progress,
+            stage="bgm_mix",
+            processed=1,
+            total=1,
+            message="背景音乐混合完成",
+        )
+        _emit_montage_progress(
+            progress,
+            stage="done",
+            processed=1,
+            total=1,
+            message="合辑导出完成",
+        )
     finally:
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)

@@ -24,10 +24,8 @@ import {
   isFreezeToDeathCompilation,
 } from "../utils/freezeToDeathRoundFilter";
 import RecordingPlanPreview from "./recordingQueue/RecordingPlanPreview";
-import AiDirectorPreview from "./recordingQueue/AiDirectorPreview";
 import { estimateItemRecordSeconds } from "../utils/recordingQueueDerive";
 import { timelineQueueMetaOneLiner } from "../utils/timelineQueue";
-import { AiScoreBadge } from "./ClipCard";
 import QueueMiniTimeline from "./recordingQueue/QueueMiniTimeline";
 import { useT } from "../i18n/useT.js";
 import { useLocaleStore } from "../i18n/localeStore";
@@ -222,10 +220,6 @@ export function PovSection({ item, updateItemPacing }) {
   const povEnabled = Boolean(po.victim_pov);
   const killerPovEnabled = Boolean(po.killer_pov);
   const povInterleaved = Boolean(po.pov_interleaved);
-  const aiDirectorEnabled = Boolean(po.ai_director);
-  const killCount = item.clipData?.kill_ticks?.length || 0;
-  const canAiDirector =
-    canVictimPov && killCount >= 3 && (isKillCompilation || (isHighlight && killCount > 1));
   const vicPre = po.victim_pov_pre_sec ?? gNum("victim_pov_pre_sec") ?? 1.5;
   const vicPost = po.victim_pov_post_sec ?? gNum("victim_pov_post_sec") ?? 1.5;
   const killPre = po.killer_pov_pre_sec ?? gNum("killer_pov_pre_sec") ?? vicPre;
@@ -243,7 +237,7 @@ export function PovSection({ item, updateItemPacing }) {
           <button
             type="button"
             title={t("queue.victimPovHint")}
-            onClick={() => commit({ victim_pov: !povEnabled, ai_director: povEnabled ? false : po.ai_director })}
+            onClick={() => commit({ victim_pov: !povEnabled, ai_director: false })}
             className={`flex w-full items-center gap-1.5 rounded border px-2 py-1.5 text-[10px] font-semibold transition-colors ${
               povEnabled
                 ? "border-cyan-500/40 bg-cs2-cyan-surface text-cyan-300 hover:bg-cs2-cyan-surface"
@@ -307,7 +301,7 @@ export function PovSection({ item, updateItemPacing }) {
         )}
       </div>
 
-      {((povEnabled && canVictimPov) || (killerPovEnabled && isDeathCompilation)) && !aiDirectorEnabled && (
+      {((povEnabled && canVictimPov) || (killerPovEnabled && isDeathCompilation)) && (
         <label className="flex cursor-pointer items-start gap-2 rounded border border-cs2-border-subtle bg-cs2-bg-input px-2 py-1.5 text-[10px] text-cs2-text-secondary">
           <input
             type="checkbox"
@@ -326,31 +320,7 @@ export function PovSection({ item, updateItemPacing }) {
         </label>
       )}
 
-      {canAiDirector && (
-        <label className="flex cursor-pointer items-start gap-2 rounded border border-violet-500/20 bg-violet-500/5 px-2 py-1.5 text-[10px] text-cs2-text-secondary">
-          <input
-            type="checkbox"
-            checked={aiDirectorEnabled}
-            onChange={(e) => {
-              const on = e.target.checked;
-              commit(on
-                ? { ai_director: true, victim_pov: true, pov_interleaved: false }
-                : { ai_director: false });
-            }}
-            className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-cs2-border accent-violet-500"
-          />
-          <span className="leading-snug">
-            <span className="font-semibold text-violet-300">{t("queue.aiDirectorLabel")}</span>
-            <span className="mt-0.5 block text-[9px] text-cs2-text-muted">{t("queue.aiDirectorHint")}</span>
-          </span>
-        </label>
-      )}
-
-      {aiDirectorEnabled && canAiDirector ? (
-        <AiDirectorPreview item={item} globalPacing={gp} />
-      ) : (
-        <RecordingPlanPreview item={item} globalPacing={gp} />
-      )}
+      <RecordingPlanPreview item={item} globalPacing={gp} />
 
       {povEnabled && canVictimPov && (
         <div className="space-y-2 rounded border border-cyan-500/10 bg-cs2-cyan-surface p-2">
@@ -612,7 +582,6 @@ function QueueItemCard({
   const locale = useLocaleStore((s) => s.locale);
   const cd = item.clipData || {};
   const tl = isTimelineSourceClip(cd);
-  const hideQueueAi = tl || cd.category === "compilation";
   const killBadge = t(blockShortLabelI18nKey(getMontageBlockShortLabel(cd)));
   const playerName = String(item.targetPlayer || cd.player_name || "—").trim() || "—";
   const round = cd.round != null && Number.isFinite(Number(cd.round)) ? Number(cd.round) : null;
@@ -621,7 +590,6 @@ function QueueItemCard({
   const opp = cd.score_opp != null ? Number(cd.score_opp) : null;
   const hasScorePair = own != null && opp != null && Number.isFinite(own) && Number.isFinite(opp);
   const mapName = String(cd.map_name || cd.map || "").trim();
-  const aiScore = cd.ai_score;
   const queueSummary = String(cd.queue_summary_line || "").trim();
   const combatSummary = !tl ? formatClipCombatSummaryLine(cd, t, locale) : "";
   const showLegacyTags =
@@ -636,7 +604,7 @@ function QueueItemCard({
       className="flex flex-col px-3 py-2 text-[11px] text-cs2-text-secondary"
       title={item.clipId || undefined}
     >
-      {/* 标题行：徽章 + 玩家名 + AI 分数 */}
+      {/* 标题行 */}
       <div className="flex items-center gap-2">
         {killBadge ? (
           <span
@@ -648,9 +616,6 @@ function QueueItemCard({
         <span className="min-w-0 flex-1 truncate text-[13px] font-bold text-cs2-text-primary">
           {playerName}
         </span>
-        <div className="ml-auto shrink-0">
-          {hideQueueAi ? null : <AiScoreBadge score={aiScore} />}
-        </div>
       </div>
 
       {/* 比分 / 地图行 */}

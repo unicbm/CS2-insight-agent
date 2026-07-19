@@ -10,12 +10,12 @@ if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
 
 const frontendRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-function run(command, args, env = process.env) {
+function run(command, args, env = process.env, shell = process.platform === "win32") {
   const result = spawnSync(command, args, {
     cwd: frontendRoot,
     env,
     stdio: "inherit",
-    shell: process.platform === "win32",
+    shell,
   });
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
@@ -23,12 +23,13 @@ function run(command, args, env = process.env) {
 run("npm", ["run", "desktop:stage-python"]);
 run("npm", ["run", "desktop:stage-resources"]);
 
-const tauri = join(frontendRoot, "node_modules", ".bin", process.platform === "win32" ? "tauri.cmd" : "tauri");
+const tauri = join(frontendRoot, "node_modules", "@tauri-apps", "cli", "tauri.js");
 run(
-  tauri,
-  ["build", "--config", JSON.stringify({ version })],
+  process.execPath,
+  [tauri, "build", "--config", JSON.stringify({ version })],
   {
     ...process.env,
     CS2_INSIGHT_APP_VERSION: version,
   },
+  false,
 );

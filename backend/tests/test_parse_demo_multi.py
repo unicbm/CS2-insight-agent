@@ -46,7 +46,10 @@ def test_parse_demo_multi_keeps_per_player_ai_review(monkeypatch, tmp_path):
     monkeypatch.setattr(
         main,
         "load_config",
-        lambda: AppConfig(ai_mode=True, llm=LLMConfig(api_key="test-key")),
+        lambda: AppConfig(
+            ai_mode=True,
+            llm=LLMConfig(api_key="test-key"),
+        ),
     )
 
     parsed = {
@@ -68,3 +71,29 @@ def test_parse_demo_multi_keeps_per_player_ai_review(monkeypatch, tmp_path):
     assert sorted(reviewed_players) == [("alpha", "en"), ("bravo", "en")]
     assert response["players"]["alpha"]["clips"] == [{"id": "a", "reviewed": True}]
     assert response["players"]["bravo"]["clips"] == [{"id": "b", "reviewed": True}]
+
+
+def test_parse_demo_multi_does_not_run_llm_when_product_switch_is_off(monkeypatch, tmp_path):
+    from app import ai_reviewer
+
+    demo_path = tmp_path / "match.dem"
+    demo_path.write_bytes(b"demo")
+    monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: AppConfig(ai_mode=False, llm=LLMConfig(api_key="test-key")),
+    )
+    parsed = {
+        "alpha": {"clips": [{"id": "a"}], "match_meta": {"target_player": "alpha"}},
+    }
+    monkeypatch.setattr(demo_parse_isolation, "analyze_multi_isolated", lambda *_args: parsed)
+
+    async def unexpected_enrich(*_args, **_kwargs):
+        raise AssertionError("LLM reviewer must remain disabled")
+
+    monkeypatch.setattr(ai_reviewer, "enrich_clips_dicts_with_reviewer", unexpected_enrich)
+
+    response = _run_parse_multi(players=["alpha"])
+
+    assert response["players"]["alpha"]["clips"] == [{"id": "a"}]

@@ -6,7 +6,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from unittest.mock import MagicMock, patch, call
 import pytest
 
-from app.recording.executor.obs_fade_controller import OBSFadeController, FadeConfig
+from app.recording.executor.obs_fade_controller import (
+    OBSFadeController,
+    FadeConfig,
+    _game_capture_settings,
+)
 from app.recording.executor.obs_client import OBSRecordError
 from app.env_utils import OBSConfig
 
@@ -76,6 +80,31 @@ def test_setup_skips_create_for_existing_scenes():
 
     assert result is True
     mock_client.create_scene.assert_not_called()
+
+
+def test_setup_enables_managed_game_audio_and_track_one():
+    cfg = _make_config()
+    ctrl = OBSFadeController(_make_obs_config(), cfg)
+
+    mock_client = MagicMock()
+    mock_client.get_scene_names.return_value = ["CS2 Insight Recording", "CS2 Insight Black"]
+    mock_client.get_scene_transition_list.return_value = ["Fade"]
+    mock_client.scene_has_source.return_value = True
+
+    with patch.object(ctrl, "_new_client", return_value=mock_client):
+        assert _run(ctrl.setup()) is True
+
+    game_call = mock_client.ensure_game_capture_in_scene.call_args_list[0]
+    assert game_call.args[:2] == ("CS2 Insight Recording", "CS2 Insight Game Capture")
+    assert game_call.kwargs["input_settings"]["capture_audio"] is True
+    assert game_call.kwargs["input_settings"]["capture_cursor"] is False
+    mock_client.ensure_input_audio_track.assert_called_once_with("CS2 Insight Game Capture", 1)
+
+
+def test_game_capture_settings_always_enable_audio_and_hide_cursor():
+    settings = _game_capture_settings()
+    assert settings["capture_audio"] is True
+    assert settings["capture_cursor"] is False
 
 
 def test_setup_fallback_on_exception():

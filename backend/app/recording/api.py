@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import logging
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -201,6 +202,8 @@ def build_v3_recorded_clip_meta(
         # Execution summary
         "segment_results": result.get("segment_results", []),
         "warnings": result.get("warnings", []),
+        "audio_health": result.get("audio_health"),
+        "audio_warning_code": result.get("audio_warning_code"),
         # Display fields for the montage workbench material pool
         "pov_hud_enabled": result.get("pov_hud_enabled", False),
         "recording_perspective": result.get("recording_perspective"),
@@ -229,6 +232,14 @@ async def _persist_v3_results(
             continue
         output_path = (r.get("output_path") or "").strip()
         if not output_path:
+            continue
+        audio_health = r.get("audio_health") if isinstance(r.get("audio_health"), dict) else {}
+        if audio_health.get("audible") is False:
+            logger.error(
+                "[RecordingV3][DB] skip unusable audio output=%s status=%s",
+                output_path,
+                audio_health.get("status"),
+            )
             continue
 
         dto = dto_by_id.get(r.get("request_id") or "")
@@ -271,7 +282,7 @@ async def _persist_v3_results(
                 player_name=player_name,
                 output_path=output_path,
                 duration_sec=dur_f,
-                status="ready",
+                status=("ready" if audio_health.get("audible") is True else "audio_unverified"),
                 clip_meta=clip_meta,
             )
             logger.info(
@@ -292,6 +303,118 @@ async def _persist_v3_results(
                 "[RecordingV3] recorded_clips insert failed clip_id=%s path=%s",
                 clip_id, output_path,
             )
+
+
+async def _annotate_v3_audio_health(results: list[dict], ffmpeg_path: str | None) -> None:
+    """Probe completed OBS files so silent recordings are reported immediately.
+
+    Audio-only decoding is limited to four concurrent files and ten seconds per
+    ffprobe/FFmpeg subprocess. A broken file therefore cannot silently hold the
+    queue response for the historical multi-minute timeout per clip.
+    """
+    candidates = [
+        result
+        for result in results
+        if isinstance(result, dict)
+        and result.get("success")
+        and str(result.get("output_path") or "").strip()
+    ]
+
+    def _warn(result: dict, code: str, health: dict) -> None:
+        result["audio_health"] = health
+        result["audio_warning_code"] = code
+        warnings = result.setdefault("warnings", [])
+        if isinstance(warnings, list) and code not in warnings:
+            warnings.append(code)
+
+    try:
+        from ..video_composer import inspect_media_audio, resolve_ffmpeg_binary
+
+        ffmpeg_bin = resolve_ffmpeg_binary(ffmpeg_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[RecordingV3][Audio] post-record check unavailable: %s", exc)
+        for result in candidates:
+            _warn(
+                result,
+                "RECORDING_OUTPUT_AUDIO_UNVERIFIED",
+                {"status": "unavailable", "audible": None},
+            )
+        return
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def _inspect_one(result: dict) -> None:
+        output_path = str(result.get("output_path") or "").strip()
+        try:
+            async with semaphore:
+                health = await asyncio.to_thread(
+                    inspect_media_audio,
+                    ffmpeg_bin,
+                    Path(output_path),
+                    timeout_sec=10.0,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RecordingV3][Audio] could not inspect output=%s: %s",
+                output_path,
+                exc,
+            )
+            _warn(
+                result,
+                "RECORDING_OUTPUT_AUDIO_UNVERIFIED",
+                {"status": "check_failed", "audible": None},
+            )
+            return
+
+        result["audio_health"] = health
+        if health.get("audible") is True:
+            logger.info(
+                "[RecordingV3][Audio] audible output=%s stream=%s tracks=%s",
+                output_path,
+                health.get("stream_index"),
+                health.get("audio_stream_count"),
+            )
+            return
+
+        code = (
+            "RECORDING_OUTPUT_AUDIO_MISSING"
+            if health.get("status") == "missing"
+            else "RECORDING_OUTPUT_AUDIO_SILENT"
+        )
+        _warn(result, code, health)
+        logger.error(
+            "[RecordingV3][Audio] unusable audio output=%s status=%s",
+            output_path,
+            health.get("status"),
+        )
+
+    await asyncio.gather(*(_inspect_one(result) for result in candidates))
+
+
+async def _require_obs_audio_ready(obs_cfg: OBSConfig) -> None:
+    """Read back the complete managed OBS audio path or block recording."""
+    try:
+        from .. import obs_config_center as _obs_config_center
+
+        status = await asyncio.to_thread(
+            _obs_config_center.get_status_payload,
+            obs_cfg,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[RecordingV3] OBS audio readiness check failed: %s", exc)
+        raise HTTPException(
+            409,
+            error_detail("RECORDING_OBS_AUDIO_NOT_READY"),
+        ) from exc
+    if status.get("audio", {}).get("ready") is not True:
+        logger.error(
+            "[RecordingV3] OBS audio not ready after managed-source setup: %s",
+            status.get("audio"),
+        )
+        raise HTTPException(
+            409,
+            error_detail("RECORDING_OBS_AUDIO_NOT_READY"),
+        )
 
 # Module-level abort event for the V3 queue; set when a queue is running, cleared in finally.
 _queue_abort_event: Optional[asyncio.Event] = None
@@ -689,6 +812,16 @@ async def execute_recording_queue(req: QueueRecordingRequest) -> list[dict]:
     if not await fade_ctrl.setup():
         logger.warning("[RecordingV3] OBS fade transition setup failed or disabled; recording in hard-cut mode")
 
+    # Server-authoritative audio gate. The frontend checks before opening the
+    # warmup dialog, but OBS can change afterward and API callers can bypass the
+    # UI. Fade setup above first repairs the managed source; this read-back then
+    # verifies capture_audio, mute state, input Track 1, and output Track 1.
+    try:
+        await _require_obs_audio_ready(obs_cfg)
+    except HTTPException:
+        _queue_abort_event = None
+        raise
+
     launch_args = (
         req.cs2_extra_launch_args
         if req.cs2_extra_launch_args is not None
@@ -719,6 +852,10 @@ async def execute_recording_queue(req: QueueRecordingRequest) -> list[dict]:
         raise HTTPException(500, error_detail("RECORDING_FAILED", err=str(e))) from e
     finally:
         _queue_abort_event = None
+
+    # Validate the real files, not just OBS settings. This makes an unexpected
+    # missing/silent output visible in the result dialog before montage export.
+    await _annotate_v3_audio_health(results, cfg.ffmpeg_path)
 
     # Persist successful recordings to recorded_clips for the montage workbench.
     try:

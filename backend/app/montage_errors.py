@@ -36,6 +36,16 @@ def montage_detail_from_legacy(message: str) -> dict[str, Any]:
         name = _extract_paren_name(s) or _extract_basename(s)
         return error_detail("MONTAGE_CLIP_NORMALIZE_FAILED", name=name or "?")
 
+    if "音轨" in s and ("静音" in s or "silent" in s.lower()):
+        name = _extract_paren_name(s) or _extract_basename(s)
+        return error_detail("MONTAGE_CLIP_AUDIO_SILENT", name=name or "?")
+    if "音轨" in s and ("缺失" in s or "missing" in s.lower()):
+        name = _extract_paren_name(s) or _extract_basename(s)
+        return error_detail("MONTAGE_CLIP_AUDIO_MISSING", name=name or "?")
+    if "音轨探测" in s or "audio probe" in s.lower():
+        name = _extract_paren_name(s) or _extract_basename(s)
+        return error_detail("MONTAGE_AUDIO_PROBE_FAILED", name=name or "?")
+
     if "转场" in s and ("过长" in s or "offset" in s.lower()):
         return error_detail("MONTAGE_TRANSITION_TOO_LONG")
     if "转场拼接" in s or "xfade" in s.lower():

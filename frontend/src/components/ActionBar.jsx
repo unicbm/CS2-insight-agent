@@ -1,4 +1,5 @@
-import { CheckSquare, XSquare, Loader2, ListPlus, Sparkles } from "lucide-react";
+import { ArrowRight, CheckSquare, XSquare, Loader2, ListPlus, Sparkles } from "lucide-react";
+import { Link } from "react-router-dom";
 import { useT } from "../i18n/useT.js";
 
 export default function ActionBar({
@@ -70,9 +71,18 @@ export default function ActionBar({
         </div>
       </div>
       {queueLength > 0 && (
-        <p className="mt-2 text-center font-mono text-[11px] text-cs2-text-muted sm:text-left">
-          {t("actionbar.queueCount", { n: queueLength })}
-        </p>
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-cs2-accent/20 bg-cs2-accent/[0.06] px-3 py-2">
+          <p className="font-mono text-[11px] text-cs2-text-secondary">
+            {t("actionbar.queueCount", { n: queueLength })}
+          </p>
+          <Link
+            to="/queue"
+            className="inline-flex items-center gap-1.5 rounded-md bg-cs2-accent px-3 py-1.5 text-[11px] font-bold text-cs2-text-on-accent transition-opacity hover:opacity-90"
+          >
+            {t("actionbar.goQueue")}
+            <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+          </Link>
+        </div>
       )}
     </div>
   );

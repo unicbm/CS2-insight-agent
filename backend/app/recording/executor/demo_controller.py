@@ -7,8 +7,9 @@ logger = logging.getLogger(__name__)
 
 # Non-Windows: stubs
 try:
-    from ...win_cs2_console import inject_console_sequence, send_cs2_vk_tap
+    from ...win_cs2_console import inject_console_batch, inject_console_sequence, send_cs2_vk_tap
 except ImportError:
+    def inject_console_batch(lines): pass
     def inject_console_sequence(lines): pass
     def send_cs2_vk_tap(vk: int) -> bool: return False
 
@@ -33,7 +34,9 @@ async def gototick(tick: int, verify_tolerance_ticks: int = 32) -> None:
     """
     cmds = ["demo_pause", f"demo_gototick {int(tick)}"]
     try:
-        await asyncio.to_thread(inject_console_sequence, cmds)
+        # Both commands belong to one seek transaction and contain only trusted
+        # numeric input, so one console submission is sufficient.
+        await asyncio.to_thread(inject_console_batch, cmds)
     except Exception as e:
         raise DemoSeekError(f"gototick {tick} failed: {e}") from e
     # Wait for seek to complete (CS2 async disk read)

@@ -122,7 +122,7 @@ describe("weapon kill compilations", () => {
         targetPlayer: "target",
         targetSteamId: "7656119",
         clipData,
-        pacing_override: { victim_pov: true },
+        pacing_override: { victim_pov: true, ai_director: true },
       },
       { total_rounds: 2, map_name: "de_mirage", all_players: [] },
     );
@@ -132,5 +132,6 @@ describe("weapon kill compilations", () => {
     expect(dto.events[0].victim.name).toBe("one");
     expect(dto.events[0].victim.spec_slot).toBe(4);
     expect(dto.options.enable_victim_pov).toBe(true);
+    expect(dto.options.use_ai_director).toBe(false);
   });
 });

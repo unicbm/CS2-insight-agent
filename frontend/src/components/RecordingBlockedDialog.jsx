@@ -71,12 +71,17 @@ function isConfigBackupMessage(message, errorCode) {
   );
 }
 
+function isObsConfigMessage(errorCode) {
+  return errorCode === "RECORDING_OBS_AUDIO_NOT_READY";
+}
+
 export default function RecordingBlockedDialog({ message, errorCode = null, onClose }) {
   const t = useT();
   const navigate = useNavigate();
   if (!message) return null;
   const subtitleKey = recordingBlockedSubtitleKey(message, errorCode);
   const showConfigLink = isConfigBackupMessage(message, errorCode);
+  const showObsConfigLink = isObsConfigMessage(errorCode);
   return (
     <div
       className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm"
@@ -121,6 +126,15 @@ export default function RecordingBlockedDialog({ message, errorCode = null, onCl
               className="rounded-lg border border-cs2-accent/40 bg-cs2-accent/10 px-4 py-2 text-sm font-bold text-cs2-accent transition-colors hover:bg-cs2-accent/20"
             >
               {t("dialog.recordBlockedGoConfig")}
+            </button>
+          ) : null}
+          {showObsConfigLink ? (
+            <button
+              type="button"
+              onClick={() => { onClose(); navigate("/settings?tab=video"); }}
+              className="rounded-lg border border-cs2-accent/40 bg-cs2-accent/10 px-4 py-2 text-sm font-bold text-cs2-accent transition-colors hover:bg-cs2-accent/20"
+            >
+              {t("dialog.recordBlockedGoObsConfig")}
             </button>
           ) : null}
           <button

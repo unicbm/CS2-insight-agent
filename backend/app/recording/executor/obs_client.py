@@ -316,6 +316,66 @@ class OBSClient:
         except Exception as exc:
             raise OBSRecordError(f"set_input_settings({input_name!r}) failed: {exc}") from exc
 
+    def get_input_audio_tracks(self, input_name: str) -> dict[str, bool]:
+        """Return OBS audio-track routing for one input without touching other sources."""
+        self._require_connected()
+        try:
+            req = getattr(obs_requests, "GetInputAudioTracks", None)
+            if req is None:
+                raise OBSRecordError("GetInputAudioTracks not available")
+            response = self._ws.call(req(inputName=input_name))
+            raw = (getattr(response, "datain", None) or {}).get("inputAudioTracks")
+            if not isinstance(raw, dict):
+                raise OBSRecordError("GetInputAudioTracks returned no track map")
+            return {str(key): bool(value) for key, value in raw.items()}
+        except OBSRecordError:
+            raise
+        except Exception as exc:
+            raise OBSRecordError(
+                f"get_input_audio_tracks({input_name!r}) failed: {exc}"
+            ) from exc
+
+    def set_input_audio_tracks(self, input_name: str, tracks: dict[str, bool]) -> None:
+        """Replace one input's track map with a caller-provided, already-preserved map."""
+        self._require_connected()
+        normalized = {str(key): bool(value) for key, value in tracks.items()}
+        try:
+            req = getattr(obs_requests, "SetInputAudioTracks", None)
+            if req is None:
+                raise OBSRecordError("SetInputAudioTracks not available")
+            self._ws.call(req(inputName=input_name, inputAudioTracks=normalized))
+        except OBSRecordError:
+            raise
+        except Exception as exc:
+            raise OBSRecordError(
+                f"set_input_audio_tracks({input_name!r}) failed: {exc}"
+            ) from exc
+
+    def ensure_input_audio_track(self, input_name: str, track_number: int = 1) -> bool:
+        """Enable one track while preserving every other routing bit.
+
+        Returns ``True`` when OBS was changed and ``False`` when the requested
+        track was already enabled.  A read-back prevents a silent best-effort
+        failure from being reported as success.
+        """
+        track = int(track_number)
+        if track < 1 or track > 6:
+            raise ValueError("OBS audio track number must be between 1 and 6")
+        key = str(track)
+        current = self.get_input_audio_tracks(input_name)
+        if current.get(key) is True:
+            return False
+        updated = dict(current)
+        updated[key] = True
+        self.set_input_audio_tracks(input_name, updated)
+        verified = self.get_input_audio_tracks(input_name)
+        if verified.get(key) is not True:
+            raise OBSRecordError(
+                f"OBS did not enable audio track {track} for input {input_name!r}"
+            )
+        logger.info("OBSClient: enabled audio track %d for input %r", track, input_name)
+        return True
+
     def ensure_game_capture_in_scene(
         self,
         scene_name: str,

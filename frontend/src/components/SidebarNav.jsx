@@ -2,7 +2,6 @@ import { NavLink } from "react-router-dom";
 import {
   BookOpen,
   Library,
-  Microscope,
   Package,
   Clapperboard,
   Settings,
@@ -49,10 +48,6 @@ export default function SidebarNav({ queueLength = 0, disabled = false }) {
         <NavLink to="/library" className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle}`}>
           <Library className="h-4 w-4 shrink-0 opacity-90" />
           {t("nav.demoLibrary")}
-        </NavLink>
-        <NavLink to="/analysis" className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle}`}>
-          <Microscope className="h-4 w-4 shrink-0 opacity-90" />
-          {t("nav.analysis")}
         </NavLink>
         <NavLink
           to="/queue"

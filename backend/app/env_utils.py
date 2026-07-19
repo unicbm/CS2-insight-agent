@@ -352,10 +352,26 @@ def llm_api_key_configured(api_key: Optional[str]) -> bool:
     return True
 
 
+def llm_requests_enabled(ai_mode: bool, llm: LLMConfig) -> bool:
+    """Single runtime gate for optional LLM work.
+
+    Local OpenAI-compatible endpoints may intentionally run without a key.
+    When the product switch is off, callers must not construct an LLM client.
+    """
+    return bool(
+        ai_mode
+        and (
+            llm_base_url_is_local_host(llm.base_url)
+            or llm_api_key_configured(llm.api_key)
+        )
+    )
+
+
 class ExperimentalConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     pov_enabled: bool = False
+    legacy_llm_enabled: bool = False
 
 
 class SpecPlayerVerifyConfig(BaseModel):
@@ -385,6 +401,8 @@ class AppConfig(BaseModel):
     cs2_path: str = ""
     demo_directory: str = ""
     demo_watch_paths: list[str] = Field(default_factory=list)
+    # 手动扫描监听目录时向下建立文件索引的深度：0=仅当前目录，-1=全部子目录。
+    demo_scan_depth: int = Field(default=2, ge=-1, le=12)
     ai_mode: bool = False
     # 前端界面语言：auto=跟随操作系统（中文系统→zh，其他→en）；亦可显式设为 zh / en
     locale: str = "auto"
@@ -721,35 +739,107 @@ def detect_obs_path() -> Optional[str]:
     return None
 
 
+def find_windows_process_pids(exe_name: str) -> Optional[set[int]]:
+    """Return PIDs whose executable name matches *exe_name*.
+
+    ``None`` means Windows could not enumerate processes reliably.  Keeping
+    that distinct from an empty set prevents callers from treating a probe
+    failure as proof that a process is absent.
+    """
+    if sys.platform != "win32":
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        target_name = Path(exe_name).name.casefold()
+        if not target_name:
+            return set()
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        ERROR_NO_MORE_FILES = 18
+        MAX_PATH = 260
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = (
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * MAX_PATH),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        snapshot = create_snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == ctypes.c_void_p(-1).value:
+            logger.warning(
+                "Windows process snapshot failed (error=%d)",
+                ctypes.get_last_error(),
+            )
+            return None
+
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ctypes.set_last_error(0)
+            if not process_first(snapshot, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error == ERROR_NO_MORE_FILES:
+                    return set()
+                logger.warning("Windows process enumeration failed (error=%d)", error)
+                return None
+
+            pids: set[int] = set()
+            while True:
+                if entry.szExeFile.casefold() == target_name:
+                    pids.add(int(entry.th32ProcessID))
+                ctypes.set_last_error(0)
+                if process_next(snapshot, ctypes.byref(entry)):
+                    continue
+                error = ctypes.get_last_error()
+                if error == ERROR_NO_MORE_FILES:
+                    return pids
+                logger.warning("Windows process enumeration failed (error=%d)", error)
+                return None
+        finally:
+            close_handle(snapshot)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Windows process enumeration unavailable: %s", exc)
+        return None
+
+
 def minimize_obs_window() -> None:
     """最小化 OBS 主窗口。仅 Windows 生效；非 Windows 为 no-op。
 
-    先通过 tasklist 找 obs64.exe/obs32.exe 的 PID，再按 PID + 可见窗口匹配。
+    先通过 Win32 Toolhelp 找 obs64.exe 的 PID，再按 PID + 可见窗口匹配。
     OBS 进程起来后需要一点时间才创建窗口，因此内部带重试。
     """
     if sys.platform != "win32":
         return
     try:
         import ctypes
-        import subprocess as _sp
         import time as _t
 
         SW_MINIMIZE = 2
-
-        def _get_obs_pids() -> set[int]:
-            obs_pids: set[int] = set()
-            try:
-                result = _sp.run(
-                    ["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH", "/FO", "CSV"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                for line in result.stdout.splitlines():
-                    parts = [p.strip().strip('"') for p in line.split(",")]
-                    if len(parts) >= 2 and parts[0] and parts[1].isdigit():
-                        obs_pids.add(int(parts[1]))
-            except Exception:
-                pass
-            return obs_pids
 
         def _find_visible_hwnd(obs_pids: set[int]):
             found = None
@@ -774,7 +864,10 @@ def minimize_obs_window() -> None:
 
         # 重试最多 5 次，每 0.5 秒一次，给 OBS 时间创建窗口
         for _attempt in range(5):
-            obs_pids = _get_obs_pids()
+            obs_pids = find_windows_process_pids("obs64.exe")
+            if obs_pids is None:
+                logger.warning("OBS process probe failed for minimization")
+                return
             if not obs_pids:
                 logger.warning("OBS process not found for minimization")
                 return

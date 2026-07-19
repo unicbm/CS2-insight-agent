@@ -23,10 +23,32 @@ __all__ = [
     "find_cs2_hwnd",
     "ensure_cs2_foreground",
     "inject_console_command",
+    "inject_console_batch",
     "inject_console_sequence",
+    "release_cs2_synthetic_keys",
     "send_cs2_space_taps",
     "send_cs2_vk_tap",
 ]
+
+
+def _normalise_console_lines(lines: list[str]) -> list[str]:
+    return [str(line).strip() for line in lines if line is not None and str(line).strip()]
+
+
+def _build_console_batch(lines: list[str]) -> str | None:
+    """Join simple, trusted console commands into one CS2 submission.
+
+    ``None`` means batching is unsafe and the caller must preserve the original
+    per-line submissions.  In particular, existing semicolon/quoted commands
+    may carry their own grouping semantics, so this helper never rewrites them.
+    """
+    commands = _normalise_console_lines(lines)
+    if not commands:
+        return ""
+    unsafe_tokens = (";", "\r", "\n", '"', "'", "//")
+    if any(any(token in command for token in unsafe_tokens) for command in commands):
+        return None
+    return "; ".join(commands)
 
 
 if sys.platform != "win32":
@@ -49,12 +71,15 @@ if sys.platform != "win32":
         skip_console_toggle: bool = False,
         close_console: bool = True,
     ) -> bool:
-        cmds = [str(ln).strip() for ln in lines if ln and str(ln).strip()]
+        cmds = _normalise_console_lines(lines)
         if cmds:
             logger.info("[非Windows] 模拟 CS2 控制台注入 %d 条指令: %s", len(cmds), cmds)
         return False
 
     def send_cs2_vk_tap(vk: int) -> bool:
+        return False
+
+    def release_cs2_synthetic_keys() -> bool:
         return False
 
 else:
@@ -177,6 +202,11 @@ else:
         if user32.GetForegroundWindow() == hwnd:
             ok = _send_input(_key_vk(vk, False), _key_vk(vk, True))
         if not ok:
+            # SendInput may have accepted only the key-down half of the pair.
+            # Release it through the global input queue before falling back to
+            # the window-local PostMessage path, otherwise a failed tap can
+            # leave Alt/F10/Space/Numpad logically held after automation exits.
+            _send_input(_key_vk(vk, True))
             _post_key_tap(hwnd, vk, scan)
 
     def _key_unicode(code: int, keyup: bool = False) -> INPUT:
@@ -331,6 +361,23 @@ else:
 
     VK_SPACE = 0x20
 
+    def release_cs2_synthetic_keys() -> bool:
+        """Best-effort release of every virtual key this module can press.
+
+        Cleanup must use the global SendInput queue as well as CS2's window
+        queue: a partial SendInput call can leave a key held globally, while a
+        PostMessage fallback only changes the target window's local state.
+        """
+        keys = (VK_MENU, VK_F10, VK_OEM_3, VK_SPACE, 0x65, 0x66)
+        released = _send_input(*(_key_vk(vk, True) for vk in keys))
+        hwnd = find_cs2_hwnd()
+        if hwnd:
+            for vk in keys:
+                scan = int(user32.MapVirtualKeyW(vk, 0)) or 0
+                lp_up = (1 << 31) | (1 << 30) | (scan << 16) | 1
+                user32.PostMessageW(hwnd, WM_KEYUP, vk, lp_up)
+        return released
+
     def send_cs2_space_taps(count: int) -> bool:
         """
         向前台 CS2 窗口发送空格键（不下拉控制台），用于 Demo 右下角「下一个玩家视角」等 UI。
@@ -383,7 +430,7 @@ else:
         skip_console_toggle: bool = False,
         close_console: bool = True,
     ) -> bool:
-        cmds = [ln.strip() for ln in lines if ln and str(ln).strip()]
+        cmds = _normalise_console_lines(lines)
         if not cmds:
             return True
         logger.info("CS2 控制台注入 %d 条指令: %s", len(cmds), cmds)
@@ -429,3 +476,34 @@ else:
 
     def inject_console_command(cmd: str, *, skip_console_toggle: bool = False) -> bool:
         return inject_console_sequence([cmd], skip_console_toggle=skip_console_toggle)
+
+
+def inject_console_batch(
+    lines: list[str],
+    *,
+    skip_console_toggle: bool = False,
+    close_console: bool = True,
+) -> bool:
+    """Submit trusted same-stage commands with a single Enter press.
+
+    Unsafe or already-grouped input falls back to ``inject_console_sequence``
+    unchanged.  This keeps user-authored lines with semicolons or quoting from
+    being silently reinterpreted while allowing internal numeric/cvar commands
+    to avoid repeated typing and Enter delays.
+    """
+    commands = _normalise_console_lines(lines)
+    batch = _build_console_batch(commands)
+    if batch is None:
+        logger.debug("CS2 控制台批处理包含分隔符或引号，保留逐行注入: %s", commands)
+        return inject_console_sequence(
+            commands,
+            skip_console_toggle=skip_console_toggle,
+            close_console=close_console,
+        )
+    if not batch:
+        return True
+    return inject_console_sequence(
+        [batch],
+        skip_console_toggle=skip_console_toggle,
+        close_console=close_console,
+    )

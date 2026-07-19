@@ -1,5 +1,75 @@
 import { create } from "zustand";
 
+export const RECORDING_QUEUE_STORAGE_KEY = "cs2-insight.recording-queue";
+const RECORDING_QUEUE_STORAGE_VERSION = 1;
+
+function getQueueStorage() {
+  try {
+    return typeof window !== "undefined" ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizePersistedQueue(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      ...item,
+      id: String(item.id || newId()),
+      clientClipUid: String(item.clientClipUid || item.clipData?.client_clip_uid || ""),
+    }));
+}
+
+function sanitizePersistedPacing(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+}
+
+function readPersistedQueueState() {
+  const storage = getQueueStorage();
+  if (!storage) return { queue: [], globalPacing: {} };
+  try {
+    const raw = storage.getItem(RECORDING_QUEUE_STORAGE_KEY);
+    if (!raw) return { queue: [], globalPacing: {} };
+    const parsed = JSON.parse(raw);
+    if (parsed?.version !== RECORDING_QUEUE_STORAGE_VERSION || !parsed.state) {
+      storage.removeItem(RECORDING_QUEUE_STORAGE_KEY);
+      return { queue: [], globalPacing: {} };
+    }
+    return {
+      queue: sanitizePersistedQueue(parsed.state.queue),
+      globalPacing: sanitizePersistedPacing(parsed.state.globalPacing),
+    };
+  } catch {
+    try {
+      storage.removeItem(RECORDING_QUEUE_STORAGE_KEY);
+    } catch {
+      // Storage may become unavailable between reads and cleanup.
+    }
+    return { queue: [], globalPacing: {} };
+  }
+}
+
+function writePersistedQueueState(state) {
+  const storage = getQueueStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(
+      RECORDING_QUEUE_STORAGE_KEY,
+      JSON.stringify({
+        version: RECORDING_QUEUE_STORAGE_VERSION,
+        state: {
+          queue: state.queue,
+          globalPacing: state.globalPacing,
+        },
+      }),
+    );
+  } catch {
+    // Recording must keep working even when storage is full or disabled.
+  }
+}
+
 /**
  * @typedef {Object} PacingOverride
  * @property {number} [pre_first_sec]   击杀段前预留（秒），每段首杀前回拨
@@ -125,15 +195,23 @@ function applyEnqueuePovDefaults(item, globalPacing) {
   return { ...item, pacing_override: prev };
 }
 
+const persistedQueueState = readPersistedQueueState();
+
 export const useRecordingQueue = create((set, get) => ({
-  queue: /** @type {RecordingQueueItem[]} */ ([]),
+  queue: /** @type {RecordingQueueItem[]} */ (persistedQueueState.queue),
+
+  /**
+   * 最近一次清空前的内存快照。只保留一份，供显式撤回；不会写入磁盘。
+   * @type {{ queue: RecordingQueueItem[], clearedAt: number } | null}
+   */
+  lastQueueSnapshot: null,
 
   /**
    * 全局节奏参数，作用于所有未单独设置 pacing_override 的片段。
    * 仅存储用户**显式修改**过的字段；未修改字段由后端默认值接管。
    * @type {PacingOverride}
    */
-  globalPacing: {},
+  globalPacing: persistedQueueState.globalPacing,
 
   /**
    * 「设置 → 录制预设」中保存的默认节奏。它与当前录制队列的 globalPacing 分开，
@@ -187,7 +265,34 @@ export const useRecordingQueue = create((set, get) => ({
   },
 
   clearQueue() {
-    set({ queue: [] });
+    const queue = get().queue;
+    if (queue.length === 0) return null;
+    const snapshot = {
+      queue: [...queue],
+      clearedAt: Date.now(),
+    };
+    set({ queue: [], lastQueueSnapshot: snapshot });
+    return snapshot;
+  },
+
+  undoClearQueue() {
+    const snapshot = get().lastQueueSnapshot;
+    if (!snapshot?.queue?.length) return false;
+    set((s) => {
+      const restoredIds = new Set(snapshot.queue.map((item) => item.id));
+      return {
+        queue: [
+          ...snapshot.queue,
+          ...s.queue.filter((item) => !restoredIds.has(item.id)),
+        ],
+        lastQueueSnapshot: null,
+      };
+    });
+    return true;
+  },
+
+  dismissQueueUndo() {
+    set({ lastQueueSnapshot: null });
   },
 
   /**
@@ -347,3 +452,18 @@ export const useRecordingQueue = create((set, get) => ({
     });
   },
 }));
+
+let lastPersistedQueueJson = JSON.stringify({
+  queue: persistedQueueState.queue,
+  globalPacing: persistedQueueState.globalPacing,
+});
+
+useRecordingQueue.subscribe((state) => {
+  const nextPersistedQueueJson = JSON.stringify({
+    queue: state.queue,
+    globalPacing: state.globalPacing,
+  });
+  if (nextPersistedQueueJson === lastPersistedQueueJson) return;
+  lastPersistedQueueJson = nextPersistedQueueJson;
+  writePersistedQueueState(state);
+});

@@ -10,14 +10,9 @@ const currentWindow = isDesktopApp ? getCurrentWindow() : null;
 export const desktopBridge = isDesktopApp
   ? {
       minimize: () => currentWindow.minimize(),
-      async toggleMaximize() {
-        if (await currentWindow.isMaximized()) {
-          await currentWindow.unmaximize();
-        } else {
-          await currentWindow.maximize();
-        }
-      },
+      toggleMaximize: () => currentWindow.toggleMaximize(),
       close: () => currentWindow.close(),
+      startDragging: () => currentWindow.startDragging(),
       isMaximized: () => currentWindow.isMaximized(),
       onMaximizeChange(callback) {
         let active = true;

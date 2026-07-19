@@ -12,7 +12,14 @@ from typing import Any, Literal, Optional
 from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from ..env_utils import LLMConfig, llm_api_key_configured, llm_base_url_is_local_host, load_config, resolve_config_path
+from ..env_utils import (
+    LLMConfig,
+    llm_api_key_configured,
+    llm_base_url_is_local_host,
+    llm_requests_enabled,
+    load_config,
+    resolve_config_path,
+)
 from ..llm_compat import completion_extra_body, message_text, normalize_llm_base_url
 from .normalizer import NormalizedRequest
 from .models import EventInfo
@@ -756,7 +763,10 @@ async def suggest_recording_outline(
     elif flashy == 0:
         payload["metadata_gap"] = "击杀列表未携带标签/爆头字段，LLM 无法识别颗秒等名场面"
 
-    cfg_llm = llm or load_config().llm
+    app_cfg = load_config()
+    cfg_llm = llm or app_cfg.llm
+    if not llm_requests_enabled(app_cfg.ai_mode, cfg_llm):
+        return _heuristic_outline(req), "heuristic", "AI 锐评未启用，已使用本地规则"
     try:
         api_key = _resolve_api_key(cfg_llm)
     except ValueError as e:

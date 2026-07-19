@@ -11,7 +11,7 @@ from .obs_fade_controller import OBSFadeController
 from .demo_controller import (
     gototick, demo_resume, demo_pause,
     demo_pause_silent, demo_pause_silent_attempt, demo_pause_silent_strict, demo_resume_silent_strict,
-    DemoSeekError, inject_console_sequence,
+    DemoSeekError, inject_console_batch,
 )
 from .spec_controller import spec_by_slot, spec_player
 from .gsi_verifier import verify_spec_target
@@ -368,12 +368,82 @@ class ExecutionResult:
 _SPEC_SLOT_MAX_OFFSET = 3
 
 
+def _parse_persistent_console_assignment(line: str) -> Optional[tuple[str, str]]:
+    """Return a cache key/value for a simple cvar assignment.
+
+    User-authored lines that contain grouping, quoting, or comments deliberately
+    remain uncacheable: replaying those lines preserves their existing semantics
+    and avoids guessing what state a compound command leaves behind.
+    """
+    command = str(line or "").strip()
+    if not command or any(token in command for token in (";", "\r", "\n", '"', "'", "//")):
+        return None
+    parts = command.split()
+    if len(parts) < 2:
+        return None
+    return parts[0].lower(), " ".join(parts[1:])
+
+
+@dataclass
+class _ConsoleSessionState:
+    """State known to have been successfully applied in this CS2 session."""
+
+    persistent_values: dict[str, str] = field(default_factory=dict)
+    target_bound_names: set[str] = field(default_factory=set)
+    confirmed_target_steamid64: str = ""
+
+    def is_current(self, name: str, value: object) -> bool:
+        return self.persistent_values.get(str(name).lower()) == str(value)
+
+    def pending_commands(self, lines: list[str]) -> list[str]:
+        pending: list[str] = []
+        projected = dict(self.persistent_values)
+        for raw in lines:
+            command = str(raw or "").strip()
+            if not command:
+                continue
+            assignment = _parse_persistent_console_assignment(command)
+            if assignment is None:
+                pending.append(command)
+                continue
+            name, value = assignment
+            if projected.get(name) == value:
+                continue
+            pending.append(command)
+            projected[name] = value
+        return pending
+
+    def mark_applied(self, lines: list[str]) -> None:
+        for line in lines:
+            assignment = _parse_persistent_console_assignment(line)
+            if assignment is not None:
+                name, value = assignment
+                self.persistent_values[name] = value
+
+    def register_target_bound_commands(self, lines: list[str]) -> None:
+        for line in lines:
+            assignment = _parse_persistent_console_assignment(line)
+            if assignment is not None:
+                self.target_bound_names.add(assignment[0])
+
+    def on_spec_player_sent(self) -> None:
+        # CS2 may reset/rebind these cvars (notably cl_demo_predict) whenever
+        # spec_player actually switches POV.  They remain cached only when the
+        # same target is GSI-confirmed and spec_player is skipped altogether.
+        for name in self.target_bound_names:
+            self.persistent_values.pop(name, None)
+
+    def forget_target(self) -> None:
+        self.confirmed_target_steamid64 = ""
+
+
 async def _spec_by_slot_with_retry(
     base_slot: Optional[int],
     player_name: str,
     target_steamid64: str,
     result_warnings: list,
     segment_index: int,
+    session_state: Optional[_ConsoleSessionState] = None,
 ) -> "bool | None":
     """
     Switch to base_slot (pre-computed during demo parsing), then verify via GSI.
@@ -385,17 +455,43 @@ async def _spec_by_slot_with_retry(
         None  — GSI inconclusive (proceed with warning)
         False — all offsets exhausted, still wrong player
     """
+    target_steamid64 = str(target_steamid64 or "")
+    if (
+        session_state is not None
+        and target_steamid64
+        and session_state.confirmed_target_steamid64 == target_steamid64
+        and session_state.is_current("spec_mode", 5)
+    ):
+        cached_verified = await verify_spec_target(target_steamid64)
+        if cached_verified is True:
+            logger.info(
+                "[RecordingV3] spec target unchanged and still GSI-verified; skipping spec_player for %r",
+                player_name,
+            )
+            return True
+        if cached_verified is False:
+            session_state.forget_target()
+
     if base_slot is None:
         if (player_name or "").strip():
             logger.info(
                 "[RecordingV3] no spec slot for %r; falling back to spec_player by name",
                 player_name,
             )
-            await spec_player(player_name)
+            include_mode = session_state is None or not session_state.is_current("spec_mode", 5)
+            sent = await spec_player(player_name, include_mode=include_mode)
+            if sent and include_mode and session_state is not None:
+                session_state.mark_applied(["spec_mode 5"])
+            if sent and session_state is not None:
+                session_state.on_spec_player_sent()
             if not target_steamid64:
                 return None
             verified = await verify_spec_target(target_steamid64)
+            if verified is True and session_state is not None:
+                session_state.confirmed_target_steamid64 = target_steamid64
             if verified is False:
+                if session_state is not None:
+                    session_state.forget_target()
                 result_warnings.append(
                     f"segment {segment_index}: spec verify failed for "
                     f"{player_name} (name fallback) — wrong player spectated"
@@ -413,13 +509,20 @@ async def _spec_by_slot_with_retry(
             "[RecordingV3] spec_by_slot %d (base=%d offset=%d) for %r steamid=%s",
             slot, base_slot, offset, player_name, target_steamid64,
         )
-        await spec_by_slot(slot)
+        include_mode = session_state is None or not session_state.is_current("spec_mode", 5)
+        sent = await spec_by_slot(slot, include_mode=include_mode)
+        if sent and include_mode and session_state is not None:
+            session_state.mark_applied(["spec_mode 5"])
+        if sent and session_state is not None:
+            session_state.on_spec_player_sent()
 
         if not target_steamid64:
             return None
 
         verified = await verify_spec_target(target_steamid64)
         if verified is True:
+            if session_state is not None:
+                session_state.confirmed_target_steamid64 = target_steamid64
             if offset > 0:
                 logger.info(
                     "[RecordingV3] slot offset +%d worked for %r (base=%d actual=%d)",
@@ -433,6 +536,8 @@ async def _spec_by_slot_with_retry(
             )
             return None
         # verified is False — try next offset
+        if session_state is not None:
+            session_state.forget_target()
         logger.warning(
             "[RecordingV3] slot %d wrong for %r (offset=%d), trying +1",
             slot, player_name, offset,
@@ -442,6 +547,8 @@ async def _spec_by_slot_with_retry(
         "[RecordingV3] all slot offsets 0..%d failed for %r steamid=%s",
         _SPEC_SLOT_MAX_OFFSET, player_name, target_steamid64,
     )
+    if session_state is not None:
+        session_state.forget_target()
     return False
 
 
@@ -452,12 +559,22 @@ class RecordingExecutor:
         abort_event: Optional[asyncio.Event] = None,
         fade_controller: Optional[OBSFadeController] = None,
         post_spec_console_lines: Optional[list[str]] = None,
+        disconnect_obs_on_finish: bool = True,
     ):
         self._obs = obs_client
         self._abort_event = abort_event
         self._fade: Optional[OBSFadeController] = fade_controller
+        # The queue director owns one OBSClient for the whole demo group and
+        # reuses this executor across multiple DTOs.  Standalone callers retain
+        # the historical behaviour of disconnecting when execute() finishes.
+        self._disconnect_obs_on_finish = bool(disconnect_obs_on_finish)
         # record_inject 行中需在每片段 spec_player 锁定后补注入的子集（依赖观战目标的 cvar，如 cl_demo_predict）。
         self._post_spec_console_lines: list[str] = list(post_spec_console_lines or [])
+        # One executor corresponds to one live CS2/demo session and is reused for
+        # all DTOs in that group.  Persist known cvar/POV state across segments so
+        # the hot path sends only actual changes.
+        self._console_state = _ConsoleSessionState()
+        self._console_state.register_target_bound_commands(self._post_spec_console_lines)
         # Controller is created per-execute call so it always holds the current client.
         self._ctrl: Optional[OBSRecordingController] = None
         # Tracks whether OBS program output is currently on the black scene.
@@ -467,6 +584,38 @@ class RecordingExecutor:
 
     def _is_aborted(self) -> bool:
         return self._abort_event is not None and self._abort_event.is_set()
+
+    async def _disconnect_obs_if_owned(self) -> None:
+        if self._disconnect_obs_on_finish and self._obs is not None:
+            await asyncio.to_thread(self._obs.disconnect)
+
+    async def _apply_prepare_console_state(self, voice_listen_mask: Optional[int]) -> bool:
+        """Apply changed voice/post-spec cvars in one safe console submission."""
+        requested: list[str] = []
+        if voice_listen_mask is not None:
+            # Direct assignment replaces the old -1 -> mask two-step.  Warmup has
+            # already established the all-voices baseline, and the cvar accepts a
+            # new bitmask without an intermediate reset.
+            requested.append(f"tv_listen_voice_indices {int(voice_listen_mask)}")
+        requested.extend(self._post_spec_console_lines)
+
+        pending = self._console_state.pending_commands(requested)
+        if not pending:
+            logger.debug("[RecordingV3] persistent prepare cvars unchanged; skipping console injection")
+            return True
+
+        try:
+            applied = await asyncio.to_thread(inject_console_batch, pending)
+        except Exception as exc:
+            logger.warning("[RecordingV3] prepare console batch failed: %s", exc)
+            return False
+        if applied is False:
+            logger.warning("[RecordingV3] prepare console batch was not delivered: %s", pending)
+            return False
+
+        self._console_state.mark_applied(pending)
+        logger.info("[RecordingV3] applied %d changed prepare command(s): %s", len(pending), pending)
+        return True
 
     async def _stop_obs_and_console_pause(self, is_last: bool) -> Optional[str]:
         """
@@ -643,30 +792,12 @@ class RecordingExecutor:
                         target_steamid64=segment.target_steamid64,
                         result_warnings=result.warnings,
                         segment_index=segment.segment_index,
+                        session_state=self._console_state,
                     )
                     spec_elapsed = time.monotonic() - spec_t0
 
-                    if spec_ok is not False and segment.voice_listen_mask is not None:
-                        mask_val = segment.voice_listen_mask
-                        try:
-                            await asyncio.to_thread(
-                                inject_console_sequence,
-                                ["tv_listen_voice_indices -1", f"tv_listen_voice_indices {mask_val}"],
-                            )
-                        except Exception as _e:
-                            logger.warning(
-                                "[RecordingV3] tv_listen_voice_indices inject failed: %s", _e
-                            )
-
-                    if spec_ok is not False and self._post_spec_console_lines:
-                        try:
-                            await asyncio.to_thread(
-                                inject_console_sequence, list(self._post_spec_console_lines)
-                            )
-                        except Exception as _e:
-                            logger.warning(
-                                "[RecordingV3] post-spec console inject failed: %s", _e
-                            )
+                    if spec_ok is not False:
+                        await self._apply_prepare_console_state(segment.voice_listen_mask)
 
                     if spec_ok is False:
                         logger.error(
@@ -738,6 +869,7 @@ class RecordingExecutor:
                             target_steamid64=segment.target_steamid64,
                             result_warnings=result.warnings,
                             segment_index=segment.segment_index,
+                            session_state=self._console_state,
                         )
                         if spec_ok is False:
                             logger.error(
@@ -769,17 +901,8 @@ class RecordingExecutor:
                             result.success = any(r.status == "ok" for r in result.segment_results)
                             result.warnings.extend(plan.warnings)
                             return result
-                        if spec_ok is not False and segment.voice_listen_mask is not None:
-                            mask_val = segment.voice_listen_mask
-                            try:
-                                await asyncio.to_thread(
-                                    inject_console_sequence,
-                                    ["tv_listen_voice_indices -1", f"tv_listen_voice_indices {mask_val}"],
-                                )
-                            except Exception as _e:
-                                logger.warning(
-                                    "[RecordingV3] tv_listen_voice_indices inject failed: %s", _e
-                                )
+                        if spec_ok is not False:
+                            await self._apply_prepare_console_state(segment.voice_listen_mask)
 
                 logger.info(
                     "[RecordingV3] spec_elapsed=%.2fs prepare_elapsed=%.2fs "
@@ -886,7 +1009,7 @@ class RecordingExecutor:
                     # OBS is recording a frozen frame — pause/stop it immediately.
                     if is_last:
                         final_output_path = await self._ctrl.stop_record_safe()
-                        await asyncio.to_thread(self._obs.disconnect)
+                        await self._disconnect_obs_if_owned()
                     else:
                         pause_r = await self._ctrl.pause_record_safe()
                         if pause_r == "fallback_stopped":
@@ -934,7 +1057,7 @@ class RecordingExecutor:
                     final_output_path = None
                     if is_last:
                         final_output_path = await self._stop_obs_and_console_pause(is_last=True)
-                        await asyncio.to_thread(self._obs.disconnect)
+                        await self._disconnect_obs_if_owned()
                     else:
                         await self._stop_obs_and_console_pause(is_last=False)
                         await self._ctrl.force_stop_recording()
@@ -962,7 +1085,7 @@ class RecordingExecutor:
                 if is_last:
                     result.recording_stopped_at = time.time()
                     final_output_path = obs_stop_path
-                    await asyncio.to_thread(self._obs.disconnect)
+                    await self._disconnect_obs_if_owned()
                     # ── kb overlay: end ─────────────────────────────────────
                     _bus, _ = _kb_bus(segment)
                     if _bus:

@@ -367,6 +367,10 @@ export default function RecordWarmupModal({
             {t("record.warmupIntroPersistNote")}
           </span>
         </p>
+        <div className="mb-5 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-3 py-2.5 text-xs leading-relaxed text-amber-100/80">
+          <span className="font-bold text-amber-300">{t("record.warmupSafetyTitle")}</span>{" "}
+          {t("record.warmupSafetyBody")}
+        </div>
 
         <div className="grid gap-4 lg:grid-cols-2 lg:items-start">
           <div className="min-w-0 space-y-4">

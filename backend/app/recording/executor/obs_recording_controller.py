@@ -39,6 +39,11 @@ OBS_FAST_PAUSE_DEADLINE_SEC: float = 1.0  # max wait: paused after PauseRecord
 OBS_FAST_STOP_DEADLINE_SEC: float = 5.0   # max wait: stopped after StopRecord
 OBS_FAST_POLL_INTERVAL_SEC: float = 0.08  # 80 ms between polls
 OBS_FAST_STATUS_TIMEOUT_SEC: float = 0.8  # per-poll GetRecordStatus timeout
+# ``StopRecord`` normally returns its outputPath alongside the state change.  The
+# previous synchronous poll-client disconnect happened to give that response
+# roughly two seconds to arrive.  Keep the same bounded grace period explicitly
+# now that disconnect cleanup no longer blocks the hot path.
+OBS_STOP_OUTPUT_PATH_GRACE_SEC: float = 2.0
 
 OBS_STOP_RETRIES: int = 3                  # retries in force_stop_recording
 
@@ -66,6 +71,10 @@ class OBSRecordingController:
         # client is kept for backward-compatible API; not used for recording ops.
         self._client = client
         self._timeout = command_timeout_sec
+        # asyncio only keeps weak references to tasks.  Retain every fire/cleanup
+        # task until completion so fresh OBS clients are always disconnected even
+        # though their slow recv-thread join is no longer on the recording path.
+        self._background_tasks: set[asyncio.Task] = set()
 
     # ── Internal: fresh client factory ───────────────────────────────────────
 
@@ -75,6 +84,40 @@ class OBSRecordingController:
             handshake_timeout_sec=OBS_CONNECT_TIMEOUT_SEC,
             command_timeout_sec=command_timeout,
         )
+
+    def _track_background_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Keep a strong task reference until completion."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _schedule_disconnect(self, client: OBSClient, label: str) -> asyncio.Task:
+        """Disconnect a fresh OBS client without delaying state-transition callers.
+
+        ``obswebsocket`` joins its receive thread in ``disconnect()``.  On the
+        packaged Windows build that join consistently takes about two seconds,
+        even though the OBS command and status response have already completed.
+        Run it in a tracked task so resources are still reclaimed but Start /
+        Resume / Pause can return as soon as the requested state is observed.
+        """
+
+        async def _cleanup() -> None:
+            try:
+                await asyncio.to_thread(client.disconnect)
+            except Exception as exc:
+                logger.debug(
+                    "[RecordingV3][OBS_FAST] %s disconnect cleanup failed: %s",
+                    label,
+                    exc,
+                )
+
+        return self._track_background_task(asyncio.create_task(_cleanup()))
+
+    async def _wait_for_background_tasks(self) -> None:
+        """Drain tracked command/cleanup tasks (used by deterministic tests)."""
+        while self._background_tasks:
+            pending = tuple(self._background_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ── Internal: fire-and-forget command task ────────────────────────────────
 
@@ -116,12 +159,9 @@ class OBSRecordingController:
                     display_name, _conn_e,
                 )
             finally:
-                try:
-                    await asyncio.to_thread(fresh.disconnect)
-                except Exception:
-                    pass
+                self._schedule_disconnect(fresh, f"{display_name} command")
 
-        return asyncio.create_task(_bg())
+        return self._track_background_task(asyncio.create_task(_bg()))
 
     # ── Internal: status polling ──────────────────────────────────────────────
 
@@ -169,10 +209,10 @@ class OBSRecordingController:
                         )
                 await asyncio.sleep(OBS_FAST_POLL_INTERVAL_SEC)
         finally:
-            try:
-                await asyncio.to_thread(poll_client.disconnect)
-            except Exception:
-                pass
+            # State observation is the synchronization point.  Closing the
+            # websocket is resource cleanup only and must not extend that point
+            # by obswebsocket's ~2 s receive-thread join.
+            self._schedule_disconnect(poll_client, f"{display_name} poll")
 
         raise OBSControlError(
             f"{display_name}: expected state not observed within {deadline_sec:.1f}s"
@@ -322,10 +362,7 @@ class OBSRecordingController:
         fire_t0 = time.monotonic()
         logger.info("[RecordingV3][OBS_FAST] StopRecord fired")
 
-        # Shared box so the bg task can pass back outputPath if the response arrives.
-        output_path_box: list[Optional[str]] = [None]
-
-        async def _fire_stop_capture() -> None:
+        async def _fire_stop_capture() -> Optional[str]:
             fresh = self._new_client(command_timeout=OBS_COMMAND_TIMEOUT_SEC)
             try:
                 await asyncio.to_thread(fresh.connect)
@@ -335,12 +372,12 @@ class OBSRecordingController:
                         timeout=OBS_COMMAND_TIMEOUT_SEC + 1.0,
                     )
                     if path:
-                        output_path_box[0] = path
                         logger.info(
                             "[RecordingV3][OBS_FAST] StopRecord response path=%s", path
                         )
                     else:
                         logger.debug("[RecordingV3][OBS_FAST] StopRecord response: no path")
+                    return path
                 except asyncio.TimeoutError:
                     logger.warning(
                         "[RecordingV3][OBS_FAST] StopRecord bg response timed out (ignored)"
@@ -354,12 +391,10 @@ class OBSRecordingController:
                     "[RecordingV3][OBS_FAST] StopRecord bg connect failed: %s", _conn_e
                 )
             finally:
-                try:
-                    await asyncio.to_thread(fresh.disconnect)
-                except Exception:
-                    pass
+                self._schedule_disconnect(fresh, "StopRecord command")
+            return None
 
-        asyncio.create_task(_fire_stop_capture())
+        stop_task = self._track_background_task(asyncio.create_task(_fire_stop_capture()))
 
         try:
             await self._observe_state(
@@ -377,7 +412,22 @@ class OBSRecordingController:
                 "[RecordingV3][OBS_FAST] StopRecord: stop not confirmed: %s", _e
             )
 
-        return output_path_box[0]
+        # Preserve the existing outputPath behaviour without putting the slow
+        # websocket disconnect back on the critical path.  In normal operation
+        # this task is already complete when the stopped state is observed; the
+        # grace only covers the response/state race.
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(stop_task),
+                timeout=OBS_STOP_OUTPUT_PATH_GRACE_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[RecordingV3][OBS_FAST] StopRecord outputPath response not available "
+                "within %.1fs; directory scan fallback will be used",
+                OBS_STOP_OUTPUT_PATH_GRACE_SEC,
+            )
+            return None
 
     async def get_record_status_safe(self) -> dict:
         """Fetch current OBS record status via a fresh connection. Returns {} on failure."""

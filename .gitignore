@@ -30,6 +30,8 @@ Thumbs.db
 *.tmp
 *.log
 .empty-git-hooks/
+.pytest_cache/
+/tmp/pytest-*/
 
 # Local demo files (do not upload)
 cs2_demo/

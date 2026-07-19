@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -17,6 +18,8 @@ from app.recording.ai_director import (
     finalize_ai_director_outline,
     victim_pov_omitted_kills,
 )
+from app.recording import ai_director as ai_director_module
+from app.env_utils import AppConfig, LLMConfig
 from app.recording.models import (
     DemoContext,
     EventInfo,
@@ -69,6 +72,34 @@ def _req(events: list[EventInfo]) -> NormalizedRequest:
         source_ref=__import__("app.recording.models", fromlist=["SourceRef"]).SourceRef(),
         warnings=[],
     )
+
+
+def test_ai_director_does_not_construct_llm_client_when_ai_mode_is_off(monkeypatch):
+    req = _req([_kill(0, headshot=True, stk=1)])
+    monkeypatch.setattr(
+        ai_director_module,
+        "enrich_kill_events_from_library",
+        lambda request: (request, []),
+    )
+    monkeypatch.setattr(
+        ai_director_module,
+        "load_config",
+        lambda: AppConfig(ai_mode=False, llm=LLMConfig(api_key="configured")),
+    )
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("LLM client must not be constructed while AI mode is off")
+
+    monkeypatch.setattr(ai_director_module, "AsyncOpenAI", UnexpectedClient)
+
+    outline, source, error = asyncio.run(
+        ai_director_module.suggest_recording_outline(req)
+    )
+
+    assert source == "heuristic"
+    assert outline.blocks
+    assert "未启用" in str(error)
 
 
 def test_heuristic_picks_all_eligible_instant_kills():

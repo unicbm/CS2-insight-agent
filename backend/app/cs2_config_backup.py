@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from .env_utils import get_data_dir
+from .env_utils import find_windows_process_pids, get_data_dir
 from .win_cs2_console import find_cs2_hwnd
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,35 @@ RECOVERY_README_TEXT = """这是 CS2 Insight Agent 在录制前自动保存的�
 CONFIG_RESTORE_REQUIRED = {
     "code": "RECORDING_CONFIG_RESTORE_REQUIRED",
 }
+
+_POISONED_KEYBIND_CODE = "CONFIG_BACKUP_POISONED"
+_DEFAULT_KEY_VCFG_UNAVAILABLE_CODE = "CONFIG_DEFAULT_KEY_VCFG_UNAVAILABLE"
+_POISONED_QUARANTINE_DIR_NAME = "legacy_poisoned_key_vcfg"
+_POISONED_MOUSE_KEYS = frozenset({"MOUSE1", "MOUSE2", "MOUSE_X", "MOUSE_Y"})
+_OFFICIAL_DEFAULT_MOUSE_BINDS = {
+    "MOUSE1": "+attack",
+    "MOUSE2": "+attack2",
+    "MOUSE_X": "yaw",
+    "MOUSE_Y": "pitch",
+}
+_POISONED_EXPECTED_BINDS = {
+    "F10": "toggleconsole",
+    "W": "+forward",
+    "A": "+moveleft",
+    "S": "+back",
+    "D": "+moveright",
+    "SPACE": "+jump",
+    "ESCAPE": "cancelselect",
+}
+_BIND_COMMAND_RE = re.compile(
+    r'^\s*bind\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]*)"|(\S+))',
+    re.IGNORECASE,
+)
+_UNBIND_COMMAND_RE = re.compile(
+    r'^\s*unbind\s+(?:"([^"]+)"|(\S+))',
+    re.IGNORECASE,
+)
+_QUOTED_BIND_PAIR_RE = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"')
 
 
 def get_backup_root() -> Path:
@@ -149,46 +179,292 @@ def write_manifest(manifest: dict[str, Any]) -> None:
     os.replace(tmp, p)
 
 
-def is_cs2_running() -> bool:
-    """Return True when CS2 has either a visible window or a live cs2.exe process."""
-    if sys.platform != "win32":
-        return bool(find_cs2_hwnd())
-    if find_cs2_hwnd():
-        return True
+def probe_cs2_running() -> Optional[bool]:
+    """Return CS2 presence as ``True`` / ``False`` / ``None`` (probe unknown).
+
+    A failed process enumeration is deliberately *not* collapsed to ``False``:
+    restoring cfg files while CS2 may still be alive lets its exit autosave
+    immediately overwrite the restored data again.
+    """
+    window_probe_failed = False
     try:
-        cp = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq cs2.exe", "/NH"],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-        )
-        if "cs2.exe" in (cp.stdout or "").lower():
+        if find_cs2_hwnd():
             return True
     except Exception as e:  # noqa: BLE001
-        logger.debug("Could not query cs2.exe via tasklist: %s", e)
+        logger.warning("Could not query the CS2 window: %s", e)
+        window_probe_failed = True
 
+    if sys.platform != "win32":
+        return None if window_probe_failed else False
+
+    pids = find_windows_process_pids("cs2.exe")
+    if pids:
+        return True
+    if pids is None or window_probe_failed:
+        return None
+    return False
+
+
+def is_cs2_running() -> bool:
+    """Fail-closed compatibility wrapper for existing boolean callers.
+
+    Startup/restore call sites written as ``if is_cs2_running()`` must never
+    interpret a native enumeration failure as permission to mutate cfg files.
+    """
+    return probe_cs2_running() is not False
+
+
+def _normalise_bind_key(raw: str) -> str:
+    return str(raw or "").strip().strip('"').upper()
+
+
+def _normalise_bind_action(raw: str) -> str:
+    return " ".join(str(raw or "").strip().strip('"').lower().split())
+
+
+def _keybind_candidate(path: Path) -> bool:
+    name = path.name.lower()
+    return name in {"config.cfg", "cs2_user.cfg"} or (
+        "key" in name and path.suffix.lower() in {".cfg", ".vcfg", ".txt"}
+    )
+
+
+def _parse_keybinds(data: bytes) -> dict[str, set[Optional[str]]]:
+    """Extract key bindings from console cfg and Valve quoted key/value files."""
+    text = data.decode("utf-8-sig", errors="ignore").replace("\x00", "")
+    bindings: dict[str, set[Optional[str]]] = {}
+
+    def add(key: str, action: Optional[str]) -> None:
+        normal_key = _normalise_bind_key(key)
+        if not normal_key:
+            return
+        normal_action = None if action is None else _normalise_bind_action(action)
+        bindings.setdefault(normal_key, set()).add(normal_action)
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("//", 1)[0]
+        match = _BIND_COMMAND_RE.match(line)
+        if match:
+            add(match.group(1) or match.group(2) or "", match.group(3) or match.group(4) or "")
+            continue
+        match = _UNBIND_COMMAND_RE.match(line)
+        if match:
+            add(match.group(1) or match.group(2) or "", None)
+            continue
+        match = _QUOTED_BIND_PAIR_RE.match(line)
+        if match:
+            add(match.group(1), match.group(2))
+    return bindings
+
+
+def find_poisoned_keybind_backup_paths(
+    files: dict[Path, Optional[bytes]],
+) -> list[Path]:
+    """Recognise the exact legacy ``unbindall`` minimal-bind fingerprint.
+
+    This intentionally does not invent replacement bindings.  It only rejects
+    a key file when every old recorder-owned default is present, both console
+    toggles are present, and MOUSE1/MOUSE2/MOUSE_X/MOUSE_Y have no live binding.
+    Files are evaluated independently so a healthy second Steam account cannot
+    hide a poisoned first account (or vice versa).
+    """
+    poisoned: list[Path] = []
+    for path, data in files.items():
+        if data is None or not _keybind_candidate(path):
+            continue
+        parsed = _parse_keybinds(data)
+        if not parsed:
+            continue
+        if any(
+            expected not in parsed.get(key, set())
+            for key, expected in _POISONED_EXPECTED_BINDS.items()
+        ):
+            continue
+        tilde_actions = parsed.get("`", set()) | parsed.get("~", set())
+        if "toggleconsole" not in tilde_actions:
+            continue
+        if any(
+            any(action not in {None, "", "none", "<unbound>"} for action in parsed.get(key, set()))
+            for key in _POISONED_MOUSE_KEYS
+        ):
+            continue
+        poisoned.append(path)
+    return poisoned
+
+
+def _is_user_key_vcfg(path: Path) -> bool:
+    """Only CS2's per-user key table is schema-compatible with the shipped default."""
+    name = path.name.lower()
+    return path.suffix.lower() == ".vcfg" and name.startswith("cs2_user_keys")
+
+
+def _official_default_key_vcfg(cs2_path: Optional[str]) -> tuple[Optional[Path], Optional[bytes], str]:
+    """Read ``game/csgo/cfg/user_keys_default.vcfg`` from the configured install.
+
+    Deliberately do not search other Steam libraries or manufacture bindings:
+    recovery is allowed only from the local game payload that owns ``cs2.exe``.
+    """
+    raw = str(cs2_path or "").strip()
+    if not raw:
+        return None, None, "未配置 cs2_path，无法定位游戏自带默认键位文件"
     try:
-        cp = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                "if (Get-Process -Name cs2 -ErrorAction SilentlyContinue) { 'cs2' }",
-            ],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
+        cs2 = Path(raw)
+        default_path = cs2.parents[2] / "csgo" / "cfg" / "user_keys_default.vcfg"
+    except (IndexError, OSError, ValueError) as e:
+        return None, None, f"cs2_path 无法定位 game/csgo/cfg: {e}"
+    if not cs2.is_file():
+        return default_path, None, f"cs2_path 不存在或不是文件: {cs2}"
+    if not default_path.is_file():
+        return default_path, None, f"游戏自带默认键位文件不存在: {default_path}"
+    try:
+        data = default_path.read_bytes()
+    except OSError as e:
+        return default_path, None, f"游戏自带默认键位文件无法读取: {default_path}: {e}"
+    if not data:
+        return default_path, None, f"游戏自带默认键位文件为空: {default_path}"
+    if find_poisoned_keybind_backup_paths({default_path: data}):
+        return default_path, None, f"游戏自带默认键位文件也命中旧版污染指纹: {default_path}"
+    parsed = _parse_keybinds(data)
+    missing_mouse_binds = [
+        f"{key}={action}"
+        for key, action in _OFFICIAL_DEFAULT_MOUSE_BINDS.items()
+        if action not in parsed.get(key, set())
+    ]
+    if missing_mouse_binds:
+        return (
+            default_path,
+            None,
+            "游戏自带默认键位文件缺少核心鼠标绑定，拒绝用它覆盖玩家配置: "
+            + ", ".join(missing_mouse_binds),
         )
-        return "cs2" in (cp.stdout or "").lower()
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Could not query cs2.exe via PowerShell: %s", e)
-        return False
+    return default_path, data, ""
+
+
+def _quarantine_poisoned_key_vcfg(path: Path, data: bytes) -> Path:
+    """Keep the exact poisoned bytes before replacing them with Valve's default."""
+    account = extract_steam_account_id(path) or "unknown-account"
+    quarantine = get_backup_root() / _POISONED_QUARANTINE_DIR_NAME / account
+    stamp = time.time_ns()
+    target = quarantine / f"{path.stem}.before-default-{stamp}{path.suffix}"
+    _atomic_write_bytes(target, data)
+    return target
+
+
+def migrate_legacy_poisoned_key_vcfg_targets(
+    targets: list[Path],
+    *,
+    cs2_path: Optional[str],
+) -> dict[str, Any]:
+    """Make exact legacy-poisoned key VCFG targets safe without guessing binds.
+
+    A target that no longer matches the fingerprint is preserved byte-for-byte.
+    A target that still matches is quarantined and atomically replaced only by
+    the configured CS2 install's ``user_keys_default.vcfg``.  All paths and the
+    default source are validated before the first target is changed.
+    """
+    unique_targets = list(dict.fromkeys(Path(path) for path in targets))
+    invalid = [path for path in unique_targets if not _is_user_key_vcfg(path)]
+    if invalid:
+        return {
+            "ok": False,
+            "code": _POISONED_KEYBIND_CODE,
+            "migrated": [],
+            "preserved": [],
+            "failed": [
+                {
+                    "original": str(path),
+                    "error": "旧版 unbindall 污染只允许从官方默认文件迁移 cs2_user_keys*.vcfg；该目标不是可安全迁移的 key VCFG",
+                }
+                for path in invalid
+            ],
+        }
+
+    current_data: dict[Path, bytes] = {}
+    failed: list[dict[str, str]] = []
+    for path in unique_targets:
+        try:
+            if not path.is_file():
+                failed.append({"original": str(path), "error": "当前 key VCFG 不存在，拒绝猜测用户原键位"})
+                continue
+            current_data[path] = path.read_bytes()
+        except OSError as e:
+            failed.append({"original": str(path), "error": f"当前 key VCFG 无法读取: {e}"})
+    if failed:
+        return {
+            "ok": False,
+            "code": _POISONED_KEYBIND_CODE,
+            "migrated": [],
+            "preserved": [],
+            "failed": failed,
+        }
+
+    still_poisoned = find_poisoned_keybind_backup_paths(current_data)
+    poisoned_set = set(still_poisoned)
+    preserved = [str(path) for path in unique_targets if path not in poisoned_set]
+    if not still_poisoned:
+        return {
+            "ok": True,
+            "migrated": [],
+            "preserved": preserved,
+            "failed": [],
+        }
+
+    default_path, default_data, default_error = _official_default_key_vcfg(cs2_path)
+    if default_data is None:
+        return {
+            "ok": False,
+            "code": _DEFAULT_KEY_VCFG_UNAVAILABLE_CODE,
+            "migrated": [],
+            "preserved": preserved,
+            "failed": [
+                {
+                    "original": str(path),
+                    "error": default_error,
+                }
+                for path in still_poisoned
+            ],
+            "default_path": str(default_path) if default_path else "",
+        }
+
+    migrated: list[str] = []
+    migration_failed: list[dict[str, str]] = []
+    quarantined: list[str] = []
+    for path in still_poisoned:
+        try:
+            # Re-read immediately before mutation so a concurrently repaired
+            # healthy file is never overwritten by the default.
+            live_data = path.read_bytes()
+            if not find_poisoned_keybind_backup_paths({path: live_data}):
+                if str(path) not in preserved:
+                    preserved.append(str(path))
+                continue
+            quarantine_path = _quarantine_poisoned_key_vcfg(path, live_data)
+            quarantined.append(str(quarantine_path))
+            # Steam Cloud may rewrite the file while the forensic copy is
+            # being created.  Re-check immediately before replacement so a
+            # concurrently repaired healthy table is never overwritten.
+            latest_data = path.read_bytes()
+            if not find_poisoned_keybind_backup_paths({path: latest_data}):
+                if str(path) not in preserved:
+                    preserved.append(str(path))
+                continue
+            if latest_data != live_data:
+                quarantine_path = _quarantine_poisoned_key_vcfg(path, latest_data)
+                quarantined.append(str(quarantine_path))
+            _atomic_write_bytes(path, default_data)
+            migrated.append(str(path))
+        except OSError as e:
+            migration_failed.append({"original": str(path), "error": f"默认键位迁移失败: {e}"})
+
+    return {
+        "ok": not migration_failed,
+        "code": "CONFIG_POISONED_KEY_VCFG_MIGRATED" if not migration_failed else _POISONED_KEYBIND_CODE,
+        "migrated": migrated,
+        "preserved": preserved,
+        "quarantined": quarantined,
+        "failed": migration_failed,
+        "default_path": str(default_path),
+    }
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:
@@ -209,7 +485,11 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
     raise last_err  # type: ignore[misc]
 
 
-def restore_latest_user_config_backup(*, skip_cs2_running_check: bool = False) -> dict[str, Any]:
+def restore_latest_user_config_backup(
+    *,
+    skip_cs2_running_check: bool = False,
+    cs2_path: Optional[str] = None,
+) -> dict[str, Any]:
     """按 manifest 将备份写回原始路径；全部成功后将 ``recording_state`` 置为 ``recorded``。"""
     backup_root = get_backup_root()
     manifest = read_manifest()
@@ -226,35 +506,87 @@ def restore_latest_user_config_backup(*, skip_cs2_running_check: bool = False) -
             }
         return {"ok": True, "restored": 0, "failed": [], "code": "CONFIG_NO_MANIFEST"}
 
-    if not skip_cs2_running_check and is_cs2_running():
-        return {
-            "ok": False,
-            "code": "CS2_RUNNING",
-            "restored": 0,
-            "failed": [],
-        }
+    if not skip_cs2_running_check:
+        running = probe_cs2_running()
+        if running is not False:
+            return {
+                "ok": False,
+                "code": "CS2_RUNNING" if running is True else "CS2_PROCESS_STATE_UNKNOWN",
+                "restored": 0,
+                "failed": [],
+            }
+
+    # Load and validate every source before touching any player file.  Older
+    # releases could persist the post-``unbindall`` minimal key table as the
+    # "backup"; restoring it would recreate the no-mouse-input failure.
+    restore_data: dict[Path, Optional[bytes]] = {}
+    source_errors: list[dict[str, str]] = []
+    for ent in entries:
+        orig_s = ent.get("original")
+        if not orig_s:
+            source_errors.append({"original": "", "error": "manifest 缺少 original，拒绝静默跳过恢复目标"})
+            continue
+        if not bool(ent.get("existed", True)):
+            continue
+        original = Path(orig_s)
+        rel = ent.get("backup_relpath")
+        if not rel:
+            source_errors.append({"original": str(original), "error": "manifest 缺少 backup_relpath"})
+            continue
+        rel_path = Path(str(rel))
+        try:
+            backup_root_resolved = backup_root.resolve()
+            src = (backup_root / rel_path).resolve()
+            if rel_path.is_absolute() or not src.is_relative_to(backup_root_resolved):
+                source_errors.append(
+                    {"original": str(original), "error": f"backup_relpath 越出备份目录: {rel}"}
+                )
+                continue
+        except OSError as e:
+            source_errors.append({"original": str(original), "error": f"备份路径无法解析: {rel}: {e}"})
+            continue
+        try:
+            restore_data[original] = src.read_bytes()
+        except OSError as e:
+            source_errors.append({"original": str(original), "error": f"备份文件无法读取: {rel}: {e}"})
+
+    if source_errors:
+        return {"ok": False, "restored": 0, "failed": source_errors}
+
+    poisoned = find_poisoned_keybind_backup_paths(restore_data)
+    migration: dict[str, Any] = {}
+    if poisoned:
+        migration = migrate_legacy_poisoned_key_vcfg_targets(poisoned, cs2_path=cs2_path)
+        if not migration.get("ok"):
+            return {
+                "ok": False,
+                "code": migration.get("code") or _POISONED_KEYBIND_CODE,
+                "restored": len(migration.get("migrated") or []),
+                "preserved": migration.get("preserved") or [],
+                "failed": migration.get("failed") or [],
+            }
 
     failed: list[dict[str, str]] = []
-    restored = 0
+    poisoned_set = set(poisoned)
+    restored = len(migration.get("migrated") or [])
+    preserved = list(migration.get("preserved") or [])
 
     for ent in entries:
         orig_s = ent.get("original")
         if not orig_s:
             continue
         original = Path(orig_s)
+        if original in poisoned_set:
+            # A healthy current key table was preserved, or a poisoned current
+            # table was already atomically replaced by Valve's local default.
+            continue
         existed = bool(ent.get("existed", True))
-        rel = ent.get("backup_relpath")
-
         try:
             if existed:
-                if not rel:
-                    failed.append({"original": str(original), "error": "manifest 缺少 backup_relpath"})
+                data = restore_data[original]
+                if data is None:  # defensive: existed entries were preloaded above
+                    failed.append({"original": str(original), "error": "备份内容为空"})
                     continue
-                src = backup_root / str(rel)
-                if not src.is_file():
-                    failed.append({"original": str(original), "error": f"备份文件不存在: {rel}"})
-                    continue
-                data = src.read_bytes()
                 _atomic_write_bytes(original, data)
                 restored += 1
             else:
@@ -264,18 +596,31 @@ def restore_latest_user_config_backup(*, skip_cs2_running_check: bool = False) -
         except OSError as e:
             failed.append({"original": str(original), "error": str(e)})
 
-    # recording_state 必须先清，无论恢复是否完整——否则下次录制会拒绝写新备份，
-    # 形成"旧 manifest → 恢复失败 → 拒绝备份"死循环。
-    if status_was == "recording":
+    # Only a fully successful restore may clear the recovery marker.  Keeping
+    # ``recording`` on partial failure is what makes a later retry possible.
+    if not failed and status_was == "recording":
         try:
             write_recording_state("recorded")
         except OSError as e:
             logger.warning("write_recording_state(recorded) failed: %s", e)
+            failed.append({"original": str(get_recording_state_path()), "error": str(e)})
 
     if failed:
-        return {"ok": False, "restored": restored, "failed": failed}
+        return {"ok": False, "restored": restored, "preserved": preserved, "failed": failed}
 
-    return {"ok": True, "restored": restored, "failed": []}
+    return {"ok": True, "restored": restored, "preserved": preserved, "failed": []}
+
+
+def _clear_snapshot_contents_preserving_quarantine(backup_dir: Path) -> None:
+    if not backup_dir.exists():
+        return
+    for child in backup_dir.iterdir():
+        if child.name == _POISONED_QUARANTINE_DIR_NAME:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def write_persistent_backup_from_snap(snap: dict[Path, Optional[bytes]]) -> Optional[Path]:
@@ -286,10 +631,20 @@ def write_persistent_backup_from_snap(snap: dict[Path, Optional[bytes]]) -> Opti
         logger.warning("Refusing persistent backup: restore_required (recording state)")
         return None
 
+    poisoned = find_poisoned_keybind_backup_paths(snap)
+    if poisoned:
+        logger.error(
+            "Refusing to overwrite the last backup with legacy poisoned keybind data: %s",
+            [str(path) for path in poisoned],
+        )
+        return None
+
     backup_dir = get_backup_root()
     try:
         if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
+            # Keep forensic copies made before a legacy poisoned key table was
+            # replaced.  Everything else remains the single latest snapshot.
+            _clear_snapshot_contents_preserving_quarantine(backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         logger.warning("Persistent backup mkdir %s failed: %s", backup_dir, e)
@@ -317,7 +672,10 @@ def write_persistent_backup_from_snap(snap: dict[Path, Optional[bytes]]) -> Opti
                 target.write_bytes(original)
             except OSError as e:
                 logger.warning("Persistent backup write %s failed: %s", target, e)
-                shutil.rmtree(backup_dir, ignore_errors=True)
+                try:
+                    _clear_snapshot_contents_preserving_quarantine(backup_dir)
+                except OSError:
+                    pass
                 return None
             entry["backup_relpath"] = rel
         entries.append(entry)
@@ -334,7 +692,10 @@ def write_persistent_backup_from_snap(snap: dict[Path, Optional[bytes]]) -> Opti
         write_recording_state("recording")
     except OSError as e:
         logger.warning("Persistent backup finalize failed: %s", e)
-        shutil.rmtree(backup_dir, ignore_errors=True)
+        try:
+            _clear_snapshot_contents_preserving_quarantine(backup_dir)
+        except OSError:
+            pass
         return None
 
     logger.info(

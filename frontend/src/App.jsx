@@ -158,11 +158,13 @@ export default function App() {
   const [ffmpegPath, setFfmpegPath] = useState("");
   const [montageEncoder, setMontageEncoder] = useState("auto");
   const [demoWatchPaths, setDemoWatchPaths] = useState([]);
+  const [demoScanDepth, setDemoScanDepth] = useState(2);
   const [expectedParsePlayersText, setExpectedParsePlayersText] = useState("");
   const [demoLibraryItems, setDemoLibraryItems] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
   /** 仅「扫描本地 demo 库」进行中；不在顶部 ProgressBar 展示，由按钮内 spinner 表示 */
   const [libraryScanning, setLibraryScanning] = useState(false);
+  const [libraryScanStatus, setLibraryScanStatus] = useState(null);
   const [libraryLoadingOverlay, setLibraryLoadingOverlay] = useState(false);
   const [libraryLoadingText, setLibraryLoadingText] = useState("");
   const [libraryPage, setLibraryPage] = useState(1);
@@ -529,19 +531,49 @@ export default function App() {
 
   const handleScanDemos = useCallback(async () => {
     setLibraryScanning(true);
+    setLibraryScanStatus({
+      state: "running",
+      phase: "indexing",
+      processed: 0,
+      total: 0,
+      current_file: null,
+      skipped_existing: 0,
+      depth: demoScanDepth,
+    });
+    let statusTimer = null;
+    let pollingActive = true;
     try {
+      const pollStatus = async () => {
+        try {
+          const { data } = await API.get("/demos/scan/status");
+          if (pollingActive && data?.state) setLibraryScanStatus(data);
+        } catch {
+          // The POST response remains authoritative if an individual poll is missed.
+        }
+      };
+      statusTimer = window.setInterval(() => void pollStatus(), 400);
       const { data } = await API.post("/demos/scan");
+      if (data?.scan) setLibraryScanStatus(data.scan);
       await refreshDemoLibrary(libraryPage, { manageLoading: false });
       const n = data?.discovered_count;
       if (typeof n === "number" && n > 0) {
         setProgressText(t("app.scanDone", { n }));
       }
     } catch (e) {
+      setLibraryScanStatus((prev) => ({
+        ...(prev || {}),
+        state: "error",
+        phase: "error",
+        error: e.response?.data?.detail || e.message,
+        current_file: null,
+      }));
       setProgressText(t("app.scanFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
     } finally {
+      pollingActive = false;
+      if (statusTimer !== null) window.clearInterval(statusTimer);
       setLibraryScanning(false);
     }
-  }, [refreshDemoLibrary, libraryPage, t]);
+  }, [demoScanDepth, refreshDemoLibrary, libraryPage, t]);
 
   const handleDeleteDemo = useCallback(
     async (id, rescan) => {
@@ -912,6 +944,7 @@ export default function App() {
             setMontageEncoder(data.montage_encoder.trim().toLowerCase());
           }
           if (Array.isArray(data.demo_watch_paths)) setDemoWatchPaths(data.demo_watch_paths);
+          if (Number.isInteger(data.demo_scan_depth)) setDemoScanDepth(data.demo_scan_depth);
           if (Array.isArray(data.expected_parse_players)) {
             setExpectedParsePlayersText(data.expected_parse_players.join("\n"));
           }
@@ -1793,11 +1826,33 @@ export default function App() {
     try {
       const { data } = await API.post("/obs/config-check", obsConfig);
       if (!data?.connected) {
-        setProgressText(t("app.obsConnectFail"), { isError: true });
+        setProgressText(
+          data?.error ? t("app.obsCheckFail", { msg: data.error }) : t("app.obsConnectFail"),
+          { isError: true },
+        );
         return;
       }
     } catch (e) {
       setProgressText(t("app.obsCheckFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
+      return;
+    }
+    // A successful WebSocket handshake does not prove that OBS is actually
+    // recording CS2 audio. Refuse to start a long batch when the dedicated
+    // source is muted, capture_audio is off, or Track 1 is not recorded.
+    setProgressText(t("app.checkingObsAudio"), { loading: true });
+    try {
+      const { data: obsStatus } = await API.get("/obs-config/status");
+      if (obsStatus?.audio?.ready !== true) {
+        setProgressText("");
+        setRecordingBlockedMessage(t("app.recordBlockedObsAudio"));
+        setRecordingBlockedCode("RECORDING_OBS_AUDIO_NOT_READY");
+        return;
+      }
+    } catch (e) {
+      setProgressText(
+        t("app.obsAudioCheckFail", { msg: e.response?.data?.detail || e.message }),
+        { isError: true },
+      );
       return;
     }
     setQueueDrawerOpen(false);
@@ -1893,8 +1948,6 @@ export default function App() {
             _queueItem: reqIdToQueueItem[r?.request_id] ?? null,
             _index: i,
           }));
-          const allSucceeded = results.length > 0 && results.every((r) => r && r.success);
-          if (allSucceeded) clearQueue();
           setRecordingResults(annotated);
           setRecordingResultModalOpen(true);
           setProgressText("", { autoDismissMs: 100 });
@@ -1923,7 +1976,6 @@ export default function App() {
     [
       warmupIntent,
       queue,
-      clearQueue,
       obsConfig,
       refreshConfigBackupStatus,
       uploadedDemos,
@@ -2393,6 +2445,7 @@ export default function App() {
   }, [currentMatchIndex]);
   const shell = {
     aiMode,
+    setAiMode,
     queue,
     uploadedDemos,
     libraryTotal,
@@ -2415,6 +2468,8 @@ export default function App() {
     setMontageEncoder,
     demoWatchPaths,
     setDemoWatchPaths,
+    demoScanDepth,
+    setDemoScanDepth,
     handleSaveConfig,
     startupInitDone,
     initialQuickCheckStatus,
@@ -2430,6 +2485,7 @@ export default function App() {
     handleScanDemos,
     libraryLoading,
     libraryScanning,
+    libraryScanStatus,
     expectedParsePlayersText,
     setExpectedParsePlayersText,
     handleSaveExpectedParsePlayers,
@@ -2607,6 +2663,7 @@ export default function App() {
                 <Route path="/montage" element={<MontageWorkbenchPage />} />
                 <Route path="/params" element={<RecordingParamsPage />} />
                 <Route path="/settings" element={<SettingsPage />} />
+                <Route path="/obs-config-center" element={<Navigate to="/settings?tab=video" replace />} />
                 <Route path="/player-game-config" element={<PlayerGameConfigPage />} />
                 <Route path="/match-history" element={<MatchHistoryPage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />

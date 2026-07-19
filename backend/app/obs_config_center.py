@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -44,6 +45,108 @@ def _obs_studio_root() -> Optional[Path]:
     return Path(appdata) / "obs-studio"
 
 
+def _as_optional_bool(value: object) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _read_obs_websocket_settings(obs_root: Optional[Path] = None) -> dict[str, Any]:
+    """读取 OBS WebSocket 插件配置，只返回连接元数据，绝不返回密码内容。"""
+    root = obs_root if obs_root is not None else _obs_studio_root()
+    result: dict[str, Any] = {
+        "settings_found": False,
+        "server_enabled": None,
+        "server_port": None,
+        "auth_required": None,
+        "obs_password_present": False,
+    }
+    if root is None:
+        return result
+    path = root / "plugin_config" / "obs-websocket" / "config.json"
+    if not path.is_file():
+        return result
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        logger.debug("Cannot read OBS WebSocket settings: %s", path, exc_info=True)
+        return result
+    if not isinstance(payload, dict):
+        return result
+    values = {str(key).casefold(): value for key, value in payload.items()}
+    result["settings_found"] = True
+    result["server_enabled"] = _as_optional_bool(values.get("server_enabled"))
+    result["auth_required"] = _as_optional_bool(values.get("auth_required"))
+    try:
+        port = int(values.get("server_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    result["server_port"] = port if 1 <= port <= 65535 else None
+    result["obs_password_present"] = bool(str(values.get("server_password") or "").strip())
+    return result
+
+
+def _tcp_port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def get_connection_readiness(
+    obs_cfg,
+    *,
+    obs_root: Optional[Path] = None,
+    probe_port: bool = True,
+) -> dict[str, Any]:
+    """无需 WebSocket 握手即可给出连接准备状态和明确阻断原因。"""
+    settings = _read_obs_websocket_settings(obs_root)
+    host = str(getattr(obs_cfg, "host", "") or "localhost").strip() or "localhost"
+    try:
+        port = int(getattr(obs_cfg, "port", 4455) or 4455)
+    except (TypeError, ValueError):
+        port = 4455
+    app_password_present = bool(str(getattr(obs_cfg, "password", "") or "").strip())
+    server_port = settings.get("server_port")
+    port_matches = server_port is None or int(server_port) == port
+    auth_required = settings.get("auth_required")
+    credentials_ready = auth_required is not True or app_password_present
+    port_open = _tcp_port_open(host, port) if probe_port and 1 <= port <= 65535 else None
+
+    blockers: list[str] = []
+    if not settings["settings_found"]:
+        blockers.append("OBS_WEBSOCKET_CONFIG_NOT_FOUND")
+    if settings["server_enabled"] is False:
+        blockers.append("OBS_WEBSOCKET_DISABLED")
+    if not port_matches:
+        blockers.append("OBS_PORT_MISMATCH")
+    if not credentials_ready:
+        blockers.append("OBS_PASSWORD_REQUIRED")
+    if port_open is False:
+        blockers.append("OBS_PORT_NOT_LISTENING")
+
+    return {
+        "host": host,
+        "configured_port": port,
+        **settings,
+        "app_password_present": app_password_present,
+        "port_matches": port_matches,
+        "credentials_ready": credentials_ready,
+        "port_open": port_open,
+        "connected": False,
+        "blockers": blockers,
+    }
+
+
 def _backup_root() -> Path:
     return get_data_dir() / BACKUP_SUBDIR
 
@@ -56,14 +159,28 @@ def _read_global_profile_names(obs_root: Path) -> tuple[Optional[str], Optional[
         raw = g.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None, None
-    prof: Optional[str] = None
-    sc: Optional[str] = None
+    values: dict[str, str] = {}
     for line in raw.splitlines():
         s = line.strip()
-        if s.lower().startswith("currentprofile="):
-            prof = s.split("=", 1)[1].strip()
-        if s.lower().startswith("currentscenecollection="):
-            sc = s.split("=", 1)[1].strip()
+        if not s or s.startswith(("#", ";", "[")) or "=" not in s:
+            continue
+        key, value = s.split("=", 1)
+        key = key.strip().casefold()
+        value = value.strip()
+        if value:
+            values[key] = value
+    # OBS 30+ stores filesystem-safe directory names in ProfileDir and
+    # SceneCollectionFile.  Keep the legacy keys as fallbacks for older installs.
+    prof = (
+        values.get("profiledir")
+        or values.get("currentprofile")
+        or values.get("profile")
+    )
+    sc = (
+        values.get("scenecollectionfile")
+        or values.get("currentscenecollection")
+        or values.get("scenecollection")
+    )
     return prof, sc
 
 
@@ -165,30 +282,113 @@ def _effective_project_profile(obs_root: Path, explicit: Optional[str]) -> str:
     return _resolve_obs_profile_folder_name(obs_root)
 
 
-def _parse_simple_output(ini_path: Path) -> dict[str, str]:
+def _read_profile_ini(ini_path: Path) -> Optional[configparser.ConfigParser]:
     if not ini_path.is_file():
-        return {}
-    cp = configparser.ConfigParser(interpolation=None)
+        return None
+    # OBS profile templates can contain legacy lower-case keys alongside the
+    # canonical mixed-case variants. Preserve case while parsing, then fold it
+    # ourselves so the later/canonical entry wins deterministically.
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
     try:
         cp.read(ini_path, encoding="utf-8-sig")
-    except configparser.Error:
+    except (OSError, configparser.Error):
+        return None
+    return cp
+
+
+def _parse_ini_section(ini_path: Path, section_name: str) -> dict[str, str]:
+    cp = _read_profile_ini(ini_path)
+    if cp is None:
         return {}
-    if "SimpleOutput" not in cp:
+    actual = next(
+        (name for name in cp.sections() if name.casefold() == section_name.casefold()),
+        None,
+    )
+    if actual is None:
         return {}
-    return {k: str(v) for k, v in cp["SimpleOutput"].items()}
+    return {str(key).casefold(): str(value) for key, value in cp[actual].items()}
+
+
+def _parse_simple_output(ini_path: Path) -> dict[str, str]:
+    return _parse_ini_section(ini_path, "SimpleOutput")
+
+
+def _parse_adv_output(ini_path: Path) -> dict[str, str]:
+    return _parse_ini_section(ini_path, "AdvOut")
+
+
+def _parse_output_mode(ini_path: Path) -> str:
+    raw = (_parse_ini_section(ini_path, "Output").get("mode") or "Simple").strip()
+    return "Advanced" if raw.casefold() == "advanced" else "Simple"
 
 
 def _parse_adv_output_rec_path(ini_path: Path) -> str:
     """从 basic.ini [AdvOut] 读取高级输出模式的录像目录（RecFilePath）。"""
-    if not ini_path.is_file():
-        return ""
-    cp = configparser.ConfigParser(interpolation=None)
+    return (_parse_adv_output(ini_path).get("recfilepath") or "").strip()
+
+
+def _parse_track_mask(raw: object, default: int = 1) -> int:
     try:
-        cp.read(ini_path, encoding="utf-8-sig")
-    except configparser.Error:
-        return ""
-    section = cp["AdvOut"] if "AdvOut" in cp else {}
-    return str(section.get("recfilepath") or section.get("RecFilePath") or "").strip()
+        mask = int(str(raw).strip())
+    except (TypeError, ValueError):
+        mask = default
+    return max(0, mask) & 0x3F
+
+
+def _profile_recording_settings(ini_path: Optional[Path]) -> dict[str, Any]:
+    """Read the active OBS output mode and the matching recording section."""
+    base: dict[str, Any] = {
+        "output_mode": "Simple",
+        "use_stream_encoder": False,
+        "encoder": "",
+        "format": "",
+        "rec_quality": "",
+        "output_path": "",
+        "audio_track_mask": 1,
+        "audio_tracks": [1],
+        "output_track1_enabled": True,
+    }
+    if ini_path is None or not ini_path.is_file():
+        return base
+
+    mode = _parse_output_mode(ini_path)
+    simple = _parse_simple_output(ini_path)
+    advanced = _parse_adv_output(ini_path)
+    base["output_mode"] = mode
+
+    if mode == "Advanced":
+        rec_encoder = (advanced.get("recencoder") or "").strip()
+        stream_encoder = (advanced.get("encoder") or "").strip()
+        use_stream = rec_encoder.casefold() in {"", "none", "null", "stream"}
+        mask = _parse_track_mask(advanced.get("rectracks"), 1)
+        base.update(
+            {
+                "use_stream_encoder": use_stream,
+                "encoder": stream_encoder if use_stream else rec_encoder,
+                "format": (advanced.get("recformat2") or advanced.get("recformat") or "").strip(),
+                "rec_quality": "Advanced",
+                "output_path": (advanced.get("recfilepath") or "").strip(),
+                "audio_track_mask": mask,
+            }
+        )
+    else:
+        mask = _parse_track_mask(simple.get("rectracks"), 1)
+        base.update(
+            {
+                "use_stream_encoder": _detect_use_stream_encoder(simple, None),
+                "encoder": (simple.get("recencoder") or simple.get("encoder") or "").strip(),
+                "format": (simple.get("recformat2") or simple.get("recformat") or "").strip(),
+                "rec_quality": (simple.get("recquality") or "").strip(),
+                "output_path": _recording_output_path_from_simple(simple),
+                "audio_track_mask": mask,
+            }
+        )
+
+    mask = int(base["audio_track_mask"])
+    base["audio_tracks"] = [track for track in range(1, 7) if mask & (1 << (track - 1))]
+    base["output_track1_enabled"] = bool(mask & 1)
+    return base
 
 
 def _get_record_directory_via_ws(ws: obsws) -> str:
@@ -302,12 +502,12 @@ def _fps_from_video_dict(v: dict[str, int]) -> int:
 
 def _detect_use_stream_encoder(simple: dict[str, str], obs_ws: Optional[obsws]) -> bool:
     # ini 启发式
-    for key in ("RecUseStreamEncoder", "UseStreamEncoder", "rec_use_stream_encoder"):
+    for key in ("recusestreamencoder", "usestreamencoder", "rec_use_stream_encoder"):
         val = simple.get(key)
         if val is not None:
             return str(val).strip().lower() in ("1", "true", "yes")
-    same = (simple.get("RecEncoder") or "").strip() and (simple.get("Encoder") or "").strip()
-    if same and simple.get("RecEncoder") == simple.get("Encoder"):
+    same = (simple.get("recencoder") or "").strip() and (simple.get("encoder") or "").strip()
+    if same and simple.get("recencoder") == simple.get("encoder"):
         # 可能共用；保守视为警告来源之一，最终以 WS 为准
         pass
     if obs_ws is not None:
@@ -329,7 +529,7 @@ def _detect_use_stream_encoder(simple: dict[str, str], obs_ws: Optional[obsws]) 
 
 
 def _recording_output_path_from_simple(simple: dict[str, str]) -> str:
-    return (simple.get("FilePath") or simple.get("FilePath2") or "").strip()
+    return (simple.get("filepath") or simple.get("filepath2") or "").strip()
 
 
 def _scene_item_transform(ws: obsws, scene_name: str, source_name: str) -> Optional[dict]:
@@ -387,6 +587,276 @@ def _source_fits_canvas(ws: obsws, scene_name: str, source_name: str, base_w: in
             if int(sx * sw) >= base_w - 8 and int(sy * sh) >= base_h - 8:
                 return True
     return False
+
+
+def _get_input_settings(ws: obsws, input_name: str) -> Optional[dict[str, Any]]:
+    try:
+        req = getattr(obs_requests, "GetInputSettings", None)
+        if req is None:
+            return None
+        response = ws.call(req(inputName=input_name))
+        settings = (getattr(response, "datain", None) or {}).get("inputSettings")
+        return dict(settings) if isinstance(settings, dict) else None
+    except Exception:  # noqa: BLE001
+        logger.debug("GetInputSettings failed for %r", input_name, exc_info=True)
+        return None
+
+
+def _get_input_mute(ws: obsws, input_name: str) -> Optional[bool]:
+    try:
+        req = getattr(obs_requests, "GetInputMute", None)
+        if req is None:
+            return None
+        response = ws.call(req(inputName=input_name))
+        raw = (getattr(response, "datain", None) or {}).get("inputMuted")
+        return _as_optional_bool(raw)
+    except Exception:  # noqa: BLE001
+        logger.debug("GetInputMute failed for %r", input_name, exc_info=True)
+        return None
+
+
+def _get_input_audio_tracks(ws: obsws, input_name: str) -> Optional[dict[str, bool]]:
+    try:
+        req = getattr(obs_requests, "GetInputAudioTracks", None)
+        if req is None:
+            return None
+        response = ws.call(req(inputName=input_name))
+        raw = (getattr(response, "datain", None) or {}).get("inputAudioTracks")
+        if not isinstance(raw, dict):
+            return None
+        return {
+            str(key): _as_optional_bool(value) is True
+            for key, value in raw.items()
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("GetInputAudioTracks failed for %r", input_name, exc_info=True)
+        return None
+
+
+def _get_special_input_names(ws: obsws) -> Optional[set[str]]:
+    """Return global Desktop Audio / Mic-Aux input names configured by OBS."""
+    try:
+        req = getattr(obs_requests, "GetSpecialInputs", None)
+        if req is None:
+            return None
+        response = ws.call(req())
+        raw = getattr(response, "datain", None)
+        if not isinstance(raw, dict):
+            return None
+        names: set[str] = set()
+        for key, value in raw.items():
+            normalized_key = str(key).casefold()
+            if not (
+                normalized_key.startswith("desktop")
+                or normalized_key.startswith("mic")
+            ):
+                continue
+            name = str(value or "").strip()
+            if name:
+                names.add(name)
+        return names
+    except Exception:  # noqa: BLE001
+        logger.debug("GetSpecialInputs failed", exc_info=True)
+        return None
+
+
+def _get_scene_source_names(ws: obsws, scene_name: str) -> Optional[set[str]]:
+    try:
+        response = ws.call(obs_requests.GetSceneItemList(sceneName=scene_name))
+        items = (getattr(response, "datain", None) or {}).get("sceneItems")
+        if not isinstance(items, list):
+            return None
+        return {
+            str(item.get("sourceName") or item.get("sceneItemSourceName") or "").strip()
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("sourceName") or item.get("sceneItemSourceName") or "").strip()
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("GetSceneItemList failed for %r", scene_name, exc_info=True)
+        return None
+
+
+def _track1_conflict_health(
+    ws: obsws,
+    managed_input_name: str,
+    *,
+    scene_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Verify no other source can mix into Track 1 during managed recording.
+
+    Scene inputs are considered active when the dedicated scene is used. A
+    configured, unmuted OBS special input (Desktop Audio / Mic-Aux) is global and
+    therefore conservatively counts as active. ``GetInputActiveState`` exposes a
+    video-oriented flag whose false value is not reliable proof that an audio-only
+    source cannot mix later. The check is intentionally read-only: user-owned
+    global inputs are reported, never muted or rerouted behind the user's back.
+    """
+    special_names = _get_special_input_names(ws)
+    scene_names = _get_scene_source_names(ws, scene_name) if scene_name else set()
+    scan_available = special_names is not None and scene_names is not None
+    if not scan_available:
+        return {
+            "track1_conflict_scan_available": False,
+            "track1_conflicts": [],
+            "track1_conflict_names": [],
+            "track1_unverified_inputs": [],
+            "track1_isolated": False,
+        }
+
+    managed_key = managed_input_name.casefold()
+    special_names = special_names or set()
+    scene_names = scene_names or set()
+    candidates = sorted(
+        special_names | scene_names,
+        key=lambda name: name.casefold(),
+    )
+    conflicts: list[dict[str, Any]] = []
+    unverified: list[str] = []
+    for candidate in candidates:
+        if candidate.casefold() == managed_key:
+            continue
+        settings = _get_input_settings(ws, candidate)
+        # OBS exposes track toggles even for browser sources whose audio is not
+        # routed through the mixer.  Our keyboard overlay explicitly uses
+        # reroute_audio=false, so treating its default Track 1 flag as audible
+        # creates a permanent false-positive recording block.
+        if (
+            settings is not None
+            and "reroute_audio" in settings
+            and _as_optional_bool(settings.get("reroute_audio")) is False
+        ):
+            continue
+        tracks = _get_input_audio_tracks(ws, candidate)
+        if tracks is None:
+            unverified.append(candidate)
+            continue
+        if tracks.get("1") is not True:
+            continue
+        muted = _get_input_mute(ws, candidate)
+        if muted is True:
+            continue
+        if muted is None:
+            unverified.append(candidate)
+            continue
+
+        scopes: list[str] = []
+        active = False
+        if candidate in scene_names:
+            scopes.append("dedicated_scene")
+            active = True
+        if candidate in special_names:
+            scopes.append("global_special_input")
+            active = True
+        if not active:
+            continue
+        conflicts.append(
+            {
+                "input_name": candidate,
+                "scopes": scopes,
+                "muted": False,
+                "track1_enabled": True,
+            }
+        )
+
+    unverified = sorted(set(unverified), key=str.casefold)
+    return {
+        "track1_conflict_scan_available": not unverified,
+        "track1_conflicts": conflicts,
+        "track1_conflict_names": [row["input_name"] for row in conflicts],
+        "track1_unverified_inputs": unverified,
+        "track1_isolated": not conflicts and not unverified,
+    }
+
+
+def _dedicated_audio_health(
+    ws: obsws,
+    input_name: str,
+    *,
+    scene_name: Optional[str] = None,
+) -> dict[str, Any]:
+    settings = _get_input_settings(ws, input_name)
+    muted = _get_input_mute(ws, input_name)
+    tracks = _get_input_audio_tracks(ws, input_name)
+    capture_audio = (
+        _as_optional_bool(settings.get("capture_audio", False))
+        if settings is not None
+        else None
+    )
+    track1 = tracks.get("1") if tracks is not None else None
+    enabled_tracks = sorted(
+        int(key)
+        for key, enabled in (tracks or {}).items()
+        if enabled and str(key).isdigit() and 1 <= int(key) <= 6
+    )
+    extra_tracks = [track for track in enabled_tracks if track != 1]
+    exclusive_track1 = tracks is not None and enabled_tracks == [1]
+    track1_health = _track1_conflict_health(
+        ws,
+        input_name,
+        scene_name=scene_name,
+    )
+    return {
+        "capture_audio_enabled": capture_audio,
+        "capture_muted": muted,
+        "track1_enabled": track1,
+        "enabled_tracks": enabled_tracks,
+        "extra_tracks": extra_tracks,
+        "exclusive_track1": exclusive_track1,
+        "duplicate_track_risk": bool(
+            extra_tracks
+            or track1_health["track1_conflicts"]
+            or track1_health["track1_unverified_inputs"]
+            or not track1_health["track1_conflict_scan_available"]
+        ),
+        **track1_health,
+        "ready": (
+            capture_audio is True
+            and muted is False
+            and track1 is True
+            and exclusive_track1
+            and track1_health["track1_isolated"] is True
+        ),
+    }
+
+
+def _ensure_exclusive_input_audio_track(
+    ws: obsws,
+    input_name: str,
+    track_number: int = 1,
+) -> bool:
+    """Route one managed input to exactly one OBS track, with read-back.
+
+    This is intentionally only used for the CS2 Insight-owned capture source.
+    It never changes Desktop Audio, microphones, or any user-owned input.
+    """
+    track = int(track_number)
+    if track < 1 or track > 6:
+        raise ValueError("OBS 音轨编号必须在 1 到 6 之间")
+    current = _get_input_audio_tracks(ws, input_name)
+    if current is None:
+        raise ValueError(f"无法读取「{input_name}」的 OBS 音轨路由")
+    desired = {str(number): number == track for number in range(1, 7)}
+    current_normalized = {
+        str(number): current.get(str(number)) is True
+        for number in range(1, 7)
+    }
+    if current_normalized == desired:
+        return False
+    req = getattr(obs_requests, "SetInputAudioTracks", None)
+    if req is None:
+        raise ValueError("当前 OBS WebSocket 不支持设置输入音轨")
+    ws.call(req(inputName=input_name, inputAudioTracks=desired))
+    verified = _get_input_audio_tracks(ws, input_name)
+    verified_normalized = {
+        str(number): bool(verified and verified.get(str(number)) is True)
+        for number in range(1, 7)
+    }
+    if verified_normalized != desired:
+        raise ValueError(
+            f"OBS 未接受「{input_name}」仅路由到音轨 {track} 的修改"
+        )
+    return True
 
 
 def _create_backup(
@@ -466,6 +936,7 @@ def _latest_backup_summary() -> Optional[dict[str, str]]:
 
 def get_status_payload(obs_cfg) -> dict[str, Any]:
     obs_root = _obs_studio_root()
+    connection = get_connection_readiness(obs_cfg, obs_root=obs_root)
     prof_name, sc_name = (None, None)
     if obs_root:
         prof_name, sc_name = _read_global_profile_names(obs_root)
@@ -487,33 +958,78 @@ def get_status_payload(obs_cfg) -> dict[str, Any]:
             "fps": 0,
         },
         "recording": {
+            "output_mode": "Simple",
             "use_stream_encoder": False,
             "encoder": "",
             "format": "",
+            "rec_quality": "",
             "output_path": "",
+            "audio_track_mask": 1,
+            "audio_tracks": [1],
+            "output_track1_enabled": True,
         },
         "scene": {
             "dedicated_scene_exists": False,
             "capture_source_exists": False,
             "source_fit_to_canvas": False,
         },
+        "audio": {
+            "capture_audio_enabled": None,
+            "capture_muted": None,
+            "track1_enabled": None,
+            "enabled_tracks": [],
+            "extra_tracks": [],
+            "exclusive_track1": False,
+            "duplicate_track_risk": False,
+            "track1_conflict_scan_available": False,
+            "track1_conflicts": [],
+            "track1_conflict_names": [],
+            "track1_unverified_inputs": [],
+            "track1_isolated": False,
+            "output_track1_enabled": True,
+            "ready": False,
+        },
         "monitor": {"width": _mon_w, "height": _mon_h},
         "latest_backup": latest,
         "obs_version": None,
+        "connection": connection,
     }
 
     if sys.platform != "win32":
         base["ok"] = True
         base["message"] = "OBS 配置文件操作建议在 Windows 上进行；仍可尝试连接 OBS WebSocket 查看画面状态。"
+
+    # 文件级检查不依赖 WebSocket；连接失败时仍能展示输出目录、格式与编码器线索。
+    profile_ini: Optional[Path] = None
+    if obs_root and prof_name:
+        profile_ini = obs_root / "basic" / "profiles" / prof_name / "basic.ini"
+    profile_recording = _profile_recording_settings(profile_ini)
+    base["recording"].update(profile_recording)
+    base["audio"]["output_track1_enabled"] = bool(
+        profile_recording.get("output_track1_enabled", True)
+    )
+    static_blockers = {
+        "OBS_WEBSOCKET_DISABLED",
+        "OBS_PORT_MISMATCH",
+        "OBS_PASSWORD_REQUIRED",
+    }.intersection(connection.get("blockers", []))
+    if static_blockers:
+        return base
     ws: Optional[obsws] = None
     try:
         ws = _ws_connect(obs_cfg)
     except Exception as e:  # noqa: BLE001
-        base["obs_connected"] = False
-        base["ws_error"] = str(e)
+        logger.info("OBS WebSocket status handshake failed: %s", e)
         return base
 
     base["obs_connected"] = True
+    base["connection"]["connected"] = True
+    base["connection"]["port_open"] = True
+    base["connection"]["blockers"] = [
+        code
+        for code in base["connection"].get("blockers", [])
+        if code != "OBS_PORT_NOT_LISTENING"
+    ]
     try:
         try:
             ver = ws.call(obs_requests.GetVersion())
@@ -564,38 +1080,56 @@ def get_status_payload(obs_cfg) -> dict[str, Any]:
                 int(base["video"]["base_width"]),
                 int(base["video"]["base_height"]),
             )
-        simple: dict[str, str] = {}
-        if obs_root and prof_name:
-            simple = _parse_simple_output(obs_root / "basic" / "profiles" / prof_name / "basic.ini")
-        base["recording"]["use_stream_encoder"] = _detect_use_stream_encoder(simple, ws)
-        base["recording"]["encoder"] = (simple.get("RecEncoder") or simple.get("Encoder") or "").strip()
-        # 三路兜底：Simple 输出 INI → Advanced 输出 INI → WebSocket GetRecordDirectory
-        _ini_path = (obs_root / "basic" / "profiles" / prof_name / "basic.ini") if (obs_root and prof_name) else None
-        _out_path = (
-            _recording_output_path_from_simple(simple)
-            or (_parse_adv_output_rec_path(_ini_path) if _ini_path else "")
-            or _get_record_directory_via_ws(ws)
+        if base["scene"]["capture_source_exists"]:
+            audio_health = _dedicated_audio_health(
+                ws,
+                cap_name,
+                scene_name=scene_name,
+            )
+            audio_health["output_track1_enabled"] = bool(
+                base["recording"].get("output_track1_enabled", True)
+            )
+            audio_health["ready"] = bool(
+                audio_health.get("ready")
+                and audio_health["output_track1_enabled"]
+            )
+            base["audio"] = audio_health
+
+        if base["recording"]["output_mode"] == "Simple":
+            base["recording"]["use_stream_encoder"] = _detect_use_stream_encoder(
+                _parse_simple_output(profile_ini) if profile_ini else {},
+                ws,
+            )
+        base["recording"]["output_path"] = (
+            base["recording"].get("output_path") or _get_record_directory_via_ws(ws)
         )
-        base["recording"]["output_path"] = _out_path
-        # 优先从 OBS WebSocket 读取格式和质量，避免 INI 路径检测失败导致"未知"
+
+        # Query the section OBS is actually using. Advanced Output has no
+        # SimpleOutput RecQuality, so do not overwrite it with an unrelated value.
+        profile_category = (
+            "AdvOut" if base["recording"]["output_mode"] == "Advanced" else "SimpleOutput"
+        )
         try:
             fmt_resp = ws.call(obs_requests.GetProfileParameter(
-                parameterCategory="SimpleOutput", parameterName="RecFormat2"
+                parameterCategory=profile_category, parameterName="RecFormat2"
             ))
             fmt_val = (getattr(fmt_resp, "datain", None) or {}).get("parameterValue", "")
-            base["recording"]["format"] = fmt_val or (simple.get("RecFormat2") or simple.get("RecFormat") or "").strip()
+            if fmt_val:
+                base["recording"]["format"] = fmt_val
         except Exception:  # noqa: BLE001
-            base["recording"]["format"] = (simple.get("RecFormat2") or simple.get("RecFormat") or "").strip()
-        try:
-            q_resp = ws.call(obs_requests.GetProfileParameter(
-                parameterCategory="SimpleOutput", parameterName="RecQuality"
-            ))
-            q_val = (getattr(q_resp, "datain", None) or {}).get("parameterValue", "")
-            base["recording"]["rec_quality"] = q_val or (simple.get("RecQuality") or "").strip()
-        except Exception:  # noqa: BLE001
-            base["recording"]["rec_quality"] = (simple.get("RecQuality") or "").strip()
+            pass
+        if profile_category == "SimpleOutput":
+            try:
+                q_resp = ws.call(obs_requests.GetProfileParameter(
+                    parameterCategory="SimpleOutput", parameterName="RecQuality"
+                ))
+                q_val = (getattr(q_resp, "datain", None) or {}).get("parameterValue", "")
+                if q_val:
+                    base["recording"]["rec_quality"] = q_val
+            except Exception:  # noqa: BLE001
+                pass
     except Exception as e:  # noqa: BLE001
-        base["ws_error"] = str(e)
+        logger.warning("OBS WebSocket status query failed after connect: %s", e)
     finally:
         _ws_disconnect(ws)
 
@@ -613,10 +1147,136 @@ def diagnose(obs_cfg) -> dict[str, Any]:
     video_dims: dict[str, int] = {"base_width": 0, "base_height": 0, "output_width": 0, "output_height": 0, "fps_num": 60, "fps_den": 1}
     prof_name: Optional[str] = None
     disk_profile_checked = False
+    profile_recording = _profile_recording_settings(None)
+    audio_health: dict[str, Any] = {
+        "capture_audio_enabled": None,
+        "capture_muted": None,
+        "track1_enabled": None,
+        "enabled_tracks": [],
+        "extra_tracks": [],
+        "exclusive_track1": False,
+        "duplicate_track_risk": False,
+        "track1_conflict_scan_available": False,
+        "track1_conflicts": [],
+        "track1_conflict_names": [],
+        "track1_unverified_inputs": [],
+        "track1_isolated": False,
+        "output_track1_enabled": True,
+        "ready": False,
+    }
+    connection = get_connection_readiness(obs_cfg, obs_root=obs_root)
+
+    connection_issue_specs = {
+        "OBS_WEBSOCKET_CONFIG_NOT_FOUND": (
+            "warning",
+            "未找到 OBS WebSocket 配置",
+            "请先启动一次 OBS，并在「工具 → WebSocket 服务器设置」中确认配置。",
+        ),
+        "OBS_WEBSOCKET_DISABLED": (
+            "error",
+            "OBS WebSocket 服务器未启用",
+            "在 OBS 中打开「工具 → WebSocket 服务器设置」，勾选“启用 WebSocket 服务器”。",
+        ),
+        "OBS_PORT_MISMATCH": (
+            "error",
+            "OBS 与应用端口不一致",
+            f"OBS 使用 {connection.get('server_port')}，应用配置为 {connection.get('configured_port')}；请改为相同端口。",
+        ),
+        "OBS_PASSWORD_REQUIRED": (
+            "error",
+            "OBS 需要密码，但应用尚未填写",
+            "OBS 已启用身份验证。请把 OBS WebSocket 设置中的密码填入本页连接配置。",
+        ),
+        "OBS_PORT_NOT_LISTENING": (
+            "error",
+            "OBS WebSocket 端口未监听",
+            f"当前无法访问 {connection.get('host')}:{connection.get('configured_port')}。请确认 OBS 已启动且 WebSocket 服务器已启用。",
+        ),
+    }
+    for code in connection.get("blockers", []):
+        spec = connection_issue_specs.get(code)
+        if spec is None:
+            continue
+        level_name, title, message = spec
+        issues.append(
+            {
+                "code": code,
+                "level": level_name,
+                "title": title,
+                "message": message,
+                "fixable": False,
+            }
+        )
+
+    # Profile 文件可以离线读取；即使 WebSocket 完全连不上，也继续给出录制配置诊断。
+    if obs_root is not None and obs_root.is_dir():
+        prof_name, _ = _read_global_profile_names(obs_root)
+        if prof_name:
+            profile_ini = obs_root / "basic" / "profiles" / prof_name / "basic.ini"
+            if profile_ini.is_file():
+                profile_recording = _profile_recording_settings(profile_ini)
+                audio_health["output_track1_enabled"] = bool(
+                    profile_recording.get("output_track1_enabled", True)
+                )
+                disk_profile_checked = True
+                if profile_recording["use_stream_encoder"]:
+                    issues.append(
+                        {
+                            "code": "USE_STREAM_ENCODER",
+                            "level": "error",
+                            "title": "录制正在使用与串流一致",
+                            "message": "当前录制配置依赖串流编码器，可能导致录制失败。建议应用推荐预设。",
+                            "fixable": True,
+                        }
+                    )
+                if not profile_recording["output_path"]:
+                    issues.append(
+                        {
+                            "code": "NO_OUTPUT_PATH",
+                            "level": "warning",
+                            "title": "未设置录制输出目录",
+                            "message": "请在 OBS 设置中为录制指定输出路径。",
+                            "fixable": False,
+                        }
+                    )
+                if not profile_recording["encoder"] and not profile_recording["use_stream_encoder"]:
+                    issues.append(
+                        {
+                            "code": "ENCODER_UNAVAILABLE",
+                            "level": "warning",
+                            "title": "录制编码器未配置或为空",
+                            "message": "建议应用推荐预设或手动选择可用编码器。",
+                            "fixable": True,
+                        }
+                    )
+                if not profile_recording["output_track1_enabled"]:
+                    issues.append(
+                        {
+                            "code": "OUTPUT_AUDIO_TRACK1_DISABLED",
+                            "level": "error",
+                            "title": "录像输出未包含音轨 1",
+                            "message": (
+                                f"当前 {profile_recording['output_mode']} 输出未录制音轨 1；"
+                                "即使 CS2 音频源正常，也不会写入成片。"
+                            ),
+                            "fixable": True,
+                        }
+                    )
 
     try:
+        static_blockers = {
+            "OBS_WEBSOCKET_DISABLED",
+            "OBS_PORT_MISMATCH",
+            "OBS_PASSWORD_REQUIRED",
+        }.intersection(connection.get("blockers", []))
+        if static_blockers:
+            raise ConnectionError("OBS connection readiness check failed")
         ws = _ws_connect(obs_cfg)
         obs_connected = True
+        connection["connected"] = True
+        connection["port_open"] = True
+        connection["blockers"] = []
+        issues[:] = [issue for issue in issues if issue.get("code") not in connection_issue_specs]
 
         try:
             ver = ws.call(obs_requests.GetVersion())
@@ -738,50 +1398,115 @@ def diagnose(obs_cfg) -> dict[str, Any]:
                     "fixable": True,
                 }
             )
-
-        simple: dict[str, str] = {}
-        if obs_root is not None and obs_root.is_dir():
-            prof_name, _ = _read_global_profile_names(obs_root)
-            if prof_name:
-                pin = obs_root / "basic" / "profiles" / prof_name / "basic.ini"
-                if pin.is_file():
-                    simple = _parse_simple_output(pin)
-                    disk_profile_checked = True
-
-        if disk_profile_checked:
-            if _detect_use_stream_encoder(simple, ws):
+        if cap_ok:
+            audio_health.update(
+                _dedicated_audio_health(
+                    ws,
+                    cap_name,
+                    scene_name=scene_name,
+                )
+            )
+            audio_health["output_track1_enabled"] = bool(
+                profile_recording.get("output_track1_enabled", True)
+            )
+            audio_health["ready"] = bool(
+                audio_health.get("ready")
+                and audio_health["output_track1_enabled"]
+            )
+            if audio_health["capture_audio_enabled"] is False:
                 issues.append(
                     {
-                        "code": "USE_STREAM_ENCODER",
+                        "code": "CAPTURE_AUDIO_DISABLED",
                         "level": "error",
-                        "title": "录制正在使用与串流一致",
-                        "message": "当前录制配置依赖串流编码器，可能导致录制失败。建议应用推荐预设。",
+                        "title": "CS2 游戏音频捕获未启用",
+                        "message": f"「{cap_name}」只捕获画面，当前不会采集 CS2 声音。",
                         "fixable": True,
                     }
                 )
-            out_path = _recording_output_path_from_simple(simple)
-            if not out_path:
+            if audio_health["capture_muted"] is True:
                 issues.append(
                     {
-                        "code": "NO_OUTPUT_PATH",
-                        "level": "warning",
-                        "title": "未设置录制输出目录",
-                        "message": "请在 OBS 设置中为录制指定输出路径。",
+                        "code": "CAPTURE_AUDIO_MUTED",
+                        "level": "error",
+                        "title": "CS2 游戏音频源已静音",
+                        "message": f"「{cap_name}」在 OBS 混音器中处于静音状态。",
+                        "fixable": True,
+                    }
+                )
+            if audio_health["track1_enabled"] is False:
+                issues.append(
+                    {
+                        "code": "CAPTURE_AUDIO_TRACK1_DISABLED",
+                        "level": "error",
+                        "title": "CS2 游戏音频未路由到音轨 1",
+                        "message": f"「{cap_name}」未发送到应用默认使用的 OBS 音轨 1。",
+                        "fixable": True,
+                    }
+                )
+            if audio_health["duplicate_track_risk"]:
+                extra_tracks = ", ".join(
+                    str(track) for track in audio_health.get("extra_tracks", [])
+                )
+                if extra_tracks:
+                    issues.append(
+                        {
+                            "code": "CAPTURE_AUDIO_EXTRA_TRACK_ROUTES",
+                            "level": "warning",
+                            "title": "CS2 游戏音频被发送到额外音轨",
+                            "message": (
+                                f"「{cap_name}」除音轨 1 外还发送到音轨 {extra_tracks}。"
+                                "这些音轨若再混入桌面音频，导出时可能出现重复叠加、削波或刺耳失真。"
+                            ),
+                            "fixable": True,
+                        }
+                    )
+            if audio_health["track1_conflict_names"]:
+                conflict_names = "、".join(audio_health["track1_conflict_names"])
+                issues.append(
+                    {
+                        "code": "AUDIO_TRACK1_CONFLICTING_INPUTS",
+                        "level": "error",
+                        "title": "音轨 1 同时混入其他音频源",
+                        "message": (
+                            f"以下未静音音频源也在专属录制时发送到音轨 1：{conflict_names}。"
+                            "这会与 CS2 专用捕获重复混音。请在 OBS 高级音频属性中将这些源移出音轨 1，"
+                            "本应用不会自动修改用户的全局音频输入。"
+                        ),
                         "fixable": False,
                     }
                 )
-            enc = (simple.get("RecEncoder") or "").strip()
-            if not enc:
+            if not audio_health["track1_conflict_scan_available"]:
+                unverified_names = "、".join(
+                    audio_health.get("track1_unverified_inputs", [])
+                )
                 issues.append(
                     {
-                        "code": "ENCODER_UNAVAILABLE",
-                        "level": "warning",
-                        "title": "录制编码器未配置或为空",
-                        "message": "建议应用推荐预设或手动选择可用编码器。",
-                        "fixable": True,
+                        "code": "AUDIO_TRACK1_ISOLATION_UNVERIFIED",
+                        "level": "error",
+                        "title": "无法确认音轨 1 是否只有 CS2 声音",
+                        "message": (
+                            f"无法验证这些音频源：{unverified_names}。"
+                            if unverified_names
+                            else "OBS 未返回完整的全局/场景音频路由状态。"
+                        ),
+                        "fixable": False,
                     }
                 )
-    except Exception as e:  # noqa: BLE001
+            if any(
+                audio_health[key] is None
+                for key in ("capture_audio_enabled", "capture_muted", "track1_enabled")
+            ):
+                issues.append(
+                    {
+                        "code": "CAPTURE_AUDIO_STATUS_UNAVAILABLE",
+                        "level": "warning",
+                        "title": "无法确认 CS2 游戏音频状态",
+                        "message": "OBS 未返回完整的音频开关、静音或音轨路由信息。",
+                        "fixable": False,
+                    }
+                )
+
+    except Exception:  # noqa: BLE001
         obs_connected = False
         obs_version = None
         issues.append(
@@ -789,7 +1514,11 @@ def diagnose(obs_cfg) -> dict[str, Any]:
                 "code": "OBS_NOT_CONNECTED",
                 "level": "error",
                 "title": "无法连接 OBS WebSocket",
-                "message": str(e) or "请确认 OBS 已启动且 WebSocket 已启用。",
+                "message": (
+                    "请先按上方连接诊断逐项处理，然后重新测试连接。"
+                    if connection.get("blockers")
+                    else f"无法完成 WebSocket 握手，请检查地址、端口和密码（{connection.get('host')}:{connection.get('configured_port')}）。"
+                ),
                 "fixable": False,
             }
         )
@@ -821,6 +1550,9 @@ def diagnose(obs_cfg) -> dict[str, Any]:
         "obs_version": obs_version,
         "active_profile_name": prof_name,
         "disk_profile_checked": disk_profile_checked,
+        "recording": profile_recording,
+        "audio": audio_health,
+        "connection": connection,
         "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -843,6 +1575,14 @@ def calibrate(obs_cfg) -> dict[str, Any]:
 
         changed: list[str] = []
         already_ok: list[str] = []
+        obs_root = _obs_studio_root()
+        active_profile, _ = _read_global_profile_names(obs_root) if obs_root else (None, None)
+        profile_ini = (
+            obs_root / "basic" / "profiles" / active_profile / "basic.ini"
+            if obs_root and active_profile
+            else None
+        )
+        profile_recording = _profile_recording_settings(profile_ini)
 
         # Step 1+2: 读显示器分辨率 & OBS 画布
         monitor_w, monitor_h = get_primary_monitor_resolution()
@@ -920,11 +1660,80 @@ def calibrate(obs_cfg) -> dict[str, Any]:
                 sceneName=scene_name,
                 inputName=capture_name,
                 inputKind="game_capture",
-                inputSettings={"capture_mode": "window", "window": "cs2.exe"},
+                inputSettings={
+                    "capture_mode": "window",
+                    "window": "cs2.exe",
+                    "capture_audio": True,
+                    "capture_cursor": False,
+                },
             ))
             changed.append(f"已创建 Game Capture 源「{capture_name}」")
         else:
             already_ok.append(f"Game Capture 源「{capture_name}」已存在")
+
+        # Always repair the existing managed source as well. overlay=True keeps
+        # unrelated Game Capture properties intact and never touches user sources.
+        before_audio = _dedicated_audio_health(
+            ws,
+            capture_name,
+            scene_name=scene_name,
+        )
+        ws.call(obs_requests.SetInputSettings(
+            inputName=capture_name,
+            inputSettings={"capture_audio": True, "capture_cursor": False},
+            overlay=True,
+        ))
+        if before_audio["capture_audio_enabled"] is True:
+            already_ok.append("CS2 游戏音频捕获已启用")
+        else:
+            changed.append("已启用 CS2 Game Capture 游戏音频")
+
+        if before_audio["capture_muted"] is True:
+            ws.call(obs_requests.SetInputMute(inputName=capture_name, inputMuted=False))
+            changed.append("已取消 CS2 游戏音频源静音")
+        elif before_audio["capture_muted"] is False:
+            already_ok.append("CS2 游戏音频源未静音")
+
+        if _ensure_exclusive_input_audio_track(ws, capture_name, 1):
+            changed.append("已将 CS2 游戏音频仅路由到 OBS 音轨 1")
+        else:
+            already_ok.append("CS2 游戏音频仅路由到 OBS 音轨 1")
+
+        verified_audio = _dedicated_audio_health(
+            ws,
+            capture_name,
+            scene_name=scene_name,
+        )
+        manual_actions: list[str] = []
+        if verified_audio["track1_conflict_names"]:
+            conflict_names = "、".join(verified_audio["track1_conflict_names"])
+            manual_actions.append(
+                "专属录制的 OBS 音轨 1 仍混入其他未静音音频源："
+                f"{conflict_names}。请在 OBS 高级音频属性中将这些源移出音轨 1；"
+                "应用不会静默修改 Desktop Audio、麦克风或其他用户输入。"
+            )
+        if not verified_audio["track1_conflict_scan_available"]:
+            unverified_names = "、".join(
+                verified_audio.get("track1_unverified_inputs", [])
+            )
+            suffix = f"（无法验证：{unverified_names}）" if unverified_names else ""
+            manual_actions.append(
+                "OBS 未返回完整的音轨 1 输入状态，无法确认录制音频不会重复混音"
+                + suffix
+            )
+        source_audio_ready = bool(
+            verified_audio["capture_audio_enabled"] is True
+            and verified_audio["capture_muted"] is False
+            and verified_audio["track1_enabled"] is True
+            and verified_audio["exclusive_track1"] is True
+        )
+        if not source_audio_ready:
+            raise ValueError(
+                "OBS 未接受专属游戏音频修复："
+                f"捕获开关={verified_audio['capture_audio_enabled']}，"
+                f"静音={verified_audio['capture_muted']}，"
+                f"启用音轨={verified_audio['enabled_tracks']}"
+            )
 
         # Step 6: 设置拉伸填满画布
         item_id_resp = ws.call(obs_requests.GetSceneItemId(
@@ -948,68 +1757,65 @@ def calibrate(obs_cfg) -> dict[str, Any]:
         else:
             already_ok.append("Game Capture 拉伸变换跳过（无法获取 sceneItemId）")
 
-        # Step 7: 修正输出设置（RecQuality / RecFormat2）
-        rec_q_resp = ws.call(obs_requests.GetProfileParameter(
-            parameterCategory="SimpleOutput", parameterName="RecQuality"
-        ))
-        rec_q_data = getattr(rec_q_resp, "datain", None) or {}
-        rec_quality = rec_q_data.get("parameterValue", "")
-
+        # Step 7: 修正当前实际输出模式对应的设置。
         restart_required = False
+        output_mode = profile_recording["output_mode"]
+        profile_category = "AdvOut" if output_mode == "Advanced" else "SimpleOutput"
 
-        if rec_quality == "Stream":
-            ws.call(obs_requests.SetProfileParameter(
-                parameterCategory="SimpleOutput",
-                parameterName="RecQuality",
-                parameterValue="Small",
+        if output_mode == "Simple":
+            rec_q_resp = ws.call(obs_requests.GetProfileParameter(
+                parameterCategory="SimpleOutput", parameterName="RecQuality"
             ))
-            # RecQuality="Stream" 时 OBS 忽略 RecEncoder；改为 "Small" 后必须有有效编码器
-            # 否则 OBS 以空编码器启动录制会报「启动录像失败」
-            rec_enc_resp = ws.call(obs_requests.GetProfileParameter(
-                parameterCategory="SimpleOutput", parameterName="RecEncoder"
-            ))
-            rec_enc_val = ((getattr(rec_enc_resp, "datain", None) or {}).get("parameterValue") or "").strip()
-            if not rec_enc_val or rec_enc_val.lower() in ("none", "null", "stream"):
-                # 1. 优先用当前串流编码器（用户已确认可用的硬件编码器）
-                try:
-                    stream_enc_resp = ws.call(obs_requests.GetProfileParameter(
-                        parameterCategory="SimpleOutput", parameterName="StreamEncoder"
-                    ))
-                    stream_enc = ((getattr(stream_enc_resp, "datain", None) or {}).get("parameterValue") or "").strip()
-                except Exception:  # noqa: BLE001
-                    stream_enc = ""
-                # 2. 串流编码器无效时按硬件优先顺序选取
-                _HW_PRIORITY = [
-                    "jim_nvenc",        # NVENC（新版，推荐）
-                    "ffmpeg_nvenc",     # NVENC（旧版）
-                    "h264_texture_amf", # AMD AMF（新版）
-                    "amd_amf_h264",    # AMD AMF（旧版）
-                    "obs_qsv11_v2",    # Intel QSV（新版）
-                    "obs_qsv11",       # Intel QSV（旧版）
-                ]
-                _INVALID = {"", "none", "null", "stream"}
-                target_enc = stream_enc if stream_enc.lower() not in _INVALID else _HW_PRIORITY[0]
+            rec_q_data = getattr(rec_q_resp, "datain", None) or {}
+            rec_quality = rec_q_data.get("parameterValue", "")
+
+            if rec_quality == "Stream":
                 ws.call(obs_requests.SetProfileParameter(
                     parameterCategory="SimpleOutput",
-                    parameterName="RecEncoder",
-                    parameterValue=target_enc,
+                    parameterName="RecQuality",
+                    parameterValue="Small",
                 ))
-                changed.append(f"录像编码器已设为「{target_enc}」（原质量为串流一致时未配置）")
-            # 编码器/质量变更写入的是磁盘 Profile，OBS 输出管线不会热重载，必须重启生效
-            restart_required = True
-            changed.append("录像质量已从「与串流一致」改为「高质量，中等文件大小」")
+                # RecQuality="Stream" 时 OBS 忽略 RecEncoder；改为 "Small" 后必须有有效编码器
+                rec_enc_resp = ws.call(obs_requests.GetProfileParameter(
+                    parameterCategory="SimpleOutput", parameterName="RecEncoder"
+                ))
+                rec_enc_val = ((getattr(rec_enc_resp, "datain", None) or {}).get("parameterValue") or "").strip()
+                if not rec_enc_val or rec_enc_val.lower() in ("none", "null", "stream"):
+                    try:
+                        stream_enc_resp = ws.call(obs_requests.GetProfileParameter(
+                            parameterCategory="SimpleOutput", parameterName="StreamEncoder"
+                        ))
+                        stream_enc = ((getattr(stream_enc_resp, "datain", None) or {}).get("parameterValue") or "").strip()
+                    except Exception:  # noqa: BLE001
+                        stream_enc = ""
+                    _HW_PRIORITY = [
+                        "jim_nvenc", "ffmpeg_nvenc", "h264_texture_amf",
+                        "amd_amf_h264", "obs_qsv11_v2", "obs_qsv11",
+                    ]
+                    _INVALID = {"", "none", "null", "stream"}
+                    target_enc = stream_enc if stream_enc.lower() not in _INVALID else _HW_PRIORITY[0]
+                    ws.call(obs_requests.SetProfileParameter(
+                        parameterCategory="SimpleOutput",
+                        parameterName="RecEncoder",
+                        parameterValue=target_enc,
+                    ))
+                    changed.append(f"录像编码器已设为「{target_enc}」（原质量为串流一致时未配置）")
+                restart_required = True
+                changed.append("录像质量已从「与串流一致」改为「高质量，中等文件大小」")
+            else:
+                already_ok.append("录像质量设置正常")
         else:
-            already_ok.append("录像质量设置正常")
+            already_ok.append("已识别高级输出模式，不套用简单输出质量选项")
 
         rec_f_resp = ws.call(obs_requests.GetProfileParameter(
-            parameterCategory="SimpleOutput", parameterName="RecFormat2"
+            parameterCategory=profile_category, parameterName="RecFormat2"
         ))
         rec_f_data = getattr(rec_f_resp, "datain", None) or {}
         rec_format = rec_f_data.get("parameterValue", "")
 
         if rec_format != "hybrid_mp4":
             ws.call(obs_requests.SetProfileParameter(
-                parameterCategory="SimpleOutput",
+                parameterCategory=profile_category,
                 parameterName="RecFormat2",
                 parameterValue="hybrid_mp4",
             ))
@@ -1017,10 +1823,48 @@ def calibrate(obs_cfg) -> dict[str, Any]:
         else:
             already_ok.append("录像格式正确（混合 MP4）")
 
+        # Source routing and output routing are separate in OBS.  Preserve all
+        # user-selected output tracks while ensuring Track 1 is actually written.
+        fallback_mask = int(profile_recording.get("audio_track_mask", 1) or 0)
+        try:
+            rec_tracks_resp = ws.call(obs_requests.GetProfileParameter(
+                parameterCategory=profile_category,
+                parameterName="RecTracks",
+            ))
+            rec_tracks_raw = (getattr(rec_tracks_resp, "datain", None) or {}).get(
+                "parameterValue",
+                fallback_mask,
+            )
+        except Exception:  # noqa: BLE001
+            rec_tracks_raw = fallback_mask
+        current_track_mask = _parse_track_mask(rec_tracks_raw, fallback_mask)
+        target_track_mask = current_track_mask | 1
+        if current_track_mask != target_track_mask:
+            ws.call(obs_requests.SetProfileParameter(
+                parameterCategory=profile_category,
+                parameterName="RecTracks",
+                parameterValue=str(target_track_mask),
+            ))
+            verify_tracks_resp = ws.call(obs_requests.GetProfileParameter(
+                parameterCategory=profile_category,
+                parameterName="RecTracks",
+            ))
+            verify_tracks_raw = (getattr(verify_tracks_resp, "datain", None) or {}).get(
+                "parameterValue",
+                0,
+            )
+            verified_track_mask = _parse_track_mask(verify_tracks_raw, 0)
+            if not (verified_track_mask & 1):
+                raise ValueError("OBS 未接受录像输出音轨 1 设置，请在输出设置中手动勾选音轨 1")
+            changed.append("已在录像输出中启用音轨 1")
+        else:
+            already_ok.append("录像输出已包含音轨 1")
+
         return {
-            "success": True,
+            "success": not manual_actions,
             "changed": changed,
             "already_ok": already_ok,
+            "manual_actions": manual_actions,
             "restart_obs_required": restart_required,
         }
 

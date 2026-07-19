@@ -71,9 +71,16 @@ export default function RecordingStatsStrip({
         {obsConfigured ? t("queue.obsConfigured") : t("queue.obsNotConfigured")}
       </span>
       {obsConfigured && obsConfigHasIssues === true && (
-        <Link to="/obs-config-center">
+        <Link to="/settings?tab=video">
           <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium leading-none text-amber-300 hover:bg-amber-500/20 transition-colors">
             {t("queue.obsNeedsFixing")}
+          </span>
+        </Link>
+      )}
+      {obsConfigured && obsConfigHasIssues === null && (
+        <Link to="/settings?tab=video">
+          <span className="rounded-full border border-cs2-border bg-cs2-bg-hover px-2 py-0.5 text-[11px] font-medium leading-none text-cs2-text-muted hover:text-cs2-text-secondary transition-colors">
+            {t("queue.obsAudioCheckPending")}
           </span>
         </Link>
       )}

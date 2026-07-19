@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect, useCallback, useRef } from "react";
+import { useMemo, useState, useEffect, useCallback } from "react";
 import API from "../api/api";
 import { useAppShell } from "../context/AppShellContext";
 import { useRecordingQueue } from "../stores/recordingQueueStore";
@@ -14,12 +14,17 @@ import QueueInspectorPanel from "../components/recordingQueue/QueueInspectorPane
 import RecordingControlDock from "../components/recordingQueue/RecordingControlDock";
 import RecordingQueueEmptyState from "../components/recordingQueue/RecordingQueueEmptyState";
 import PageContainer from "../components/PageContainer";
+import { obsConfigHasIssues as deriveObsConfigHasIssues } from "../utils/obsConfigHealth.js";
 
 export default function RecordingQueuePage() {
   const t = useT();
   const s = useAppShell();
   const globalPacing = useRecordingQueue((st) => st.globalPacing);
   const reorderQueue = useRecordingQueue((st) => st.reorderQueue);
+  const clearQueue = useRecordingQueue((st) => st.clearQueue);
+  const undoClearQueue = useRecordingQueue((st) => st.undoClearQueue);
+  const dismissQueueUndo = useRecordingQueue((st) => st.dismissQueueUndo);
+  const lastQueueSnapshot = useRecordingQueue((st) => st.lastQueueSnapshot);
   const queue = s.queue;
 
   const [selectedId, setSelectedId] = useState(null);
@@ -32,12 +37,19 @@ export default function RecordingQueuePage() {
 
   useEffect(() => {
     let cancelled = false;
-    API.get("/config/quick-check").then(({ data }) => {
+    Promise.allSettled([
+      API.get("/config/quick-check"),
+      API.get("/obs-config/status"),
+    ]).then(([quickCheck, health]) => {
       if (cancelled) return;
-      setObsConfigured(!!data?.obs_configured);
-    }).catch(() => {
-      if (cancelled) return;
-      setObsConfigured(false);
+      setObsConfigured(
+        quickCheck.status === "fulfilled" && !!quickCheck.value.data?.obs_configured,
+      );
+      setObsConfigHasIssues(
+        health.status === "fulfilled" && health.value.data?.obs_connected
+          ? deriveObsConfigHasIssues(health.value.data)
+          : null,
+      );
     });
     return () => { cancelled = true; };
   }, []);
@@ -54,8 +66,12 @@ export default function RecordingQueuePage() {
   }, [queue, selectedId]);
 
   const handleClear = () => {
-    s.clearQueue();
+    clearQueue();
     setSelectedId(null);
+  };
+
+  const handleUndoClear = () => {
+    undoClearQueue();
   };
 
   const totalEstimateSec = useMemo(
@@ -205,6 +221,9 @@ export default function RecordingQueuePage() {
         onAbort={s.handleAbortBatchRecording}
         abortRequested={s.recordingAbortRequested}
         onClear={handleClear}
+        undoCount={lastQueueSnapshot?.queue?.length || 0}
+        onUndoClear={handleUndoClear}
+        onDismissUndo={dismissQueueUndo}
         disabledStart={queue.length === 0 || s.batchRecording}
         obsConfigured={obsConfigured}
       />

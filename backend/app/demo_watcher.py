@@ -11,7 +11,7 @@ import time
 import zlib
 import zipfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Optional
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -24,6 +24,7 @@ from .file_hash import file_md5_hex
 logger = logging.getLogger(__name__)
 
 OnDemoDetected = Callable[[Path, Optional[str]], Awaitable[None]]
+ScanProgressCallback = Callable[[dict[str, Any]], None]
 
 _LOCAL_ZIP_SIG = b"PK\x03\x04"
 
@@ -40,6 +41,39 @@ def _sort_paths_by_mtime_newest_first(paths: Iterable[Path]) -> list[Path]:
         scored.append((ns, path.name.casefold(), path))
     scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
     return [t[2] for t in scored]
+
+
+def _scan_path_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _collect_scan_index(root: Path, max_depth: int) -> tuple[list[Path], list[Path], set[str]]:
+    """用 scandir 建立可控深度的 .dem/.zip 索引，不跟随目录链接。"""
+    demos: list[Path] = []
+    archives: list[Path] = []
+    visited_directories: set[str] = set()
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                resolved_directory = directory.resolve()
+                visited_directories.add(_scan_path_key(resolved_directory))
+                for entry in entries:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            suffix = Path(entry.name).suffix.casefold()
+                            if suffix == ".dem":
+                                demos.append(Path(entry.path))
+                            elif suffix == ".zip":
+                                archives.append(Path(entry.path))
+                        elif entry.is_dir(follow_symlinks=False) and (max_depth < 0 or depth < max_depth):
+                            stack.append((Path(entry.path), depth + 1))
+                    except OSError:
+                        logger.debug("Cannot inspect scan entry: %s", entry.path, exc_info=True)
+        except OSError:
+            logger.warning("Cannot scan demo directory: %s", directory, exc_info=True)
+    return demos, archives, visited_directories
 
 
 def _safe_zip_member_name(name: str) -> str | None:
@@ -250,20 +284,31 @@ def _extract_zip_dems_dedupe_sync(zip_path: Path, existing_md5s: frozenset[str])
 
 
 class _DemoEventHandler(FileSystemEventHandler):
-    def __init__(self, loop: asyncio.AbstractEventLoop, watcher: "DemoWatcher") -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, watcher: "DemoWatcher", root: Path) -> None:
         super().__init__()
         self._loop = loop
         self._watcher = watcher
+        self._root = root
 
-    def on_created(self, event) -> None:  # type: ignore[override]
-        if event.is_directory:
+    def _handle_file(self, raw_path: str) -> None:
+        path = Path(raw_path)
+        if not self._watcher._event_path_in_scope(path, self._root):
             return
-        path = Path(event.src_path)
         suf = path.suffix.lower()
         if suf == ".dem":
             asyncio.run_coroutine_threadsafe(self._watcher._on_raw_dem_detected(path), self._loop)
         elif suf == ".zip":
             asyncio.run_coroutine_threadsafe(self._watcher._on_raw_zip_detected(path), self._loop)
+
+    def on_created(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._handle_file(event.src_path)
+
+    def on_moved(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._handle_file(event.dest_path)
 
 
 class DemoWatcher:
@@ -272,14 +317,29 @@ class DemoWatcher:
         paths: list[str],
         on_detected: OnDemoDetected,
         demo_db: Optional["DemoDB"] = None,
+        *,
+        max_depth: int = 2,
     ) -> None:
         self._paths = paths
         self._on_detected = on_detected
         self._demo_db = demo_db
+        self._max_depth = max(-1, min(12, int(max_depth)))
         self._observer: Observer | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # 同一 zip 被「目录扫描 + 文件监听」或并发协程同时处理时，会在解压竞态下重复生成 _fromzip_*_N.dem
         self._zip_extract_lock = asyncio.Lock()
+
+    @property
+    def max_depth(self) -> int:
+        return self._max_depth
+
+    def _event_path_in_scope(self, path: Path, root: Path) -> bool:
+        try:
+            relative_parent = path.resolve().parent.relative_to(root.resolve())
+        except (OSError, ValueError):
+            return False
+        depth = len(relative_parent.parts)
+        return self._max_depth < 0 or depth <= self._max_depth
 
     def _normalized_paths(self) -> list[Path]:
         out: list[Path] = []
@@ -473,11 +533,11 @@ class DemoWatcher:
         if not paths:
             logger.info("No demo watch paths configured, watcher idle")
             return
-        handler = _DemoEventHandler(self._loop, self)
         observer = Observer()
         for p in paths:
-            observer.schedule(handler, str(p), recursive=False)
-            logger.info("Watching demo directory: %s", p)
+            handler = _DemoEventHandler(self._loop, self, p)
+            observer.schedule(handler, str(p), recursive=self._max_depth != 0)
+            logger.info("Watching demo directory: %s (depth=%s)", p, self._max_depth)
         observer.start()
         self._observer = observer
 
@@ -493,8 +553,7 @@ class DemoWatcher:
         await self.stop()
         await self.start()
 
-    async def scan_existing(self) -> int:
-        count = 0
+    async def scan_existing(self, progress: ScanProgressCallback | None = None) -> int:
         raw_conc = (os.environ.get("CS2_INSIGHT_SCAN_CONCURRENCY") or "").strip()
         try:
             max_conc = int(raw_conc) if raw_conc else 0
@@ -502,39 +561,120 @@ class DemoWatcher:
             max_conc = 0
         if max_conc < 1:
             max_conc = max(2, min(8, (os.cpu_count() or 4)))
-        sem = asyncio.Semaphore(max_conc)
-
-        # 收集磁盘上所有真实存在的 .dem 绝对路径，用于清理已删除的 DB 记录
-        existing_paths: set[str] = set()
-        for p in self._normalized_paths():
-            for dem in p.glob("*.dem"):
-                try:
-                    existing_paths.add(str(dem.resolve()))
-                except OSError:
-                    pass
-
-        # 清理物理已删除但仍在库中的记录（在入库新文件之前执行）
-        if existing_paths and self._demo_db is not None:
+        def _emit(**update: Any) -> None:
+            if progress is None:
+                return
             try:
-                await self._demo_db.purge_deleted_demo_files(existing_paths)
+                progress(update)
+            except Exception:
+                logger.debug("Demo scan progress callback failed", exc_info=True)
+
+        roots = self._normalized_paths()
+        _emit(
+            phase="indexing",
+            processed=0,
+            total=0,
+            current_file=None,
+            roots=len(roots),
+            depth=self._max_depth,
+        )
+
+        archive_map: dict[str, Path] = {}
+        for root in roots:
+            _, archives, _ = _collect_scan_index(root, self._max_depth)
+            for archive in archives:
+                archive_map.setdefault(_scan_path_key(archive.resolve()), archive)
+        archive_paths = _sort_paths_by_mtime_newest_first(archive_map.values())
+        processed = 0
+        _emit(phase="archives", processed=processed, total=len(archive_paths), current_file=None)
+        for archive in archive_paths:
+            _emit(phase="archives", processed=processed, total=len(archive_paths), current_file=archive.name)
+            await self._on_raw_zip_detected(archive, enqueue_extracted=False, assume_stable=True)
+            processed += 1
+            _emit(phase="archives", processed=processed, total=len(archive_paths), current_file=archive.name)
+
+        # ZIP 解压后重新索引，确保本轮生成的 .dem 立即进入候选集合。
+        demo_map: dict[str, Path] = {}
+        scanned_directories: set[str] = set()
+        for root in roots:
+            demos, _, directories = _collect_scan_index(root, self._max_depth)
+            scanned_directories.update(directories)
+            for demo in demos:
+                try:
+                    demo_map.setdefault(_scan_path_key(demo.resolve()), demo)
+                except OSError:
+                    continue
+        dem_paths = _sort_paths_by_mtime_newest_first(demo_map.values())
+        existing_paths: set[str] = set()
+        for demo in dem_paths:
+            try:
+                existing_paths.add(str(demo.resolve()))
+            except OSError:
+                pass
+
+        # 只清理本次真实遍历过的目录，绝不影响上传文件或其它未扫描目录中的库记录。
+        if scanned_directories and self._demo_db is not None:
+            try:
+                await self._demo_db.purge_deleted_demo_files(
+                    existing_paths,
+                    scanned_directories=scanned_directories,
+                )
             except Exception:
                 logger.exception("purge_deleted_demo_files failed during scan")
 
-        async def _enqueue_dem(path: Path) -> None:
-            async with sem:
+        known_path_keys: set[str] = set()
+        if self._demo_db is not None:
+            try:
+                known_path_keys = {
+                    _scan_path_key(path)
+                    for path in await self._demo_db.all_demo_paths()
+                }
+            except Exception:
+                logger.exception("Failed to preload known demo paths")
+        pending_paths = [path for path in dem_paths if _scan_path_key(path.resolve()) not in known_path_keys]
+        skipped_existing = len(dem_paths) - len(pending_paths)
+        total = len(archive_paths) + len(dem_paths)
+        processed = len(archive_paths) + skipped_existing
+        _emit(
+            phase="ingesting",
+            processed=processed,
+            total=total,
+            current_file=None,
+            skipped_existing=skipped_existing,
+            candidate_demos=len(dem_paths),
+            new_candidates=len(pending_paths),
+        )
+
+        pending_iter = iter(pending_paths)
+
+        async def _scan_worker() -> None:
+            nonlocal processed
+            while True:
+                try:
+                    path = next(pending_iter)
+                except StopIteration:
+                    return
                 try:
                     await self._on_detected(path, None)
                 except Exception:
                     logger.exception("scan_existing: enqueue failed for %s", path)
+                processed += 1
+                _emit(
+                    phase="ingesting",
+                    processed=processed,
+                    total=total,
+                    current_file=path.name,
+                    skipped_existing=skipped_existing,
+                )
 
-        for p in self._normalized_paths():
-            # 先 zip 再 .dem：本轮解压出的文件可立即随后面的 glob 入库，避免「先扫 dem 再解压」需二次扫描才登记
-            # 同类文件按 mtime 降序，优先处理最近写入的（用户刚下的 replay 等）
-            for z in _sort_paths_by_mtime_newest_first(p.glob("*.zip")):
-                await self._on_raw_zip_detected(z, enqueue_extracted=False, assume_stable=True)
-                count += 1
-            dem_paths = _sort_paths_by_mtime_newest_first(p.glob("*.dem"))
-            if dem_paths:
-                await asyncio.gather(*(_enqueue_dem(item) for item in dem_paths))
-                count += len(dem_paths)
-        return count
+        worker_count = min(max_conc, len(pending_paths))
+        if worker_count:
+            await asyncio.gather(*(asyncio.create_task(_scan_worker()) for _ in range(worker_count)))
+        _emit(
+            phase="done",
+            processed=total,
+            total=total,
+            current_file=None,
+            skipped_existing=skipped_existing,
+        )
+        return total

@@ -144,6 +144,25 @@ function ExportCheckRow({ ok, optional, label }) {
   );
 }
 
+function exportStageLabel(stage, t) {
+  const key = {
+    preparing: "montage.progressPreparing",
+    validate: "montage.progressPreparing",
+    probing_audio: "montage.progressAudio",
+    audio_preflight: "montage.progressAudio",
+    normalize: "montage.progressNormalize",
+    normalizing: "montage.progressNormalize",
+    transitions: "montage.progressTransitions",
+    concat: "montage.progressConcat",
+    packaging: "montage.progressPackaging",
+    finalize: "montage.progressPackaging",
+    bgm: "montage.progressBgm",
+    bgm_mix: "montage.progressBgm",
+    done: "montage.progressDone",
+  }[String(stage || "")];
+  return key ? t(key) : t("montage.consoleExportingBanner");
+}
+
 export function MontageStyleConsole({
   // media
   bgmPath,
@@ -187,6 +206,7 @@ export function MontageStyleConsole({
   onOutputDirClear,
   effectiveOutputDirHint,
   exportingBanner,
+  exportProgress,
   exportOk,
   lastExport,
   exportDirForButton,
@@ -208,6 +228,20 @@ export function MontageStyleConsole({
   const nameCardsFilled = Boolean(nameCardsEnabled);
   const readyTag =
     exportReady !== undefined && exportReady !== null ? Boolean(exportReady) : dirOk && nameOk && Number(clipCount) > 0;
+  const progressProcessed = Math.max(0, Number(exportProgress?.processed) || 0);
+  const progressTotal = Math.max(0, Number(exportProgress?.total) || 0);
+  const progressFractionRaw = Number(exportProgress?.fraction);
+  const countFraction = progressTotal > 0 ? progressProcessed / progressTotal : 0;
+  const progressFraction = Math.max(
+    0,
+    Math.min(
+      1,
+      Number.isFinite(progressFractionRaw) && progressFractionRaw > 0
+        ? progressFractionRaw
+        : countFraction,
+    ),
+  );
+  const progressPercent = Math.round(progressFraction * 100);
 
   const [activeTab, setActiveTab] = useState("media");
   const tabItems = [
@@ -241,8 +275,27 @@ export function MontageStyleConsole({
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="space-y-5">
           {exportingBanner ? (
-            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs font-medium text-amber-300">
-              {t("montage.consoleExportingBanner")}
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+              <div className="flex items-center gap-2">
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin text-amber-300" aria-hidden />
+                <span className="font-bold text-amber-300">
+                  {exportStageLabel(exportProgress?.stage, t)}
+                </span>
+                <span className="ml-auto font-mono tabular-nums text-amber-200/80">
+                  {progressTotal > 0
+                    ? t("montage.progressCount", { done: progressProcessed, total: progressTotal })
+                    : t("montage.progressWorking")}
+                </span>
+              </div>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-black/25" aria-hidden>
+                <div
+                  className="h-full rounded-full bg-amber-400 transition-[width] duration-300"
+                  style={{ width: `${Math.max(progressPercent, 2)}%` }}
+                />
+              </div>
+              <p className="mt-1.5 text-[10px] leading-relaxed text-amber-100/60">
+                {t("montage.progressHeartbeatHint")}
+              </p>
             </div>
           ) : null}
           {!exportingBanner && exportOk ? (
@@ -321,35 +374,44 @@ export function MontageStyleConsole({
                     {pathBasename(bgmPath)}
                   </p>
                 ) : (
-                  <p className="ml-1 text-xs text-cs2-text-muted">{t("montage.consoleBgmDropHint")}</p>
+                  <span className="ml-auto rounded-full border border-cs2-border-subtle bg-cs2-surface-2 px-2 py-0.5 text-[10px] font-bold text-cs2-text-muted">
+                    {t("montage.consoleBgmOff")}
+                  </span>
                 )}
               </div>
-              <div className="mt-3">
+              <p className="mt-2 text-[11px] leading-relaxed text-cs2-text-muted">
+                {bgmPath.trim() ? t("montage.consoleBgmEnabledHint") : t("montage.consoleBgmDisabledHint")}
+              </p>
+              <div className={`mt-3 ${bgmPath.trim() ? "" : "opacity-45"}`}>
                 <div className="flex items-center justify-between gap-2 text-xs text-cs2-text-muted">
                   <span>{t("montage.consoleBgmVolume")}</span>
-                  <span className="font-mono font-bold text-violet-400">{bgmVolume}%</span>
+                  <span className="font-mono font-bold text-violet-400">
+                    {bgmPath.trim() ? `${bgmVolume}%` : "—"}
+                  </span>
                 </div>
                 <input
                   type="range"
                   min={0}
                   max={100}
                   value={bgmVolume}
+                  disabled={!bgmPath.trim()}
                   onChange={(e) => onBgmVolumeChange(Number(e.target.value))}
-                  className="mt-1.5 h-2 w-full rounded-lg bg-cs2-bg-input accent-violet-400 cursor-pointer"
+                  className="mt-1.5 h-2 w-full rounded-lg bg-cs2-bg-input accent-violet-400 enabled:cursor-pointer disabled:cursor-not-allowed"
                 />
               </div>
-              <div className="mt-3 flex items-center gap-2">
+              <div className={`mt-3 flex items-center gap-2 ${bgmPath.trim() ? "" : "opacity-45"}`}>
                 <span className="text-xs text-cs2-text-muted">{t("montage.consoleBgmStartSec")}</span>
                 <input
                   type="number"
                   min={0}
                   step={1}
                   value={bgmStartSec || ""}
+                  disabled={!bgmPath.trim()}
                   onChange={(e) => {
                     const v = parseFloat(e.target.value);
                     onBgmStartSecChange?.(Number.isFinite(v) && v >= 0 ? v : 0);
                   }}
-                  className="w-16 rounded-lg border border-cs2-border-subtle bg-cs2-bg-input px-2.5 py-1 font-mono text-xs text-cs2-text-primary outline-none focus:border-violet-400 transition-all"
+                  className="w-16 rounded-lg border border-cs2-border-subtle bg-cs2-bg-input px-2.5 py-1 font-mono text-xs text-cs2-text-primary outline-none transition-all focus:border-violet-400 disabled:cursor-not-allowed"
                 />
                 <span className="text-xs text-cs2-text-muted">{t("montage.consoleBgmSec")}</span>
               </div>

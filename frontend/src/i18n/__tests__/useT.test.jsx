@@ -6,17 +6,17 @@ import { useLocaleStore } from "../localeStore.js";
 describe("useT", () => {
   beforeEach(() => {
     localStorage.clear();
-    useLocaleStore.setState({ locale: "zh" });
+    useLocaleStore.setState({ locale: "zh", effectiveLocale: "zh" });
   });
 
   test("按当前 locale 返回译文", () => {
-    useLocaleStore.setState({ locale: "en" });
+    useLocaleStore.setState({ locale: "en", effectiveLocale: "en" });
     const { result } = renderHook(() => useT());
     expect(result.current("common.cancel")).toBe("Cancel");
   });
 
   test("缺 key 时回退到 zh", () => {
-    useLocaleStore.setState({ locale: "en" });
+    useLocaleStore.setState({ locale: "en", effectiveLocale: "en" });
     const { result } = renderHook(() => useT());
     expect(result.current("__test_only_zh")).toBe("仅中文");
   });
