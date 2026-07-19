@@ -986,7 +986,7 @@ export default {
   "playercfg.btnOpenBackupDir": "Open backup dir",
   "playercfg.loading": "Reading config backup status…",
   "playercfg.fetchFailTitle": "Cannot connect to backend to read backup status",
-  "playercfg.fetchFailHint": "Installed-build writable data lives in the {data} folder under Electron's user-data directory (config / database / logs / backups are all there). \"Open config data directory\" in Settings opens that {data2} folder; player CFG backups are in the {backup} subfolder.",
+  "playercfg.fetchFailHint": "Installed-build writable data lives in the {data} folder under the desktop application data directory (config / database / logs / backups are all there). \"Open config data directory\" in Settings opens that {data2} folder; player CFG backups are in the {backup} subfolder.",
   "playercfg.restoreTitle": "Player config restore required",
   "playercfg.restoreDesc": "The previous recording session did not exit cleanly — the local CS2 config may not have been switched back to the player directory. Close CS2 first, then click the button below to restore.",
   "playercfg.cs2StatusRunning": "CS2 status: running (must be closed before restoring)",
