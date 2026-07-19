@@ -4,7 +4,7 @@ import { AlertTriangle, CheckCircle2, FolderOpen, Loader2, RefreshCw, RotateCcw,
 import PageContainer from "../components/PageContainer";
 import { useAppShell } from "../context/AppShellContext";
 import { calibrateObs, getObsConfigStatus } from "../api/obsConfigCenter";
-import { obsConfigHasIssues } from "../utils/obsConfigHealth";
+import { getObsVideoTarget, obsConfigHasIssues, obsEncoderIsHealthy } from "../utils/obsConfigHealth";
 import { useT } from "../i18n/useT.js";
 
 export default function ObsConfigCenterPage() {
@@ -100,6 +100,11 @@ export default function ObsConfigCenterPage() {
       await refreshSilent();
     } catch (e) {
       setErrorText(e.response?.data?.detail || e.message || t("obscfg.errorCalibrateFail"));
+      try {
+        await fetchStatus();
+      } catch {
+        // Preserve the calibration error; the stale-state warning remains visible.
+      }
     } finally {
       setCalibrating(false);
     }
@@ -118,23 +123,38 @@ export default function ObsConfigCenterPage() {
     Small: t("obscfg.qualitySmall"),
     HQ: t("obscfg.qualityHq"),
     Lossless: t("obscfg.qualityLossless"),
+    Advanced: t("obscfg.qualityAdvanced"),
   };
 
   const hasIssues = obsConfigHasIssues(status);
+  const videoTarget = getObsVideoTarget(status);
+  const highFpsPreset = videoTarget.preset === "pro_4x3_480";
+  const encoder = String(status?.recording?.encoder || "");
+  const encoderLabel = encoder === "obs_nvenc_hevc_tex"
+    ? t("obscfg.encoderNvencHevc")
+    : encoder === "obs_nvenc_h264_tex"
+      ? t("obscfg.encoderNvencH264")
+      : encoder || t("obscfg.encoderUnknown");
 
   const statusRows = status?.obs_connected
     ? [
         {
           label: t("obscfg.rowCanvas"),
           value: `${status.video?.base_width ?? 0}×${status.video?.base_height ?? 0}`,
-          ok: status.video?.base_width === status.monitor?.width && status.video?.base_height === status.monitor?.height,
-          issue: t("obscfg.resShouldBe", { w: status.monitor?.width ?? "?", h: status.monitor?.height ?? "?" }),
+          ok: status.video?.base_width === videoTarget.width && status.video?.base_height === videoTarget.height,
+          issue: t("obscfg.resShouldBe", { w: videoTarget.width || "?", h: videoTarget.height || "?" }),
         },
         {
           label: t("obscfg.rowOutput"),
           value: `${status.video?.output_width ?? 0}×${status.video?.output_height ?? 0}`,
-          ok: status.video?.output_width === status.monitor?.width && status.video?.output_height === status.monitor?.height,
-          issue: t("obscfg.resShouldBe", { w: status.monitor?.width ?? "?", h: status.monitor?.height ?? "?" }),
+          ok: status.video?.output_width === videoTarget.width && status.video?.output_height === videoTarget.height,
+          issue: t("obscfg.resShouldBe", { w: videoTarget.width || "?", h: videoTarget.height || "?" }),
+        },
+        {
+          label: t("obscfg.rowFps"),
+          value: `${status.video?.fps ?? 0} FPS`,
+          ok: highFpsPreset ? status.video?.fps === videoTarget.fps : Number(status.video?.fps || 0) >= 60,
+          issue: t("obscfg.fpsShouldBe", { fps: highFpsPreset ? videoTarget.fps : 60 }),
         },
         {
           label: t("obscfg.rowScene"),
@@ -169,6 +189,12 @@ export default function ObsConfigCenterPage() {
           value: FORMAT_LABELS[status.recording?.format] ?? status.recording?.format ?? t("obscfg.formatUnknown"),
           ok: status.recording?.format === "hybrid_mp4",
           issue: t("obscfg.formatIssue", { val: FORMAT_LABELS[status.recording?.format] ?? status.recording?.format ?? t("obscfg.formatUnknown") }),
+        },
+        {
+          label: t("obscfg.rowEncoder"),
+          value: encoderLabel,
+          ok: obsEncoderIsHealthy(status),
+          issue: highFpsPreset ? t("obscfg.encoderNvencIssue") : t("obscfg.encoderIssue"),
         },
         {
           label: t("obscfg.rowQuality"),

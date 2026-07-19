@@ -16,7 +16,7 @@ from .ai_director import (
 )
 from .planners.ai_directed_planner import plan_from_ai_outline
 from ..env_utils import OBSConfig, AppConfig, load_config, ensure_cs2_path, resolve_config_path
-from .executor.obs_client import OBSClient, OBSConnectionError
+from .executor.obs_client import OBSClient, OBSConnectionError, OBSRecordError
 from .executor.recording_executor import RecordingExecutor, ExecutionResult
 from .executor.obs_fade_controller import OBSFadeController, FadeConfig
 from .services.result_writer import write_result
@@ -617,6 +617,42 @@ async def execute_recording_queue(req: QueueRecordingRequest) -> list[dict]:
     if is_restore_required():
         raise HTTPException(409, error_detail("RECORDING_CONFIG_RESTORE_REQUIRED"))
 
+    # Parse this run's recording format before connecting to OBS, so invalid
+    # values fail before CS2 launch and the preflight can size overlays against
+    # the final canvas instead of a stale global setting.
+    warmup_extras = None
+    if req.warmup:
+        try:
+            _warmup_dict = dict(req.warmup)
+            if "snd_voipvolume_mute" in _warmup_dict and "voice_filter" not in _warmup_dict:
+                _warmup_dict["voice_filter"] = "mute" if _warmup_dict["snd_voipvolume_mute"] else "team"
+            if _warmup_dict.get("recording_fps") not in (None, ""):
+                _recording_fps = int(_warmup_dict["recording_fps"])
+                if not 30 <= _recording_fps <= 1000:
+                    raise ValueError("recording_fps must be between 30 and 1000")
+                _warmup_dict["recording_fps"] = _recording_fps
+            _valid_keys = {f.name for f in dataclasses.fields(RecordingWarmupExtras)}
+            _filtered = {k: v for k, v in _warmup_dict.items() if k in _valid_keys}
+            warmup_extras = RecordingWarmupExtras(**_filtered)
+        except (TypeError, ValueError) as e:
+            logger.warning("[RecordingV3] warmup validation failed: %s", e)
+            raise HTTPException(422, f"Invalid recording warmup options: {e}") from e
+        except Exception as e:
+            logger.warning("[RecordingV3] warmup parse failed: %s", e)
+
+    if req.pov_hud and req.pov_hud.get("enabled"):
+        pov_hud_cfg = req.pov_hud
+        if warmup_extras is None:
+            warmup_extras = RecordingWarmupExtras()
+        warmup_extras = dataclasses.replace(
+            warmup_extras,
+            pov_hud_enabled=True,
+            pov_radar_mode=int(pov_hud_cfg.get("radar_mode", 0)),
+            pov_teamcounter_numeric=bool(pov_hud_cfg.get("teamcounter_numeric", False)),
+        )
+        logger.info("[RecordingV3] POV HUD enabled: radar_mode=%s, teamcounter_numeric=%s",
+                    warmup_extras.pov_radar_mode, warmup_extras.pov_teamcounter_numeric)
+
     # Resolve OBS config (merge request-level obs override with saved config).
     obs_cfg_override = None
     if req.obs:
@@ -632,6 +668,16 @@ async def execute_recording_queue(req: QueueRecordingRequest) -> list[dict]:
     try:
         _pre_obs_client = OBSClient(obs_cfg)
         _pre_obs_client.connect()
+        if warmup_extras is not None and (
+            warmup_extras.resolution_width is not None
+            or warmup_extras.resolution_height is not None
+            or warmup_extras.recording_fps is not None
+        ):
+            _pre_obs_client.apply_recording_video_settings(
+                width=warmup_extras.resolution_width,
+                height=warmup_extras.resolution_height,
+                fps=warmup_extras.recording_fps,
+            )
         try:
             # Auto-setup requested overlay Browser Sources.
             _kb_overlay_requested = any(
@@ -698,6 +744,12 @@ async def execute_recording_queue(req: QueueRecordingRequest) -> list[dict]:
             400,
             error_detail("RECORDING_OBS_CONNECT_FAIL", err=str(e)),
         )
+    except OBSRecordError as e:
+        try:
+            _pre_obs_client.disconnect()
+        except Exception:
+            pass
+        raise HTTPException(400, f"无法应用本次录制的视频规格：{e}") from e
 
     # Resolve demo paths: replace filename/relative refs with absolute paths.
     resolved_requests = []
@@ -736,35 +788,6 @@ async def execute_recording_queue(req: QueueRecordingRequest) -> list[dict]:
             compat.report.removed_messages,
             demo_path,
         )
-
-    # Build warmup extras from request warmup dict.
-    # Merge pov_hud fields into warmup_extras so execute_plan_queue sees them.
-    warmup_extras = None
-    if req.warmup:
-        try:
-            _warmup_dict = dict(req.warmup)
-            # Backward compat: convert old boolean snd_voipvolume_mute → voice_filter
-            if "snd_voipvolume_mute" in _warmup_dict and "voice_filter" not in _warmup_dict:
-                _warmup_dict["voice_filter"] = "mute" if _warmup_dict["snd_voipvolume_mute"] else "team"
-            _valid_keys = {f.name for f in dataclasses.fields(RecordingWarmupExtras)}
-            _filtered = {k: v for k, v in _warmup_dict.items() if k in _valid_keys}
-            warmup_extras = RecordingWarmupExtras(**_filtered)
-        except Exception as e:
-            logger.warning("[RecordingV3] warmup parse failed: %s", e)
-
-    if req.pov_hud and req.pov_hud.get("enabled"):
-        pov_hud_cfg = req.pov_hud
-        if warmup_extras is None:
-            warmup_extras = RecordingWarmupExtras()
-        # Patch warmup extras with POV HUD settings
-        warmup_extras = dataclasses.replace(
-            warmup_extras,
-            pov_hud_enabled=True,
-            pov_radar_mode=int(pov_hud_cfg.get("radar_mode", 0)),
-            pov_teamcounter_numeric=bool(pov_hud_cfg.get("teamcounter_numeric", False)),
-        )
-        logger.info("[RecordingV3] POV HUD enabled: radar_mode=%s, teamcounter_numeric=%s",
-                    warmup_extras.pov_radar_mode, warmup_extras.pov_teamcounter_numeric)
 
     global _queue_abort_event
     if _queue_abort_event is not None:

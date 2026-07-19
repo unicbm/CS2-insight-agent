@@ -1139,6 +1139,7 @@ function ExportPane({
   fps = 60,
   encoder = "auto",
   encoderTier = "quality",
+  frameBlend = "off",
   canvasFit = "contain",
   backgroundColor = "#000000",
   blurAmount = 24,
@@ -1333,6 +1334,38 @@ function ExportPane({
               {label}
             </button>
           ))}
+        </div>
+      </PaneSection>
+      <PaneSection title="高 FPS 帧合成">
+        <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="高 FPS 帧合成强度">
+          {[
+            ["off", "关闭", "逐帧清晰"],
+            ["180", "自然 180°", "清晰与流畅平衡"],
+            ["360", "强 360°", "更顺滑，拖影更明显"],
+          ].map(([id, label, description]) => (
+            <button
+              key={id}
+              type="button"
+              aria-pressed={frameBlend === id}
+              onClick={() => commitSize({ frame_blend: id })}
+              className={`min-h-[58px] rounded-lg border px-2 py-2 text-left transition-colors ${
+                frameBlend === id
+                  ? "border-cs2-accent/70 bg-cs2-accent-soft text-cs2-accent"
+                  : "border-cs2-border/60 text-cs2-text-muted hover:border-cs2-border-focus hover:text-cs2-text-secondary"
+              }`}
+            >
+              <span className="block text-[10px] font-bold leading-tight">{label}</span>
+              <span className="mt-1 block text-[9px] leading-snug opacity-75">{description}</span>
+            </button>
+          ))}
+        </div>
+        <div className="rounded-md border border-cs2-accent/20 bg-cs2-accent-soft/35 px-2.5 py-2">
+          <p className="text-[10px] leading-relaxed text-cs2-text-secondary">
+            仅对高于导出帧率的高帧率源素材有效。FFmpeg 会先混合真实源帧再降至目标 FPS；开启后会增加导出耗时。
+          </p>
+          <p className="mt-1 text-[10px] leading-relaxed text-amber-300/90">
+            倒放与速度曲线片段暂不应用帧合成，其他片段仍按所选强度处理。
+          </p>
         </div>
       </PaneSection>
       <PaneSection title="视频编码" defaultOpen={false}>
@@ -1659,6 +1692,7 @@ export default function LiteCutPropertyPanel({
   outputFps = 60,
   outputEncoder = "auto",
   outputEncoderTier = "quality",
+  outputFrameBlend = "off",
   outputCanvasFit = "contain",
   outputBackgroundColor = "#000000",
   outputBlurAmount = 24,
@@ -1932,6 +1966,7 @@ export default function LiteCutPropertyPanel({
               fps={outputFps}
               encoder={outputEncoder}
               encoderTier={outputEncoderTier}
+              frameBlend={outputFrameBlend}
               canvasFit={outputCanvasFit}
               backgroundColor={outputBackgroundColor}
               blurAmount={outputBlurAmount}

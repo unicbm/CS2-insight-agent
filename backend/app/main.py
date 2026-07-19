@@ -1011,6 +1011,8 @@ async def update_config(payload: ConfigPayload):
         # 空字符串：GET 脱敏后输入框为空或未提交密码，不覆盖已保存的密码
         if o.obs_path is not None:
             cfg.obs.obs_path = str(o.obs_path).strip()
+        if "recording_video_preset" in o.model_fields_set:
+            cfg.obs.recording_video_preset = o.recording_video_preset
     if payload.llm:
         if payload.llm.api_key and not payload.llm.api_key.startswith("****"):
             cfg.llm = payload.llm
@@ -1176,7 +1178,18 @@ def merge_obs_for_connection(payload: Optional[OBSConfig], saved: OBSConfig) -> 
     if raw_pw.startswith("****"):
         raw_pw = ""
     password = raw_pw if raw_pw else saved.password
-    return OBSConfig(host=host, port=port, password=password)
+    return OBSConfig(
+        host=host,
+        port=port,
+        password=password,
+        obs_path=payload.obs_path or saved.obs_path,
+        obs_config_verified=saved.obs_config_verified,
+        recording_video_preset=(
+            payload.recording_video_preset
+            if "recording_video_preset" in payload.model_fields_set
+            else saved.recording_video_preset
+        ),
+    )
 
 
 def _normalize_obs_path_auto_detect(cfg: AppConfig) -> None:

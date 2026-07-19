@@ -2,7 +2,8 @@
   "obs": {
     "host": "localhost",
     "port": 4455,
-    "password": ""
+    "password": "",
+    "recording_video_preset": "display"
   },
   "llm": {
     "provider": "",

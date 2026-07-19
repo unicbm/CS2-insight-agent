@@ -65,6 +65,7 @@ export function normalizeLiteCutBody(rawBody) {
       height: 1080,
       fps: 60,
       encoder: "auto",
+      frame_blend: "off",
       range_mode: "full",
       range_start_sec: 0,
       range_end_sec: null,
@@ -81,6 +82,10 @@ export function normalizeLiteCutBody(rawBody) {
     }
     if (!["auto", "h264_nvenc", "h264_qsv", "h264_amf", "libx264"].includes(body.output.encoder)) {
       body.output.encoder = "auto";
+      changed = true;
+    }
+    if (!["off", "180", "360"].includes(body.output.frame_blend)) {
+      body.output.frame_blend = "off";
       changed = true;
     }
     if (!["full", "custom"].includes(body.output.range_mode)) {

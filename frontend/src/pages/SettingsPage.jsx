@@ -553,7 +553,7 @@ export default function SettingsPage() {
   // ─── Save handler (defined early because handleCalibrate depends on it) ───
 
   const handleSave = useCallback(async () => {
-    if (!config || saving) return;
+    if (!config || saving) return false;
     setSaving(true);
     setSaveMsg(null);
     try {
@@ -580,6 +580,7 @@ export default function SettingsPage() {
         port: obs.port ?? 4455,
         password: obs.password ?? "",
         obs_path: obs.obs_path ?? "",
+        recording_video_preset: obs.recording_video_preset ?? "display",
       };
 
       payload.llm = {
@@ -592,8 +593,10 @@ export default function SettingsPage() {
       await API.put("config", payload);
       useLocaleStore.getState().hydrate(payload.locale);
       setSaveMsg({ text: t("app.settingsSaved") ?? "Saved", tone: "ok" });
+      return true;
     } catch (e) {
       setSaveMsg({ text: e.response?.data?.detail || e.message || "Save failed", tone: "error" });
+      return false;
     } finally {
       setSaving(false);
     }
@@ -637,13 +640,16 @@ export default function SettingsPage() {
     setCalibrateResult(null);
     try {
       // Save first so the backend config has the latest OBS connection params
-      await handleSave();
+      const saved = await handleSave();
+      if (!saved) {
+        throw new Error(t("obscfg.errorSaveBeforeCalibrate"));
+      }
       const data = await calibrateObs();
       setCalibrateResult(data);
-      await refreshStatusSilent();
     } catch (e) {
       setCalibrateResult({ error: e.response?.data?.detail || e.message || t("obscfg.errorCalibrateFail") });
     } finally {
+      await refreshStatusSilent();
       setCalibrating(false);
     }
   }, [handleSave, refreshStatusSilent, t]);
@@ -655,18 +661,35 @@ export default function SettingsPage() {
 
   const obsStatusRows = useCallback((s) => {
     if (!s?.obs_connected) return [];
+    const highFpsPreset = config?.obs?.recording_video_preset === "pro_4x3_480";
+    const targetWidth = highFpsPreset ? 1280 : (s.monitor?.width ?? 0);
+    const targetHeight = highFpsPreset ? 960 : (s.monitor?.height ?? 0);
+    const targetFps = highFpsPreset ? 480 : 60;
+    const encoder = s.recording?.encoder ?? "";
+    const encoderLower = encoder.toLowerCase();
+    const encoderLabel = encoder === "obs_nvenc_hevc_tex"
+      ? t("obscfg.encoderNvencHevc")
+      : encoder === "obs_nvenc_h264_tex"
+        ? t("obscfg.encoderNvencH264")
+        : encoder || t("obscfg.encoderUnknown");
     return [
       {
         label: t("obscfg.rowCanvas"),
         value: `${s.video?.base_width ?? 0}×${s.video?.base_height ?? 0}`,
-        ok: s.video?.base_width === s.monitor?.width && s.video?.base_height === s.monitor?.height,
-        issue: t("obscfg.resShouldBe", { w: s.monitor?.width ?? "?", h: s.monitor?.height ?? "?" }),
+        ok: s.video?.base_width === targetWidth && s.video?.base_height === targetHeight,
+        issue: t("obscfg.resShouldBe", { w: targetWidth || "?", h: targetHeight || "?" }),
       },
       {
         label: t("obscfg.rowOutput"),
         value: `${s.video?.output_width ?? 0}×${s.video?.output_height ?? 0}`,
-        ok: s.video?.output_width === s.monitor?.width && s.video?.output_height === s.monitor?.height,
-        issue: t("obscfg.resShouldBe", { w: s.monitor?.width ?? "?", h: s.monitor?.height ?? "?" }),
+        ok: s.video?.output_width === targetWidth && s.video?.output_height === targetHeight,
+        issue: t("obscfg.resShouldBe", { w: targetWidth || "?", h: targetHeight || "?" }),
+      },
+      {
+        label: t("obscfg.rowFps"),
+        value: `${s.video?.fps ?? 0} FPS`,
+        ok: highFpsPreset ? s.video?.fps === targetFps : s.video?.fps >= targetFps,
+        issue: t("obscfg.fpsShouldBe", { fps: targetFps }),
       },
       {
         label: t("obscfg.rowScene"),
@@ -695,8 +718,16 @@ export default function SettingsPage() {
         issue: t("obscfg.formatIssue", { val: s.recording?.format === "hybrid_mp4" ? t("obscfg.formatHybridMp4") : s.recording?.format ?? t("obscfg.formatUnknown") }),
       },
       {
+        label: t("obscfg.rowEncoder"),
+        value: encoderLabel,
+        ok: highFpsPreset
+          ? encoderLower.includes("nvenc")
+          : !!encoder && !["none", "null", "stream", "use_stream_encoder"].includes(encoderLower),
+        issue: highFpsPreset ? t("obscfg.encoderNvencIssue") : t("obscfg.encoderIssue"),
+      },
+      {
         label: t("obscfg.rowQuality"),
-        value: s.recording?.rec_quality === "Stream" ? t("obscfg.qualityStream") : s.recording?.rec_quality === "Small" ? t("obscfg.qualitySmall") : s.recording?.rec_quality === "HQ" ? t("obscfg.qualityHq") : s.recording?.rec_quality === "Lossless" ? t("obscfg.qualityLossless") : s.recording?.rec_quality ?? t("obscfg.qualityUnknown"),
+        value: s.recording?.rec_quality === "Stream" ? t("obscfg.qualityStream") : s.recording?.rec_quality === "Small" ? t("obscfg.qualitySmall") : s.recording?.rec_quality === "HQ" ? t("obscfg.qualityHq") : s.recording?.rec_quality === "Lossless" ? t("obscfg.qualityLossless") : s.recording?.rec_quality === "Advanced" ? t("obscfg.qualityAdvanced") : s.recording?.rec_quality ?? t("obscfg.qualityUnknown"),
         ok: s.recording?.rec_quality !== "Stream" && !!s.recording?.rec_quality,
         issue: t("obscfg.qualityIssue"),
       },
@@ -708,7 +739,7 @@ export default function SettingsPage() {
         outputPath: s.recording?.output_path || "",
       },
     ];
-  }, [t]);
+  }, [config?.obs?.recording_video_preset, t]);
 
   // Search
   const searchLower = search.trim().toLowerCase();
@@ -1150,6 +1181,38 @@ export default function SettingsPage() {
                 </FieldRow>
               </SectionCard>
 
+              <SectionCard title={t("obscfg.videoPresetTitle")} hint={t("obscfg.videoPresetHint")} search={search && !matches(t("obscfg.videoPresetTitle") + " " + t("obscfg.videoPresetPro"))}>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {[
+                    { value: "display", title: t("obscfg.videoPresetDisplay"), detail: t("obscfg.videoPresetDisplayDetail") },
+                    { value: "pro_4x3_480", title: t("obscfg.videoPresetPro"), detail: t("obscfg.videoPresetProDetail") },
+                  ].map((option) => {
+                    const selected = (obs.recording_video_preset ?? "display") === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        aria-pressed={selected}
+                        onClick={() => set("obs.recording_video_preset", option.value)}
+                        className={`rounded-xl border px-3 py-3 text-left transition-colors ${
+                          selected
+                            ? "border-cs2-accent bg-cs2-accent/10 text-cs2-text-primary"
+                            : "border-cs2-border bg-cs2-bg-input text-cs2-text-secondary hover:border-cs2-accent/50"
+                        }`}
+                      >
+                        <span className="block text-xs font-bold">{option.title}</span>
+                        <span className="mt-1 block text-[11px] leading-relaxed text-cs2-text-muted">{option.detail}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {(obs.recording_video_preset ?? "display") === "pro_4x3_480" && (
+                  <p className="mt-2 rounded-lg border border-amber-400/30 bg-amber-400/5 px-2.5 py-2 text-[11px] leading-relaxed text-amber-300">
+                    {t("obscfg.videoPresetProWarning")}
+                  </p>
+                )}
+              </SectionCard>
+
               {/* OBS connection */}
               <SectionCard title={t("settings.sectionObs")} hint={t("settings.sectionObsHint")} search={search && !matches(t("settings.sectionObs") + " " + t("settings.labelObsHost") + " " + t("settings.labelObsPort") + " " + t("settings.labelObsPassword") + " " + t("settings.labelObsVerified"))}>
                 <div className="mb-2 flex items-center justify-between">
@@ -1277,6 +1340,12 @@ export default function SettingsPage() {
                         <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0" />{msg}
                       </div>
                     ))}
+                  </div>
+                )}
+                {calibrateResult?.error && (
+                  <div className="mt-2 flex items-start gap-1.5 rounded-lg border border-red-400/30 bg-red-400/5 px-2.5 py-2 text-[11px] text-red-400">
+                    <XCircle className="mt-0.5 h-3 w-3 shrink-0" />
+                    <span>{calibrateResult.error}</span>
                   </div>
                 )}
                 {calibrateResult?.restart_obs_required && (

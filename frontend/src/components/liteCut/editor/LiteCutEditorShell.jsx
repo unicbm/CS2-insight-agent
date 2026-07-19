@@ -426,6 +426,9 @@ export default function LiteCutEditorShell({
     ? body.output.encoder
     : "auto";
   const outputEncoderTier = body?.output?.encoder_tier === "fast" ? "fast" : "quality";
+  const outputFrameBlend = ["off", "180", "360"].includes(body?.output?.frame_blend)
+    ? body.output.frame_blend
+    : "off";
   const outputCanvasFit = ["contain", "cover", "blur"].includes(body?.output?.canvas_fit) ? body.output.canvas_fit : "contain";
   const outputBackgroundColor = /^#[0-9a-f]{6}$/i.test(String(body?.output?.background_color || ""))
     ? body.output.background_color
@@ -1863,6 +1866,7 @@ export default function LiteCutEditorShell({
             outputFps={outputFps}
             outputEncoder={outputEncoder}
             outputEncoderTier={outputEncoderTier}
+            outputFrameBlend={outputFrameBlend}
             outputCanvasFit={outputCanvasFit}
             outputBackgroundColor={outputBackgroundColor}
             outputBlurAmount={outputBlurAmount}

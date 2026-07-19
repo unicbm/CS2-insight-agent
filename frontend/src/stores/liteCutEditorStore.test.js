@@ -47,6 +47,7 @@ describe("normalizeLiteCutBody", () => {
     expect(body.audio).toMatchObject({ master_volume: 1.5, bgm: { path: "C:/music/theme.mp3", volume: 0.4 } });
     expect(body.overlays).toEqual([]);
     expect(body.output.encoder).toBe("auto");
+    expect(body.output.frame_blend).toBe("off");
   });
 
   it("keeps a supported per-project export encoder", () => {
@@ -56,6 +57,25 @@ describe("normalizeLiteCutBody", () => {
     });
 
     expect(body.output.encoder).toBe("h264_nvenc");
+    expect(changed).toBe(true);
+  });
+
+  it.each(["off", "180", "360"])("keeps the supported %s frame-blend mode", (frameBlend) => {
+    const { body } = normalizeLiteCutBody({
+      tracks: [{ id: "v1", type: "video", clips: [] }],
+      output: { width: 1920, height: 1080, fps: 60, frame_blend: frameBlend },
+    });
+
+    expect(body.output.frame_blend).toBe(frameBlend);
+  });
+
+  it("falls back to disabled frame blending for unknown project data", () => {
+    const { body, changed } = normalizeLiteCutBody({
+      tracks: [{ id: "v1", type: "video", clips: [] }],
+      output: { width: 1920, height: 1080, fps: 60, frame_blend: "cinematic" },
+    });
+
+    expect(body.output.frame_blend).toBe("off");
     expect(changed).toBe(true);
   });
 

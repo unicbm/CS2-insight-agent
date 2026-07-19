@@ -28,6 +28,7 @@ class OutputConfig(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 60
+    frame_blend: Literal["off", "180", "360"] = "off"
     encoder: Literal["auto", "h264_nvenc", "h264_qsv", "h264_amf", "libx264"] = "auto"
     encoder_tier: Literal["quality", "fast"] = "quality"
     canvas_fit: Literal["contain", "cover", "blur"] = "contain"

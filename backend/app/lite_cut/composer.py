@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -34,6 +35,13 @@ from ..video_composer import (
 )
 
 logger = logging.getLogger(__name__)
+
+_FRAME_BLEND_SHUTTER_FRACTION = {
+    "off": 0.0,
+    "180": 0.5,
+    "360": 1.0,
+}
+_FRAME_BLEND_MAX_FRAMES = 32
 
 
 def _ffmpeg_expr_time_variable(expression: str, variable: str = "T") -> str:
@@ -265,6 +273,65 @@ def _project_output_settings(body: dict[str, Any], ref: dict[str, Any]) -> tuple
     return width, height, fps
 
 
+def _project_frame_blend(body: dict[str, Any]) -> str:
+    output = body.get("output") if isinstance(body.get("output"), dict) else {}
+    mode = str(output.get("frame_blend") or "off").strip().lower()
+    return mode if mode in _FRAME_BLEND_SHUTTER_FRACTION else "off"
+
+
+def _frame_blend_frames(
+    mode: str,
+    *,
+    source_fps: float,
+    output_fps: float,
+    speed: float = 1.0,
+) -> int:
+    """Return the source-frame window for an output shutter angle.
+
+    The window follows output time. A constant 2x clip therefore traverses
+    twice as many source frames during the same 180/360-degree exposure.
+    """
+    fraction = _FRAME_BLEND_SHUTTER_FRACTION.get(str(mode or "off").strip().lower(), 0.0)
+    try:
+        source_rate = float(source_fps)
+        output_rate = float(output_fps)
+        playback_speed = float(speed)
+    except (TypeError, ValueError):
+        return 1
+    if (
+        fraction <= 0
+        or not math.isfinite(source_rate)
+        or not math.isfinite(output_rate)
+        or not math.isfinite(playback_speed)
+        or source_rate <= 0
+        or output_rate <= 0
+        or playback_speed <= 0
+    ):
+        return 1
+    samples = source_rate * playback_speed * fraction / output_rate
+    frames = int(samples + 0.5)
+    return max(1, min(_FRAME_BLEND_MAX_FRAMES, frames))
+
+
+def _frame_blend_filter(
+    mode: str,
+    *,
+    source_fps: float,
+    output_fps: float,
+    speed: float = 1.0,
+) -> str:
+    frames = _frame_blend_frames(
+        mode,
+        source_fps=source_fps,
+        output_fps=output_fps,
+        speed=speed,
+    )
+    if frames <= 1:
+        return ""
+    weights = " ".join("1" for _ in range(frames))
+    return f"tmix=frames={frames}:weights='{weights}'"
+
+
 def _project_encoder_tier(body: dict[str, Any]) -> str:
     output = body.get("output") if isinstance(body.get("output"), dict) else {}
     return "fast" if str(output.get("encoder_tier") or "").strip().lower() == "fast" else "quality"
@@ -436,19 +503,32 @@ def _clip_video_filter_chain(
     background_color: str = "black",
     blur_amount: int = 24,
     timeline_duration_override: float | None = None,
+    frame_blend: str = "off",
+    source_fps: float | None = None,
 ) -> str:
     speed = 1.0 if _clip_has_speed_ramp(clip) else _clip_speed(clip)
     timeline_duration = max(0.1, float(timeline_duration_override)) if timeline_duration_override is not None else _clip_timeline_duration_sec(clip)
     fade_in = _clip_video_fade(clip, "fade_in_sec")
     fade_out = _clip_video_fade(clip, "fade_out_sec")
     fps_s = f"{fps:.4f}".rstrip("0").rstrip(".")
+    # tmix is intentionally limited to forward, constant-speed clips. Reverse
+    # and speed-ramp timelines need direction/segment-aware exposure windows;
+    # silently approximating those modes creates leading trails or uneven blur.
+    blend_filter = ""
+    if not _clip_reverse(clip) and not _clip_has_speed_ramp(clip):
+        blend_filter = _frame_blend_filter(
+            frame_blend,
+            source_fps=float(source_fps or fps),
+            output_fps=fps,
+            speed=speed,
+        )
     fit = _clip_canvas_fit(clip, canvas_fit)
     crop_filter = _clip_crop_filter(clip)
     if fit == "cover":
         vf_parts = ([crop_filter] if crop_filter else []) + [
             f"scale={width}:{height}:force_original_aspect_ratio=increase",
             f"crop={width}:{height}",
-            f"fps={fps_s}",
+            *([] if blend_filter else [f"fps={fps_s}"]),
             "setsar=1",
             "format=yuv420p",
         ]
@@ -461,7 +541,7 @@ def _clip_video_filter_chain(
                 f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fgfit];"
                 f"[bgfit][fgfit]overlay=(W-w)/2:(H-h)/2"
             ),
-            f"fps={fps_s}",
+            *([] if blend_filter else [f"fps={fps_s}"]),
             "setsar=1",
             "format=yuv420p",
         ]
@@ -469,7 +549,7 @@ def _clip_video_filter_chain(
         vf_parts = ([crop_filter] if crop_filter else []) + [
             f"scale={width}:{height}:force_original_aspect_ratio=decrease",
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color={background_color}",
-            f"fps={fps_s}",
+            *([] if blend_filter else [f"fps={fps_s}"]),
             "setsar=1",
             "format=yuv420p",
         ]
@@ -484,6 +564,10 @@ def _clip_video_filter_chain(
         vf_parts.append("reverse")
     if abs(speed - 1.0) > 1e-6:
         vf_parts.append(f"setpts=PTS/{speed:.6f}")
+    if blend_filter:
+        # Blend while all real source samples still exist, then reduce to the
+        # requested delivery rate. Applying fps first only averages duplicates.
+        vf_parts.extend([blend_filter, f"fps={fps_s}"])
     freeze_frame_sec = _clip_freeze_frame_sec(clip)
     if freeze_frame_sec > 1e-6:
         vf_parts.append(f"tpad=stop_mode=clone:stop_duration={freeze_frame_sec:.6f}")
@@ -2311,6 +2395,7 @@ def _lite_cut_clip_to_ts(
     background_color: str,
     blur_amount: int,
     video_encode_quality: list[str],
+    frame_blend: str = "off",
     transition_in_background: bool = False,
     transition_out_background: bool = False,
     cancel_event: Any | None = None,
@@ -2324,6 +2409,19 @@ def _lite_cut_clip_to_ts(
     volume = _clip_volume(clip)
     ramped = _clip_has_speed_ramp(clip)
     visual_clip = {**clip, "speed": 1.0, "speed_keyframes": []} if ramped else clip
+    ffprobe = resolve_ffprobe_binary(ffmpeg_bin)
+    source_info = probe_video_audio_summary(src, ffprobe)
+    source_fps = float(source_info.get("fps") or fps)
+    has_audio = bool(source_info.get("has_audio"))
+    effective_frame_blend = frame_blend
+    if ramped or _clip_reverse(clip):
+        effective_frame_blend = "off"
+        if _project_frame_blend({"output": {"frame_blend": frame_blend}}) != "off":
+            logger.info(
+                "lite_cut frame blend skipped for %s clip %s",
+                "speed-ramped" if ramped else "reversed",
+                src.name,
+            )
     vf = _clip_video_filter_chain(
         visual_clip,
         width=width,
@@ -2333,6 +2431,8 @@ def _lite_cut_clip_to_ts(
         background_color=background_color,
         blur_amount=blur_amount,
         timeline_duration_override=timeline_duration if ramped else None,
+        frame_blend=effective_frame_blend,
+        source_fps=source_fps,
     )
     af = _audio_filter_chain(
         1.0 if ramped else speed,
@@ -2371,7 +2471,6 @@ def _lite_cut_clip_to_ts(
             graph_parts.append(_clip_canvas_transform_graph("[rampv]", "[vout]", clip=clip, fitted_filter=vf, width=width, height=height, fps=fps, duration=timeline_duration, background_color=background_color, transition_in_background=transition_in_background, transition_out_background=transition_out_background))
         else:
             graph_parts.append(f"[rampv]{vf}[vout]")
-        has_audio = bool(probe_video_audio_summary(src, resolve_ffprobe_binary(ffmpeg_bin)).get("has_audio"))
         if has_audio:
             audio_labels: list[str] = []
             for index, (start, end, segment_speed) in enumerate(_clip_speed_segments(clip)):
@@ -2395,7 +2494,6 @@ def _lite_cut_clip_to_ts(
         cmd.extend(["-filter_complex", ";".join(graph_parts), "-map", "[vout]"])
         cmd.extend(["-map", "[aout]"])
     else:
-        has_audio = bool(probe_video_audio_summary(src, resolve_ffprobe_binary(ffmpeg_bin)).get("has_audio"))
         if not has_audio:
             # Keep every normalized TS dual-stream so concat and cut-boundary
             # transitions work for recordings or uploads with no audio track.
@@ -2484,6 +2582,7 @@ def compose_lite_cut_montage(
     if int(ref["width"]) <= 0 or int(ref["height"]) <= 0:
         raise MontageComposerError("MONTAGE_FIRST_CLIP_NO_RESOLUTION")
     w, h, fps = _project_output_settings(project_body, ref)
+    frame_blend = _project_frame_blend(project_body)
     canvas_fit, background_color, blur_amount = _project_canvas_settings(project_body)
     range_start_sec, range_end_sec = _project_export_range(project_body)
     _emit_progress(progress_callback, 0.08, "normalizing")
@@ -2506,6 +2605,7 @@ def compose_lite_cut_montage(
                 background_color=background_color,
                 blur_amount=blur_amount,
                 video_encode_quality=video_encode_quality,
+                frame_blend=frame_blend,
                 transition_in_background=i == 0,
                 transition_out_background=i == len(clips) - 1,
                 cancel_event=cancel_event,

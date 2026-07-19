@@ -1770,13 +1770,14 @@ class RecordingTask:
 
 @dataclass
 class RecordingWarmupExtras:
-    """一键录制前预热阶段注入的观战相关 cvar，及本次 CS2 启动分辨率。"""
+    """一键录制前预热阶段注入的观战相关 cvar，及本次录制视频规格。"""
 
     cl_draw_only_deathnotices: bool = True
     spec_show_xray: int = 0  # 0 或 1
     fov_cs_debug: Optional[float] = None  # None 表示不注入
     resolution_width: Optional[int] = None
     resolution_height: Optional[int] = None
+    recording_fps: Optional[int] = None
     hud_showtargetid_hide: bool = True
     tv_nochat: bool = True
     viewmodel_fov_68: bool = False
@@ -3760,6 +3761,29 @@ class OBSDirector:
                     await self._run_cleanup_step("CS2 shutdown after OBS failure", self._kill_cs2, timeout=30.0)
                     await self._run_cleanup_step("CS2 artifact cleanup after OBS failure", self._cleanup_cs2_artifacts, timeout=8.0)
                     continue
+
+                if warmup is not None and (
+                    warmup.resolution_width is not None
+                    or warmup.resolution_height is not None
+                    or warmup.recording_fps is not None
+                ):
+                    try:
+                        await asyncio.to_thread(
+                            obs_client.apply_recording_video_settings,
+                            width=warmup.resolution_width,
+                            height=warmup.resolution_height,
+                            fps=warmup.recording_fps,
+                        )
+                    except Exception as e:
+                        logger.error("[RecordingV3] OBS video target failed for %s: %s", demo_name, e)
+                        for dto in demo_requests:
+                            all_results.append({
+                                "request_id": dto.request_id, "success": False,
+                                "error": f"OBS video settings failed: {e}", "segment_results": [], "warnings": [],
+                            })
+                        await self._run_cleanup_step("CS2 shutdown after OBS video failure", self._kill_cs2, timeout=30.0)
+                        await self._run_cleanup_step("CS2 artifact cleanup after OBS video failure", self._cleanup_cs2_artifacts, timeout=8.0)
+                        continue
 
                 # ── Execute each DTO through build_plan + RecordingExecutor ───
                 post_spec_lines = _filter_post_spec_console_lines(self._extra_warmup_console_lines)

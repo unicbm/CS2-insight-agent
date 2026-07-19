@@ -6,6 +6,7 @@ All methods are synchronous. Call from async context via asyncio.to_thread().
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import websocket
@@ -509,7 +510,7 @@ class OBSClient:
             return False
 
     def get_video_settings(self) -> dict:
-        """GetVideoSettings → dict with base_width, base_height, output_width, output_height."""
+        """GetVideoSettings → normalized canvas, output and FPS values."""
         self._require_connected()
         try:
             req = getattr(obs_requests, "GetVideoSettings", None)
@@ -522,10 +523,123 @@ class OBSClient:
                 "base_height": int(data.get("baseHeight") or 1080),
                 "output_width": int(data.get("outputWidth") or 1920),
                 "output_height": int(data.get("outputHeight") or 1080),
+                "fps_num": int(data.get("fpsNumerator") or 60),
+                "fps_den": max(1, int(data.get("fpsDenominator") or 1)),
             }
         except Exception as exc:
             logger.warning("OBSClient: get_video_settings failed: %s", exc)
             return {}
+
+    def apply_recording_video_settings(
+        self,
+        *,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        fps: Optional[int] = None,
+    ) -> dict:
+        """Apply the per-recording resolution/FPS and verify OBS accepted it.
+
+        Width and height are an atomic pair. Missing values inherit the current
+        OBS setting, so users can change only FPS or only the resolution pair.
+        """
+        self._require_connected()
+        if (width is None) != (height is None):
+            raise OBSRecordError("Recording width and height must be set together")
+        if width is not None and not 320 <= int(width) <= 7680:
+            raise OBSRecordError(f"Recording width out of range: {width}")
+        if height is not None and not 240 <= int(height) <= 4320:
+            raise OBSRecordError(f"Recording height out of range: {height}")
+        if fps is not None and not 30 <= int(fps) <= 1000:
+            raise OBSRecordError(f"Recording FPS out of range: {fps}")
+
+        current = self.get_video_settings()
+        if not current:
+            raise OBSRecordError("OBS did not return video settings")
+        target_width = int(width if width is not None else current["base_width"])
+        target_height = int(height if height is not None else current["base_height"])
+        current_fps = int(round(current["fps_num"] / max(1, current["fps_den"])))
+        target_fps = int(fps if fps is not None else current_fps)
+        target = {
+            "fpsNumerator": target_fps,
+            "fpsDenominator": 1,
+            "baseWidth": target_width,
+            "baseHeight": target_height,
+            "outputWidth": target_width,
+            "outputHeight": target_height,
+        }
+        changed = (
+            current["base_width"] != target_width
+            or current["base_height"] != target_height
+            or current["output_width"] != target_width
+            or current["output_height"] != target_height
+            or current_fps != target_fps
+        )
+        if changed:
+            try:
+                self._ws.call(obs_requests.SetVideoSettings(**target))
+            except Exception as exc:
+                raise OBSRecordError(f"OBS rejected recording video settings: {exc}") from exc
+
+            verified = self.get_video_settings()
+            verified_fps = int(round(verified.get("fps_num", 0) / max(1, verified.get("fps_den", 1))))
+            accepted = (
+                verified.get("base_width") == target_width
+                and verified.get("base_height") == target_height
+                and verified.get("output_width") == target_width
+                and verified.get("output_height") == target_height
+                and verified_fps == target_fps
+            )
+            if not accepted:
+                rollback = {
+                    "fpsNumerator": current["fps_num"],
+                    "fpsDenominator": current["fps_den"],
+                    "baseWidth": current["base_width"],
+                    "baseHeight": current["base_height"],
+                    "outputWidth": current["output_width"],
+                    "outputHeight": current["output_height"],
+                }
+                try:
+                    self._ws.call(obs_requests.SetVideoSettings(**rollback))
+                except Exception as rollback_exc:
+                    raise OBSRecordError(
+                        "OBS did not accept the requested recording video settings, "
+                        f"and rollback failed: {rollback_exc}"
+                    ) from rollback_exc
+                raise OBSRecordError("OBS did not accept the requested recording video settings; changes were rolled back")
+        else:
+            verified = current
+
+        self._fit_dedicated_game_capture(target_width, target_height)
+        logger.info(
+            "OBSClient: recording video target ready: %dx%d @ %d FPS",
+            target_width,
+            target_height,
+            target_fps,
+        )
+        return verified
+
+    def _fit_dedicated_game_capture(self, width: int, height: int) -> None:
+        scene_name = (os.environ.get("CS2_INSIGHT_OBS_SCENE_NAME") or "CS2 Insight Recording").strip()
+        source_name = (os.environ.get("CS2_INSIGHT_OBS_GAME_CAPTURE_NAME") or "CS2 Insight Game Capture").strip()
+        item_id = self.get_scene_item_id(scene_name, source_name)
+        if item_id is None:
+            logger.warning(
+                "OBSClient: cannot fit %r in %r after video settings change",
+                source_name,
+                scene_name,
+            )
+            return
+        self.set_scene_item_transform(
+            scene_name,
+            item_id,
+            {
+                "positionX": 0,
+                "positionY": 0,
+                "boundsType": "OBS_BOUNDS_STRETCH",
+                "boundsWidth": int(width),
+                "boundsHeight": int(height),
+            },
+        )
 
     def get_scene_item_id(self, scene_name: str, source_name: str) -> Optional[int]:
         """GetSceneItemId → scene item id int, or None if not found."""

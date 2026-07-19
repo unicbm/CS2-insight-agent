@@ -108,6 +108,7 @@ export const RECORD_WARMUP_DEFAULT_OPTIONS = {
   aspect_ratio: "",
   resolution_width: "",
   resolution_height: "",
+  recording_fps: "",
   /** POV：cl_drawhud_force_radar，-1 隐藏，0 显示（与 POV 成片默认「开雷达」一致） */
   pov_radar_mode: 0,
   /** POV：true 正上方显示存活人数；false 显示双方十人头像（默认关存活人数条） */
@@ -206,7 +207,7 @@ export default function RecordWarmupModal({
       for (const k of Object.keys(RECORD_WARMUP_DEFAULT_OPTIONS)) {
         if (!Object.prototype.hasOwnProperty.call(o, k) || o[k] === undefined) continue;
         const v = o[k];
-        if (k === "resolution_width" || k === "resolution_height") {
+        if (k === "resolution_width" || k === "resolution_height" || k === "recording_fps") {
           base[k] = v != null && v !== "" ? String(v) : "";
         } else {
           base[k] = v;
@@ -289,6 +290,7 @@ export default function RecordWarmupModal({
     const h = String(opts.resolution_height || "").trim();
     const rw = w ? parseInt(w, 10) : null;
     const rh = h ? parseInt(h, 10) : null;
+    const recordingFps = String(opts.recording_fps || "").trim();
 
     const apiShape = {
       cl_draw_only_deathnotices: opts.cl_draw_only_deathnotices,
@@ -304,6 +306,7 @@ export default function RecordWarmupModal({
       hide_grenade_trajectory_pip: opts.hide_grenade_trajectory_pip,
       resolution_width: rw,
       resolution_height: rh,
+      recording_fps: recordingFps ? parseInt(recordingFps, 10) : null,
       aspect_ratio: ar || null,
       pov_radar_mode: opts.pov_radar_mode === 0 ? 0 : -1,
       pov_teamcounter_numeric: !!opts.pov_teamcounter_numeric,
@@ -834,6 +837,10 @@ export default function RecordWarmupModal({
                     <span className="font-mono text-cs2-text-secondary">
                       {resSummaryDisplay}
                     </span>
+                    {" · "}
+                    <span className="font-mono text-cs2-text-secondary">
+                      {opts.recording_fps ? `${opts.recording_fps} FPS` : t("record.warmupFpsCurrent")}
+                    </span>
                   </p>
                   <p className="mt-1 text-[11px] leading-relaxed text-cs2-text-muted">
                     {t(aspectHint(opts.aspect_ratio))}
@@ -863,6 +870,17 @@ export default function RecordWarmupModal({
                     onChange={(e) => set({ resolution_height: e.target.value })}
                     className="w-24 rounded border border-cs2-border bg-cs2-bg-input px-2 py-1.5 font-mono text-sm text-cs2-text-primary placeholder:text-cs2-text-muted"
                   />
+                  <label className="ml-1 flex items-center gap-2">
+                    <span className="text-xs text-cs2-text-muted">{t("record.warmupFpsLabel")}</span>
+                    <select
+                      value={opts.recording_fps}
+                      onChange={(e) => set({ recording_fps: e.target.value })}
+                      className="rounded border border-cs2-border bg-cs2-bg-input px-2 py-1.5 font-mono text-sm text-cs2-text-primary"
+                    >
+                      <option value="">{t("record.warmupFpsCurrent")}</option>
+                      {[60, 120, 240, 480].map((fps) => <option key={fps} value={fps}>{fps} FPS</option>)}
+                    </select>
+                  </label>
                 </div>
                 {resolutionError ? (
                   <p className="mt-2 text-[11px] leading-snug text-rose-400">{resolutionError}</p>
@@ -871,6 +889,9 @@ export default function RecordWarmupModal({
                     {t("record.warmupResLeaveBlankHint")}
                   </p>
                 )}
+                <p className="mt-1 text-[11px] leading-relaxed text-cs2-text-muted">
+                  {t("record.warmupFpsHint")}
+                </p>
               </div>
             </div>
           </section>

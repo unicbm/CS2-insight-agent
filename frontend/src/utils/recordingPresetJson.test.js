@@ -4,7 +4,7 @@ import { buildRecordingPresetFile, parseRecordingPresetFile } from "./recordingP
 
 const preset = {
   recording_global_pacing: { pre_first_sec: 2, default_victim_pov: true },
-  default_record_warmup: { ...RECORD_WARMUP_DEFAULT_OPTIONS, aspect_ratio: "16:9", resolution_width: "1920", resolution_height: "1080" },
+  default_record_warmup: { ...RECORD_WARMUP_DEFAULT_OPTIONS, aspect_ratio: "16:9", resolution_width: "1920", resolution_height: "1080", recording_fps: "480" },
   cs2_extra_launch_args: "-fullscreen",
   record_inject_console_lines: "fps_max 0",
   obs_transition_enabled: true,

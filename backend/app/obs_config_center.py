@@ -24,6 +24,24 @@ APP_VERSION = "V2.3.0"
 DEFAULT_PROJECT_PROFILE = "未命名"  # 解析失败时的兜底目录名；正常由 resolve_default_project_profile_for_obs() 解析
 BACKUP_SUBDIR = ".obs_config_backups"
 
+_OUTPUT_MODE_SIMPLE = "simple"
+_OUTPUT_MODE_ADVANCED = "advanced"
+_NVENC_HEVC_ENCODER = "obs_nvenc_hevc_tex"
+_VIDEO_PRESET_DISPLAY = "display"
+_VIDEO_PRESET_PRO_4X3_480 = "pro_4x3_480"
+_PRO_VIDEO_WIDTH = 1280
+_PRO_VIDEO_HEIGHT = 960
+_PRO_VIDEO_FPS = 480
+_AMF_ENCODERS = frozenset(
+    {
+        "h264_texture_amf",
+        "h265_texture_amf",
+        "amd_amf_h264",
+        "amd_amf_hevc",
+    }
+)
+_ADVANCED_STREAM_ENCODERS = frozenset({"none", "stream", "use_stream_encoder"})
+
 
 def _dedicated_scene_name() -> str:
     s = (os.environ.get("CS2_INSIGHT_OBS_SCENE_NAME") or "CS2 Insight Recording").strip()
@@ -56,14 +74,27 @@ def _read_global_profile_names(obs_root: Path) -> tuple[Optional[str], Optional[
         raw = g.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None, None
-    prof: Optional[str] = None
-    sc: Optional[str] = None
+    values: dict[str, str] = {}
     for line in raw.splitlines():
         s = line.strip()
-        if s.lower().startswith("currentprofile="):
-            prof = s.split("=", 1)[1].strip()
-        if s.lower().startswith("currentscenecollection="):
-            sc = s.split("=", 1)[1].strip()
+        if not s or s.startswith(("#", ";", "[")) or "=" not in s:
+            continue
+        key, value = s.split("=", 1)
+        values[key.strip().lower()] = value.strip()
+    # OBS 30+ writes ProfileDir/SceneCollectionFile under [Basic].  Older
+    # installations and imported profiles may still use the Current* keys.
+    prof = (
+        values.get("currentprofile")
+        or values.get("profiledir")
+        or values.get("profile")
+        or None
+    )
+    sc = (
+        values.get("currentscenecollection")
+        or values.get("scenecollectionfile")
+        or values.get("scenecollection")
+        or None
+    )
     return prof, sc
 
 
@@ -165,30 +196,44 @@ def _effective_project_profile(obs_root: Path, explicit: Optional[str]) -> str:
     return _resolve_obs_profile_folder_name(obs_root)
 
 
-def _parse_simple_output(ini_path: Path) -> dict[str, str]:
+def _normalise_output_mode(raw: object) -> str:
+    return (
+        _OUTPUT_MODE_ADVANCED
+        if str(raw or "").strip().lower() == _OUTPUT_MODE_ADVANCED
+        else _OUTPUT_MODE_SIMPLE
+    )
+
+
+def _parse_output_profile(ini_path: Path) -> tuple[str, dict[str, str], dict[str, str]]:
     if not ini_path.is_file():
-        return {}
+        return _OUTPUT_MODE_SIMPLE, {}, {}
     cp = configparser.ConfigParser(interpolation=None)
+    # OBS option names are case-sensitive in the rest of this module
+    # (RecEncoder, RecFormat2, ...). ConfigParser lower-cases them by default.
+    cp.optionxform = str
     try:
         cp.read(ini_path, encoding="utf-8-sig")
-    except configparser.Error:
-        return {}
-    if "SimpleOutput" not in cp:
-        return {}
-    return {k: str(v) for k, v in cp["SimpleOutput"].items()}
+    except (OSError, configparser.Error):
+        return _OUTPUT_MODE_SIMPLE, {}, {}
+    output = cp["Output"] if "Output" in cp else {}
+    simple = cp["SimpleOutput"] if "SimpleOutput" in cp else {}
+    advanced = cp["AdvOut"] if "AdvOut" in cp else {}
+    mode = _normalise_output_mode(output.get("Mode") if output else "")
+    return (
+        mode,
+        {k: str(v) for k, v in simple.items()},
+        {k: str(v) for k, v in advanced.items()},
+    )
+
+
+def _parse_simple_output(ini_path: Path) -> dict[str, str]:
+    return _parse_output_profile(ini_path)[1]
 
 
 def _parse_adv_output_rec_path(ini_path: Path) -> str:
     """从 basic.ini [AdvOut] 读取高级输出模式的录像目录（RecFilePath）。"""
-    if not ini_path.is_file():
-        return ""
-    cp = configparser.ConfigParser(interpolation=None)
-    try:
-        cp.read(ini_path, encoding="utf-8-sig")
-    except configparser.Error:
-        return ""
-    section = cp["AdvOut"] if "AdvOut" in cp else {}
-    return str(section.get("recfilepath") or section.get("RecFilePath") or "").strip()
+    section = _parse_output_profile(ini_path)[2]
+    return str(section.get("RecFilePath") or "").strip()
 
 
 def _get_record_directory_via_ws(ws: obsws) -> str:
@@ -298,6 +343,160 @@ def _fps_from_video_dict(v: dict[str, int]) -> int:
     fd = max(1, int(v.get("fps_den") or 1))
     fn = int(v.get("fps_num") or 60)
     return int(round(fn / fd)) if fn else 60
+
+
+def _recording_video_target(
+    obs_cfg: object,
+    monitor_width: int,
+    monitor_height: int,
+    current_video: Optional[dict[str, int]] = None,
+) -> dict[str, Any]:
+    """Resolve the single video target used by status, diagnosis and calibration."""
+    raw_preset = str(
+        getattr(obs_cfg, "recording_video_preset", _VIDEO_PRESET_DISPLAY) or ""
+    ).strip()
+    preset = (
+        _VIDEO_PRESET_PRO_4X3_480
+        if raw_preset == _VIDEO_PRESET_PRO_4X3_480
+        else _VIDEO_PRESET_DISPLAY
+    )
+    if preset == _VIDEO_PRESET_PRO_4X3_480:
+        return {
+            "preset": preset,
+            "width": _PRO_VIDEO_WIDTH,
+            "height": _PRO_VIDEO_HEIGHT,
+            "fps_num": _PRO_VIDEO_FPS,
+            "fps_den": 1,
+            "fps": _PRO_VIDEO_FPS,
+        }
+
+    current = current_video or {}
+    fps_num = int(current.get("fps_num") or 60)
+    fps_den = max(1, int(current.get("fps_den") or 1))
+    if fps_num / fps_den < 60:
+        fps_num, fps_den = 60, 1
+    return {
+        "preset": preset,
+        "width": int(monitor_width),
+        "height": int(monitor_height),
+        "fps_num": fps_num,
+        "fps_den": fps_den,
+        "fps": int(round(fps_num / fps_den)),
+    }
+
+
+def _video_fps_matches_target(video: dict[str, int], target: dict[str, Any]) -> bool:
+    actual_num = int(video.get("fps_num") or 0)
+    actual_den = max(1, int(video.get("fps_den") or 1))
+    target_num = int(target["fps_num"])
+    target_den = max(1, int(target["fps_den"]))
+    return actual_num * target_den == target_num * actual_den
+
+
+def _get_profile_parameter(ws: obsws, category: str, name: str) -> str:
+    resp = ws.call(
+        obs_requests.GetProfileParameter(
+            parameterCategory=category,
+            parameterName=name,
+        )
+    )
+    raw = (getattr(resp, "datain", None) or {}).get("parameterValue")
+    return str(raw or "").strip()
+
+
+def _profile_parameter_or_default(
+    ws: obsws,
+    category: str,
+    name: str,
+    default: str = "",
+) -> str:
+    try:
+        value = _get_profile_parameter(ws, category, name)
+    except Exception:  # noqa: BLE001
+        return str(default or "").strip()
+    return value or str(default or "").strip()
+
+
+def _effective_output_mode(ws: obsws, disk_mode: str) -> str:
+    return _normalise_output_mode(
+        _profile_parameter_or_default(ws, "Output", "Mode", disk_mode)
+    )
+
+
+def _is_nvenc_encoder_id(raw: object) -> bool:
+    value = str(raw or "").strip().lower()
+    return value == "nvenc" or "nvenc" in value
+
+
+def _obs_runtime_log_confirms_nvenc(obs_root: Optional[Path]) -> bool:
+    """Use the current OBS startup log as capability evidence, not a GPU-name guess."""
+    if obs_root is None:
+        return False
+    logs_dir = obs_root / "logs"
+    try:
+        latest = max(logs_dir.glob("*.txt"), key=lambda path: path.stat().st_mtime)
+        raw = latest.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return False
+    return "[obs-nvenc] NVENC version:" in raw
+
+
+def _is_amf_encoder_id(raw: object) -> bool:
+    return str(raw or "").strip().lower() in _AMF_ENCODERS
+
+
+def _advanced_uses_stream_encoder(advanced: dict[str, str]) -> bool:
+    return str(advanced.get("RecEncoder") or "").strip().lower() in _ADVANCED_STREAM_ENCODERS
+
+
+def _recording_output_path_from_advanced(advanced: dict[str, str]) -> str:
+    return str(advanced.get("RecFilePath") or advanced.get("FFFilePath") or "").strip()
+
+
+def _set_profile_parameter_verified(
+    ws: obsws,
+    *,
+    category: str,
+    name: str,
+    value: str,
+    previous: str,
+) -> None:
+    """Set a profile value and roll it back when OBS does not echo it."""
+    ws.call(
+        obs_requests.SetProfileParameter(
+            parameterCategory=category,
+            parameterName=name,
+            parameterValue=value,
+        )
+    )
+    try:
+        observed = _get_profile_parameter(ws, category, name)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            ws.call(
+                obs_requests.SetProfileParameter(
+                    parameterCategory=category,
+                    parameterName=name,
+                    parameterValue=previous,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise ValueError(f"OBS 未能回读 {category}/{name}，已尝试恢复原设置") from exc
+    if observed != value:
+        try:
+            ws.call(
+                obs_requests.SetProfileParameter(
+                    parameterCategory=category,
+                    parameterName=name,
+                    parameterValue=previous,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise ValueError(
+            f"OBS 未接受 {category}/{name}={value}（实际为 {observed or '空'}），已尝试恢复原设置"
+        )
 
 
 def _detect_use_stream_encoder(simple: dict[str, str], obs_ws: Optional[obsws]) -> bool:
@@ -469,10 +668,13 @@ def get_status_payload(obs_cfg) -> dict[str, Any]:
     prof_name, sc_name = (None, None)
     if obs_root:
         prof_name, sc_name = _read_global_profile_names(obs_root)
+        if not prof_name:
+            prof_name = _resolve_obs_profile_folder_name(obs_root)
 
     latest = _latest_backup_summary()
     from .env_utils import get_primary_monitor_resolution
     _mon_w, _mon_h = get_primary_monitor_resolution()
+    initial_target = _recording_video_target(obs_cfg, _mon_w, _mon_h)
     base: dict[str, Any] = {
         "ok": True,
         "obs_connected": False,
@@ -487,6 +689,7 @@ def get_status_payload(obs_cfg) -> dict[str, Any]:
             "fps": 0,
         },
         "recording": {
+            "output_mode": _OUTPUT_MODE_SIMPLE,
             "use_stream_encoder": False,
             "encoder": "",
             "format": "",
@@ -498,6 +701,8 @@ def get_status_payload(obs_cfg) -> dict[str, Any]:
             "source_fit_to_canvas": False,
         },
         "monitor": {"width": _mon_w, "height": _mon_h},
+        "recording_video_preset": initial_target["preset"],
+        "video_target": initial_target,
         "latest_backup": latest,
         "obs_version": None,
     }
@@ -530,6 +735,7 @@ def get_status_payload(obs_cfg) -> dict[str, Any]:
 
         vr = ws.call(obs_requests.GetVideoSettings())
         vd = _parse_ws_video(vr)
+        base["video_target"] = _recording_video_target(obs_cfg, _mon_w, _mon_h, vd)
         base["video"] = {
             "base_width": vd["base_width"],
             "base_height": vd["base_height"],
@@ -564,36 +770,63 @@ def get_status_payload(obs_cfg) -> dict[str, Any]:
                 int(base["video"]["base_width"]),
                 int(base["video"]["base_height"]),
             )
+        mode = _OUTPUT_MODE_SIMPLE
         simple: dict[str, str] = {}
+        advanced: dict[str, str] = {}
         if obs_root and prof_name:
-            simple = _parse_simple_output(obs_root / "basic" / "profiles" / prof_name / "basic.ini")
-        base["recording"]["use_stream_encoder"] = _detect_use_stream_encoder(simple, ws)
-        base["recording"]["encoder"] = (simple.get("RecEncoder") or simple.get("Encoder") or "").strip()
-        # 三路兜底：Simple 输出 INI → Advanced 输出 INI → WebSocket GetRecordDirectory
-        _ini_path = (obs_root / "basic" / "profiles" / prof_name / "basic.ini") if (obs_root and prof_name) else None
-        _out_path = (
-            _recording_output_path_from_simple(simple)
-            or (_parse_adv_output_rec_path(_ini_path) if _ini_path else "")
-            or _get_record_directory_via_ws(ws)
-        )
-        base["recording"]["output_path"] = _out_path
-        # 优先从 OBS WebSocket 读取格式和质量，避免 INI 路径检测失败导致"未知"
-        try:
-            fmt_resp = ws.call(obs_requests.GetProfileParameter(
-                parameterCategory="SimpleOutput", parameterName="RecFormat2"
-            ))
-            fmt_val = (getattr(fmt_resp, "datain", None) or {}).get("parameterValue", "")
-            base["recording"]["format"] = fmt_val or (simple.get("RecFormat2") or simple.get("RecFormat") or "").strip()
-        except Exception:  # noqa: BLE001
-            base["recording"]["format"] = (simple.get("RecFormat2") or simple.get("RecFormat") or "").strip()
-        try:
-            q_resp = ws.call(obs_requests.GetProfileParameter(
-                parameterCategory="SimpleOutput", parameterName="RecQuality"
-            ))
-            q_val = (getattr(q_resp, "datain", None) or {}).get("parameterValue", "")
-            base["recording"]["rec_quality"] = q_val or (simple.get("RecQuality") or "").strip()
-        except Exception:  # noqa: BLE001
-            base["recording"]["rec_quality"] = (simple.get("RecQuality") or "").strip()
+            mode, simple, advanced = _parse_output_profile(
+                obs_root / "basic" / "profiles" / prof_name / "basic.ini"
+            )
+        mode = _effective_output_mode(ws, mode)
+        base["recording"]["output_mode"] = mode
+
+        if mode == _OUTPUT_MODE_ADVANCED:
+            encoder = _profile_parameter_or_default(
+                ws,
+                "AdvOut",
+                "RecEncoder",
+                advanced.get("RecEncoder") or "",
+            )
+            advanced["RecEncoder"] = encoder
+            base["recording"]["use_stream_encoder"] = _advanced_uses_stream_encoder(advanced)
+            base["recording"]["encoder"] = encoder
+            base["recording"]["format"] = _profile_parameter_or_default(
+                ws,
+                "AdvOut",
+                "RecFormat2",
+                advanced.get("RecFormat2") or advanced.get("RecFormat") or "",
+            )
+            base["recording"]["output_path"] = (
+                _recording_output_path_from_advanced(advanced)
+                or _get_record_directory_via_ws(ws)
+            )
+            # Advanced mode has no SimpleOutput-style quality preset.  A
+            # truthy marker keeps the existing UI from calling it "unknown".
+            base["recording"]["rec_quality"] = "Advanced"
+        else:
+            base["recording"]["use_stream_encoder"] = _detect_use_stream_encoder(simple, ws)
+            base["recording"]["encoder"] = _profile_parameter_or_default(
+                ws,
+                "SimpleOutput",
+                "RecEncoder",
+                simple.get("RecEncoder") or simple.get("Encoder") or "",
+            )
+            base["recording"]["format"] = _profile_parameter_or_default(
+                ws,
+                "SimpleOutput",
+                "RecFormat2",
+                simple.get("RecFormat2") or simple.get("RecFormat") or "",
+            )
+            base["recording"]["output_path"] = (
+                _recording_output_path_from_simple(simple)
+                or _get_record_directory_via_ws(ws)
+            )
+            base["recording"]["rec_quality"] = _profile_parameter_or_default(
+                ws,
+                "SimpleOutput",
+                "RecQuality",
+                simple.get("RecQuality") or "",
+            )
     except Exception as e:  # noqa: BLE001
         base["ws_error"] = str(e)
     finally:
@@ -611,8 +844,16 @@ def diagnose(obs_cfg) -> dict[str, Any]:
     obs_connected = False
     obs_version: Optional[str] = None
     video_dims: dict[str, int] = {"base_width": 0, "base_height": 0, "output_width": 0, "output_height": 0, "fps_num": 60, "fps_den": 1}
+    video_target: Optional[dict[str, Any]] = None
     prof_name: Optional[str] = None
     disk_profile_checked = False
+    recording_state: dict[str, Any] = {
+        "output_mode": _OUTPUT_MODE_SIMPLE,
+        "encoder": "",
+        "format": "",
+        "output_path": "",
+        "use_stream_encoder": False,
+    }
 
     try:
         ws = _ws_connect(obs_cfg)
@@ -646,26 +887,36 @@ def diagnose(obs_cfg) -> dict[str, Any]:
         monitor_w, monitor_h = get_primary_monitor_resolution()
         vr = ws.call(obs_requests.GetVideoSettings())
         video_dims = _parse_ws_video(vr)
+        video_target = _recording_video_target(
+            obs_cfg,
+            monitor_w,
+            monitor_h,
+            video_dims,
+        )
+        target_w = int(video_target["width"])
+        target_h = int(video_target["height"])
+        high_fps_preset = video_target["preset"] == _VIDEO_PRESET_PRO_4X3_480
+        target_name = "专业 4:3 高帧率预设" if high_fps_preset else "主显示器"
         fps = _fps_from_video_dict(video_dims)
         bw, bh = video_dims["base_width"], video_dims["base_height"]
         ow, oh = video_dims["output_width"], video_dims["output_height"]
-        if bw and bh and (bw != monitor_w or bh != monitor_h):
+        if bw and bh and (bw != target_w or bh != target_h):
             issues.append(
                 {
                     "code": "CANVAS_RESOLUTION_MISMATCH",
                     "level": "warning",
-                    "title": "画布分辨率与主显示器不一致",
-                    "message": f"当前 {bw}×{bh}，应为 {monitor_w}×{monitor_h}。",
+                    "title": f"画布分辨率与{target_name}不一致",
+                    "message": f"当前 {bw}×{bh}，应为 {target_w}×{target_h}。",
                     "fixable": True,
                 }
             )
-        if ow and oh and (ow != monitor_w or oh != monitor_h):
+        if ow and oh and (ow != target_w or oh != target_h):
             issues.append(
                 {
                     "code": "OUTPUT_RESOLUTION_MISMATCH",
                     "level": "warning",
-                    "title": "输出分辨率与主显示器不一致",
-                    "message": f"当前 {ow}×{oh}，应为 {monitor_w}×{monitor_h}。",
+                    "title": f"输出分辨率与{target_name}不一致",
+                    "message": f"当前 {ow}×{oh}，应为 {target_w}×{target_h}。",
                     "fixable": True,
                 }
             )
@@ -679,7 +930,17 @@ def diagnose(obs_cfg) -> dict[str, Any]:
                     "fixable": True,
                 }
             )
-        if fps < 60:
+        if high_fps_preset and not _video_fps_matches_target(video_dims, video_target):
+            issues.append(
+                {
+                    "code": "FPS_PRESET_MISMATCH",
+                    "level": "warning",
+                    "title": "录制帧率不是 480 FPS",
+                    "message": f"当前 {fps} FPS；专业高帧率预设要求 480 FPS。",
+                    "fixable": True,
+                }
+            )
+        elif not high_fps_preset and fps < 60:
             issues.append(
                 {
                     "code": "FPS_TOO_LOW",
@@ -739,17 +1000,98 @@ def diagnose(obs_cfg) -> dict[str, Any]:
                 }
             )
 
+        disk_mode = _OUTPUT_MODE_SIMPLE
         simple: dict[str, str] = {}
+        advanced: dict[str, str] = {}
         if obs_root is not None and obs_root.is_dir():
             prof_name, _ = _read_global_profile_names(obs_root)
+            if not prof_name:
+                prof_name = _resolve_obs_profile_folder_name(obs_root)
             if prof_name:
                 pin = obs_root / "basic" / "profiles" / prof_name / "basic.ini"
                 if pin.is_file():
-                    simple = _parse_simple_output(pin)
+                    disk_mode, simple, advanced = _parse_output_profile(pin)
                     disk_profile_checked = True
 
+        output_mode = _effective_output_mode(ws, disk_mode)
+        recording_state["output_mode"] = output_mode
+        if output_mode == _OUTPUT_MODE_ADVANCED:
+            encoder = _profile_parameter_or_default(
+                ws,
+                "AdvOut",
+                "RecEncoder",
+                advanced.get("RecEncoder") or "",
+            )
+            advanced["RecEncoder"] = encoder
+            rec_format = _profile_parameter_or_default(
+                ws,
+                "AdvOut",
+                "RecFormat2",
+                advanced.get("RecFormat2") or advanced.get("RecFormat") or "",
+            )
+            out_path = (
+                _recording_output_path_from_advanced(advanced)
+                or _get_record_directory_via_ws(ws)
+            )
+            uses_stream = _advanced_uses_stream_encoder(advanced)
+            stream_encoder = _profile_parameter_or_default(
+                ws,
+                "AdvOut",
+                "Encoder",
+                advanced.get("Encoder") or "",
+            )
+        else:
+            encoder = _profile_parameter_or_default(
+                ws,
+                "SimpleOutput",
+                "RecEncoder",
+                simple.get("RecEncoder") or simple.get("Encoder") or "",
+            )
+            rec_format = _profile_parameter_or_default(
+                ws,
+                "SimpleOutput",
+                "RecFormat2",
+                simple.get("RecFormat2") or simple.get("RecFormat") or "",
+            )
+            out_path = (
+                _recording_output_path_from_simple(simple)
+                or _get_record_directory_via_ws(ws)
+            )
+            uses_stream = _detect_use_stream_encoder(simple, ws)
+            stream_encoder = _profile_parameter_or_default(
+                ws,
+                "SimpleOutput",
+                "StreamEncoder",
+                simple.get("StreamEncoder") or "",
+            )
+
+        recording_state.update(
+            {
+                "encoder": encoder,
+                "format": rec_format,
+                "output_path": out_path,
+                "use_stream_encoder": uses_stream,
+            }
+        )
+
         if disk_profile_checked:
-            if _detect_use_stream_encoder(simple, ws):
+            if high_fps_preset and not _is_nvenc_encoder_id(encoder):
+                issues.append(
+                    {
+                        "code": "HIGH_FPS_NVENC_REQUIRED",
+                        "level": "error",
+                        "title": "480 FPS 预设未使用 NVIDIA NVENC",
+                        "message": (
+                            f"当前录像编码器为 {encoder or '未配置'}。"
+                            "专业高帧率预设必须先确认 NVENC 可用，之后才会修改视频规格。"
+                        ),
+                        "fixable": (
+                            _is_nvenc_encoder_id(stream_encoder)
+                            or _obs_runtime_log_confirms_nvenc(obs_root)
+                        ),
+                    }
+                )
+            if uses_stream:
                 issues.append(
                     {
                         "code": "USE_STREAM_ENCODER",
@@ -759,7 +1101,6 @@ def diagnose(obs_cfg) -> dict[str, Any]:
                         "fixable": True,
                     }
                 )
-            out_path = _recording_output_path_from_simple(simple)
             if not out_path:
                 issues.append(
                     {
@@ -770,14 +1111,40 @@ def diagnose(obs_cfg) -> dict[str, Any]:
                         "fixable": False,
                     }
                 )
-            enc = (simple.get("RecEncoder") or "").strip()
-            if not enc:
+            if not encoder:
                 issues.append(
                     {
                         "code": "ENCODER_UNAVAILABLE",
                         "level": "warning",
                         "title": "录制编码器未配置或为空",
                         "message": "建议应用推荐预设或手动选择可用编码器。",
+                        "fixable": True,
+                    }
+                )
+            if rec_format and rec_format != "hybrid_mp4":
+                issues.append(
+                    {
+                        "code": "RECORD_FORMAT_MISMATCH",
+                        "level": "warning",
+                        "title": "录像格式不是混合 MP4",
+                        "message": f"当前格式为 {rec_format}，建议应用推荐预设。",
+                        "fixable": True,
+                    }
+                )
+            if (
+                output_mode == _OUTPUT_MODE_ADVANCED
+                and _is_amf_encoder_id(encoder)
+                and _is_nvenc_encoder_id(stream_encoder)
+            ):
+                issues.append(
+                    {
+                        "code": "ADVANCED_AMF_ON_NVENC",
+                        "level": "error",
+                        "title": "高级输出使用了错误的 AMD 录像编码器",
+                        "message": (
+                            f"当前录像编码器为 {encoder}，但 OBS 的串流编码器为 {stream_encoder}。"
+                            "这会在 NVIDIA 渲染适配器上触发 AMF 适配器错误；可应用推荐预设切换到 NVENC HEVC。"
+                        ),
                         "fixable": True,
                     }
                 )
@@ -821,13 +1188,205 @@ def diagnose(obs_cfg) -> dict[str, Any]:
         "obs_version": obs_version,
         "active_profile_name": prof_name,
         "disk_profile_checked": disk_profile_checked,
+        "recording": recording_state,
+        "recording_video_preset": (
+            video_target["preset"]
+            if video_target is not None
+            else _recording_video_target(obs_cfg, 0, 0)["preset"]
+        ),
+        "video_target": video_target,
         "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
+def _calibrate_simple_output(
+    ws: obsws,
+    *,
+    require_nvenc: bool = False,
+    nvenc_available: bool = False,
+) -> tuple[list[str], list[str], bool]:
+    changed: list[str] = []
+    already_ok: list[str] = []
+    restart_required = False
+
+    rec_quality = _get_profile_parameter(ws, "SimpleOutput", "RecQuality")
+    rec_encoder = _get_profile_parameter(ws, "SimpleOutput", "RecEncoder")
+    stream_encoder = _get_profile_parameter(ws, "SimpleOutput", "StreamEncoder")
+    if (
+        require_nvenc
+        and not nvenc_available
+        and not _is_nvenc_encoder_id(rec_encoder)
+        and not _is_nvenc_encoder_id(stream_encoder)
+    ):
+        raise ValueError(
+            "专业 480 FPS 预设需要 NVIDIA NVENC，但当前 OBS 简单输出中未检测到可用的 NVENC 编码器。"
+        )
+
+    if rec_quality == "Stream":
+        _set_profile_parameter_verified(
+            ws,
+            category="SimpleOutput",
+            name="RecQuality",
+            value="Small",
+            previous=rec_quality,
+        )
+        # RecQuality="Stream" 时 OBS 忽略 RecEncoder；改为 "Small" 后必须有有效编码器。
+        if not rec_encoder or rec_encoder.lower() in ("none", "null", "stream"):
+            hw_priority = [
+                "jim_nvenc",
+                "ffmpeg_nvenc",
+                "h264_texture_amf",
+                "amd_amf_h264",
+                "obs_qsv11_v2",
+                "obs_qsv11",
+            ]
+            invalid = {"", "none", "null", "stream"}
+            target_enc = stream_encoder if stream_encoder.lower() not in invalid else hw_priority[0]
+            _set_profile_parameter_verified(
+                ws,
+                category="SimpleOutput",
+                name="RecEncoder",
+                value=target_enc,
+                previous=rec_encoder,
+            )
+            changed.append(f"录像编码器已设为「{target_enc}」（原质量为串流一致时未配置）")
+            rec_encoder = target_enc
+        restart_required = True
+        changed.append("录像质量已从「与串流一致」改为「高质量，中等文件大小」")
+    else:
+        already_ok.append("录像质量设置正常")
+
+    if require_nvenc and not _is_nvenc_encoder_id(rec_encoder):
+        _set_profile_parameter_verified(
+            ws,
+            category="SimpleOutput",
+            name="RecEncoder",
+            value="nvenc",
+            previous=rec_encoder,
+        )
+        changed.append(f"简单输出录像编码器已从「{rec_encoder or '未配置'}」切换为「nvenc」")
+        restart_required = True
+    elif require_nvenc:
+        already_ok.append(f"简单输出录像编码器正常（{rec_encoder}）")
+
+    rec_format = _get_profile_parameter(ws, "SimpleOutput", "RecFormat2")
+    if rec_format != "hybrid_mp4":
+        _set_profile_parameter_verified(
+            ws,
+            category="SimpleOutput",
+            name="RecFormat2",
+            value="hybrid_mp4",
+            previous=rec_format,
+        )
+        changed.append("录像格式已改为「混合 MP4」")
+    else:
+        already_ok.append("录像格式正确（混合 MP4）")
+
+    return changed, already_ok, restart_required
+
+
+def _calibrate_advanced_output(
+    ws: obsws,
+    advanced_disk: dict[str, str],
+    *,
+    require_nvenc: bool = False,
+    nvenc_available: bool = False,
+) -> tuple[list[str], list[str], bool]:
+    changed: list[str] = []
+    already_ok: list[str] = []
+    restart_required = False
+
+    # Require live WebSocket reads before touching an encoder. A disk-only
+    # guess can be stale while OBS is running and would be unsafe to apply.
+    rec_encoder = _get_profile_parameter(ws, "AdvOut", "RecEncoder")
+    stream_encoder = _get_profile_parameter(ws, "AdvOut", "Encoder")
+    if not rec_encoder:
+        rec_encoder = str(advanced_disk.get("RecEncoder") or "").strip()
+    if not stream_encoder:
+        stream_encoder = str(advanced_disk.get("Encoder") or "").strip()
+
+    uses_stream_encoder = _advanced_uses_stream_encoder({"RecEncoder": rec_encoder})
+    if uses_stream_encoder:
+        if not stream_encoder or _advanced_uses_stream_encoder({"RecEncoder": stream_encoder}):
+            raise ValueError(
+                "高级输出录像正在使用“与串流一致”，但串流编码器也未配置；无法创建独立录像编码器。"
+            )
+        if require_nvenc and not nvenc_available and not _is_nvenc_encoder_id(stream_encoder):
+            raise ValueError(
+                "专业 480 FPS 预设需要 NVIDIA NVENC，但当前串流编码器不是 NVENC；未修改视频规格。"
+            )
+        target_encoder = _NVENC_HEVC_ENCODER if require_nvenc else stream_encoder
+        _set_profile_parameter_verified(
+            ws,
+            category="AdvOut",
+            name="RecEncoder",
+            value=target_encoder,
+            previous=rec_encoder,
+        )
+        changed.append(
+            f"高级输出录像已从“与串流一致”改为独立编码器「{target_encoder}」"
+        )
+        restart_required = True
+    elif require_nvenc and not _is_nvenc_encoder_id(rec_encoder):
+        if not nvenc_available and not _is_nvenc_encoder_id(stream_encoder):
+            raise ValueError(
+                "专业 480 FPS 预设需要 NVIDIA NVENC，但当前 OBS 高级输出中无法确认 NVENC 可用；未修改视频规格。"
+            )
+        _set_profile_parameter_verified(
+            ws,
+            category="AdvOut",
+            name="RecEncoder",
+            value=_NVENC_HEVC_ENCODER,
+            previous=rec_encoder,
+        )
+        changed.append(
+            f"高级输出录像编码器已从「{rec_encoder}」切换为「{_NVENC_HEVC_ENCODER}」"
+        )
+        restart_required = True
+    elif _is_amf_encoder_id(rec_encoder):
+        if not nvenc_available and not _is_nvenc_encoder_id(stream_encoder):
+            raise ValueError(
+                "检测到高级输出正在使用 AMD AMF，但无法确认 NVENC 可用；为避免写入不可用编码器，未自动修改。"
+            )
+        _set_profile_parameter_verified(
+            ws,
+            category="AdvOut",
+            name="RecEncoder",
+            value=_NVENC_HEVC_ENCODER,
+            previous=rec_encoder,
+        )
+        changed.append(
+            f"高级输出录像编码器已从「{rec_encoder}」切换为「{_NVENC_HEVC_ENCODER}」"
+        )
+        restart_required = True
+    else:
+        already_ok.append(f"高级输出录像编码器正常（{rec_encoder or '未配置'}）")
+
+    rec_format = _get_profile_parameter(ws, "AdvOut", "RecFormat2")
+    if not rec_format:
+        rec_format = str(
+            advanced_disk.get("RecFormat2") or advanced_disk.get("RecFormat") or ""
+        ).strip()
+    if rec_format != "hybrid_mp4":
+        _set_profile_parameter_verified(
+            ws,
+            category="AdvOut",
+            name="RecFormat2",
+            value="hybrid_mp4",
+            previous=rec_format,
+        )
+        changed.append("高级输出录像格式已改为「混合 MP4」")
+    else:
+        already_ok.append("高级输出录像格式正确（混合 MP4）")
+
+    return changed, already_ok, restart_required
+
+
 def calibrate(obs_cfg) -> dict[str, Any]:
-    """运行时校准：读显示器分辨率 → 修正 OBS 画布 → 建场景 → 建 Game Capture → 设拉伸 → 修输出格式。
-    仅操作 CS2 Insight 专用场景，不动用户其他场景。
+    """Apply the selected video preset and repair the dedicated recording scene.
+
+    Video and output settings belong to the active OBS profile. Scene changes are
+    limited to the dedicated CS2 Insight scene; other scene contents are untouched.
     """
     from .env_utils import get_primary_monitor_resolution
 
@@ -837,6 +1396,10 @@ def calibrate(obs_cfg) -> dict[str, Any]:
     except Exception as exc:
         raise ValueError(f"OBS WebSocket 未连接，请先在设置中测试连接：{exc}") from exc
 
+    video_snapshot: Optional[dict[str, int]] = None
+    video_rollback_armed = False
+    output_snapshot: dict[tuple[str, str], str] = {}
+    output_rollback_armed = False
     try:
         if _obs_is_recording(ws):
             raise ValueError("录制进行中，无法修改视频设置，请录制结束后再校准")
@@ -849,53 +1412,114 @@ def calibrate(obs_cfg) -> dict[str, Any]:
 
         vr = ws.call(obs_requests.GetVideoSettings())
         vd = _parse_ws_video(vr)
+        video_snapshot = dict(vd)
         canvas_w = vd.get("base_width", 0)
         canvas_h = vd.get("base_height", 0)
         output_w = vd.get("output_width", 0)
         output_h = vd.get("output_height", 0)
         existing_fps_n = vd.get("fps_num", 60)
         existing_fps_d = vd.get("fps_den", 1)
+        video_target = _recording_video_target(obs_cfg, monitor_w, monitor_h, vd)
+        target_w = int(video_target["width"])
+        target_h = int(video_target["height"])
+        target_fps_n = int(video_target["fps_num"])
+        target_fps_d = int(video_target["fps_den"])
+
+        # Validate and repair the active recording encoder before raising the
+        # profile to 480 FPS. A failed NVENC preflight must leave video settings
+        # untouched instead of producing a half-applied, CPU-bound preset.
+        disk_mode = _OUTPUT_MODE_SIMPLE
+        advanced_disk: dict[str, str] = {}
+        obs_root = _obs_studio_root()
+        if obs_root is not None:
+            profile_name, _ = _read_global_profile_names(obs_root)
+            if not profile_name:
+                profile_name = _resolve_obs_profile_folder_name(obs_root)
+            if profile_name:
+                profile_ini = obs_root / "basic" / "profiles" / profile_name / "basic.ini"
+                disk_mode, _, advanced_disk = _parse_output_profile(profile_ini)
+        output_mode = _effective_output_mode(ws, disk_mode)
+        require_nvenc = video_target["preset"] == _VIDEO_PRESET_PRO_4X3_480
+        runtime_nvenc_available = _obs_runtime_log_confirms_nvenc(obs_root)
+        if output_mode == _OUTPUT_MODE_ADVANCED:
+            output_snapshot = {
+                ("AdvOut", name): _get_profile_parameter(ws, "AdvOut", name)
+                for name in ("RecEncoder", "RecFormat2")
+            }
+            output_rollback_armed = True
+            output_changed, output_ok, restart_required = _calibrate_advanced_output(
+                ws,
+                advanced_disk,
+                require_nvenc=require_nvenc,
+                nvenc_available=runtime_nvenc_available,
+            )
+        else:
+            output_snapshot = {
+                ("SimpleOutput", name): _get_profile_parameter(ws, "SimpleOutput", name)
+                for name in ("RecQuality", "RecEncoder", "RecFormat2")
+            }
+            output_rollback_armed = True
+            output_changed, output_ok, restart_required = _calibrate_simple_output(
+                ws,
+                require_nvenc=require_nvenc,
+                nvenc_available=runtime_nvenc_available,
+            )
+        changed.extend(output_changed)
+        already_ok.extend(output_ok)
 
         # Step 3: 修正画布与输出分辨率
         # OBS WS v5 SetVideoSettings 字段是顶层 kwargs，不能嵌套在 videoSettings={}
-        canvas_needs_fix = canvas_w != monitor_w or canvas_h != monitor_h
-        output_needs_fix = output_w != monitor_w or output_h != monitor_h
-        if canvas_needs_fix or output_needs_fix:
+        canvas_needs_fix = canvas_w != target_w or canvas_h != target_h
+        output_needs_fix = output_w != target_w or output_h != target_h
+        fps_needs_fix = not _video_fps_matches_target(vd, video_target)
+        if canvas_needs_fix or output_needs_fix or fps_needs_fix:
+            video_rollback_armed = True
             ws.call(obs_requests.SetVideoSettings(
-                fpsNumerator=existing_fps_n,
-                fpsDenominator=existing_fps_d,
-                baseWidth=monitor_w,
-                baseHeight=monitor_h,
-                outputWidth=monitor_w,
-                outputHeight=monitor_h,
+                fpsNumerator=target_fps_n,
+                fpsDenominator=target_fps_d,
+                baseWidth=target_w,
+                baseHeight=target_h,
+                outputWidth=target_w,
+                outputHeight=target_h,
             ))
             # 回读验证：避免静默失败时错误报告成功
             verify_vr = ws.call(obs_requests.GetVideoSettings())
             verify_vd = _parse_ws_video(verify_vr)
-            canvas_ok = verify_vd["base_width"] == monitor_w and verify_vd["base_height"] == monitor_h
-            output_ok = verify_vd["output_width"] == monitor_w and verify_vd["output_height"] == monitor_h
-            if canvas_ok and output_ok:
+            canvas_ok = verify_vd["base_width"] == target_w and verify_vd["base_height"] == target_h
+            output_ok = verify_vd["output_width"] == target_w and verify_vd["output_height"] == target_h
+            fps_ok = _video_fps_matches_target(verify_vd, video_target)
+            if canvas_ok and output_ok and fps_ok:
                 if canvas_needs_fix:
-                    changed.append(f"已将画布分辨率从 {canvas_w}×{canvas_h} 修正为 {monitor_w}×{monitor_h}")
+                    changed.append(f"已将画布分辨率从 {canvas_w}×{canvas_h} 修正为 {target_w}×{target_h}")
                 if output_needs_fix:
-                    changed.append(f"已将输出分辨率从 {output_w}×{output_h} 修正为 {monitor_w}×{monitor_h}")
+                    changed.append(f"已将输出分辨率从 {output_w}×{output_h} 修正为 {target_w}×{target_h}")
+                if fps_needs_fix:
+                    changed.append(
+                        f"已将录制帧率从 {round(existing_fps_n / max(1, existing_fps_d))} FPS "
+                        f"修正为 {round(target_fps_n / max(1, target_fps_d))} FPS"
+                    )
             else:
                 parts: list[str] = []
                 if not canvas_ok:
                     parts.append(
-                        f"画布仍为 {verify_vd['base_width']}×{verify_vd['base_height']}（应为 {monitor_w}×{monitor_h}）"
+                        f"画布仍为 {verify_vd['base_width']}×{verify_vd['base_height']}（应为 {target_w}×{target_h}）"
                     )
                 if not output_ok:
                     parts.append(
-                        f"输出仍为 {verify_vd['output_width']}×{verify_vd['output_height']}（应为 {monitor_w}×{monitor_h}）"
+                        f"输出仍为 {verify_vd['output_width']}×{verify_vd['output_height']}（应为 {target_w}×{target_h}）"
+                    )
+                if not fps_ok:
+                    parts.append(
+                        f"帧率仍为 {_fps_from_video_dict(verify_vd)} FPS（应为 {video_target['fps']} FPS）"
                     )
                 raise ValueError(
-                    "OBS 未接受分辨率修改（" + "；".join(parts) + "），"
-                    f"请在 OBS 设置→视频中手动将基础（画布）与输出（缩放）分辨率改为 {monitor_w}×{monitor_h}"
+                    "OBS 未接受视频设置修改（" + "；".join(parts) + "），"
+                    f"请在 OBS 设置→视频中手动改为 {target_w}×{target_h} / {video_target['fps']} FPS"
                 )
         else:
             already_ok.append(f"画布分辨率正确（{canvas_w}×{canvas_h}）")
             already_ok.append(f"输出分辨率正确（{output_w}×{output_h}）")
+            already_ok.append(f"录制帧率正确（{_fps_from_video_dict(vd)} FPS）")
 
         # Step 4: 确保 CS2 Insight 场景存在
         scene_name = _dedicated_scene_name()
@@ -940,90 +1564,60 @@ def calibrate(obs_cfg) -> dict[str, Any]:
                     "positionX": 0,
                     "positionY": 0,
                     "boundsType": "OBS_BOUNDS_STRETCH",
-                    "boundsWidth": monitor_w,
-                    "boundsHeight": monitor_h,
+                    "boundsWidth": target_w,
+                    "boundsHeight": target_h,
                 },
             ))
             changed.append("已设置 Game Capture 拉伸填满画布")
         else:
             already_ok.append("Game Capture 拉伸变换跳过（无法获取 sceneItemId）")
 
-        # Step 7: 修正输出设置（RecQuality / RecFormat2）
-        rec_q_resp = ws.call(obs_requests.GetProfileParameter(
-            parameterCategory="SimpleOutput", parameterName="RecQuality"
-        ))
-        rec_q_data = getattr(rec_q_resp, "datain", None) or {}
-        rec_quality = rec_q_data.get("parameterValue", "")
-
-        restart_required = False
-
-        if rec_quality == "Stream":
-            ws.call(obs_requests.SetProfileParameter(
-                parameterCategory="SimpleOutput",
-                parameterName="RecQuality",
-                parameterValue="Small",
-            ))
-            # RecQuality="Stream" 时 OBS 忽略 RecEncoder；改为 "Small" 后必须有有效编码器
-            # 否则 OBS 以空编码器启动录制会报「启动录像失败」
-            rec_enc_resp = ws.call(obs_requests.GetProfileParameter(
-                parameterCategory="SimpleOutput", parameterName="RecEncoder"
-            ))
-            rec_enc_val = ((getattr(rec_enc_resp, "datain", None) or {}).get("parameterValue") or "").strip()
-            if not rec_enc_val or rec_enc_val.lower() in ("none", "null", "stream"):
-                # 1. 优先用当前串流编码器（用户已确认可用的硬件编码器）
-                try:
-                    stream_enc_resp = ws.call(obs_requests.GetProfileParameter(
-                        parameterCategory="SimpleOutput", parameterName="StreamEncoder"
-                    ))
-                    stream_enc = ((getattr(stream_enc_resp, "datain", None) or {}).get("parameterValue") or "").strip()
-                except Exception:  # noqa: BLE001
-                    stream_enc = ""
-                # 2. 串流编码器无效时按硬件优先顺序选取
-                _HW_PRIORITY = [
-                    "jim_nvenc",        # NVENC（新版，推荐）
-                    "ffmpeg_nvenc",     # NVENC（旧版）
-                    "h264_texture_amf", # AMD AMF（新版）
-                    "amd_amf_h264",    # AMD AMF（旧版）
-                    "obs_qsv11_v2",    # Intel QSV（新版）
-                    "obs_qsv11",       # Intel QSV（旧版）
-                ]
-                _INVALID = {"", "none", "null", "stream"}
-                target_enc = stream_enc if stream_enc.lower() not in _INVALID else _HW_PRIORITY[0]
-                ws.call(obs_requests.SetProfileParameter(
-                    parameterCategory="SimpleOutput",
-                    parameterName="RecEncoder",
-                    parameterValue=target_enc,
-                ))
-                changed.append(f"录像编码器已设为「{target_enc}」（原质量为串流一致时未配置）")
-            # 编码器/质量变更写入的是磁盘 Profile，OBS 输出管线不会热重载，必须重启生效
-            restart_required = True
-            changed.append("录像质量已从「与串流一致」改为「高质量，中等文件大小」")
-        else:
-            already_ok.append("录像质量设置正常")
-
-        rec_f_resp = ws.call(obs_requests.GetProfileParameter(
-            parameterCategory="SimpleOutput", parameterName="RecFormat2"
-        ))
-        rec_f_data = getattr(rec_f_resp, "datain", None) or {}
-        rec_format = rec_f_data.get("parameterValue", "")
-
-        if rec_format != "hybrid_mp4":
-            ws.call(obs_requests.SetProfileParameter(
-                parameterCategory="SimpleOutput",
-                parameterName="RecFormat2",
-                parameterValue="hybrid_mp4",
-            ))
-            changed.append("录像格式已改为「混合 MP4」")
-        else:
-            already_ok.append("录像格式正确（混合 MP4）")
-
         return {
             "success": True,
             "changed": changed,
             "already_ok": already_ok,
             "restart_obs_required": restart_required,
+            "recording_video_preset": video_target["preset"],
+            "video_target": video_target,
         }
 
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        if video_rollback_armed and video_snapshot is not None:
+            try:
+                ws.call(obs_requests.SetVideoSettings(
+                    fpsNumerator=int(video_snapshot["fps_num"]),
+                    fpsDenominator=int(video_snapshot["fps_den"]),
+                    baseWidth=int(video_snapshot["base_width"]),
+                    baseHeight=int(video_snapshot["base_height"]),
+                    outputWidth=int(video_snapshot["output_width"]),
+                    outputHeight=int(video_snapshot["output_height"]),
+                ))
+                restored_video = _parse_ws_video(ws.call(obs_requests.GetVideoSettings()))
+                if restored_video != video_snapshot:
+                    rollback_errors.append("视频设置回读不一致")
+            except Exception:  # noqa: BLE001
+                rollback_errors.append("视频设置恢复失败")
+        if output_rollback_armed:
+            for (category, name), previous in output_snapshot.items():
+                try:
+                    ws.call(obs_requests.SetProfileParameter(
+                        parameterCategory=category,
+                        parameterName=name,
+                        parameterValue=previous,
+                    ))
+                    if _get_profile_parameter(ws, category, name) != previous:
+                        rollback_errors.append(f"{category}/{name} 回读不一致")
+                except Exception:  # noqa: BLE001
+                    rollback_errors.append(f"{category}/{name} 恢复失败")
+        original = str(exc) or "OBS 校准失败"
+        if rollback_errors:
+            raise ValueError(
+                f"{original}；自动回滚未完全成功：{'；'.join(rollback_errors)}。请刷新状态后再操作。"
+            ) from exc
+        if video_rollback_armed or output_rollback_armed:
+            raise ValueError(f"{original}；已恢复本次校准修改的视频与输出设置。") from exc
+        raise
     finally:
         _ws_disconnect(ws)
 

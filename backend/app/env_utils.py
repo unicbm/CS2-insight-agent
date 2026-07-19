@@ -14,7 +14,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
 try:
@@ -304,6 +304,8 @@ class OBSConfig(BaseModel):
     obs_path: str = ""
     # OBS 配置中心"配置检查"是否通过过（WebSocket 连接成功）
     obs_config_verified: bool = False
+    # display: 跟随显示器的普通录制；pro_4x3_480: 1280x960@480 的 CS2 高帧率素材档。
+    recording_video_preset: Literal["display", "pro_4x3_480"] = "display"
 
 
 class LLMConfig(BaseModel):

@@ -23,6 +23,7 @@ export function projectBodyFromTemplate(templateId) {
       height: vertical ? 1920 : 1080,
       fps: 60,
       encoder: "auto",
+      frame_blend: "off",
       canvas_fit: vertical ? "cover" : "contain",
       background_color: "#000000",
       blur_amount: 24,

@@ -191,7 +191,7 @@ export default function CommonParamsModal({
       for (const k of Object.keys(RECORD_WARMUP_DEFAULT_OPTIONS)) {
         if (!Object.prototype.hasOwnProperty.call(o, k) || o[k] === undefined) continue;
         const v = o[k];
-        if (k === "resolution_width" || k === "resolution_height") {
+        if (k === "resolution_width" || k === "resolution_height" || k === "recording_fps") {
           base[k] = v != null && v !== "" ? String(v) : "";
         } else {
           base[k] = v;
@@ -1231,6 +1231,10 @@ export default function CommonParamsModal({
                   <span className="font-mono text-cs2-text-secondary">
                     {resSummaryDisplay}
                   </span>
+                  {" · "}
+                  <span className="font-mono text-cs2-text-secondary">
+                    {warmupOpts.recording_fps ? `${warmupOpts.recording_fps} FPS` : t("record.warmupFpsCurrent")}
+                  </span>
                 </p>
                 <p className="mt-1.5 text-xs leading-relaxed text-cs2-text-muted">
                   {t(aspectHint(warmupOpts.aspect_ratio))}
@@ -1260,6 +1264,17 @@ export default function CommonParamsModal({
                   onChange={(e) => patchWarmup({ resolution_height: e.target.value })}
                   className="w-24 rounded-lg border border-cs2-border bg-cs2-bg-input px-3 py-1.5 font-mono text-sm text-cs2-text-primary placeholder:text-cs2-text-muted outline-none focus:border-cs2-accent"
                 />
+                <label className="ml-1 flex items-center gap-2">
+                  <span className="text-xs font-medium text-cs2-text-muted">{t("record.warmupFpsLabel")}</span>
+                  <select
+                    value={warmupOpts.recording_fps}
+                    onChange={(e) => patchWarmup({ recording_fps: e.target.value })}
+                    className="rounded-lg border border-cs2-border bg-cs2-bg-input px-3 py-1.5 font-mono text-sm text-cs2-text-primary outline-none focus:border-cs2-accent"
+                  >
+                    <option value="">{t("record.warmupFpsCurrent")}</option>
+                    {[60, 120, 240, 480].map((fps) => <option key={fps} value={fps}>{fps} FPS</option>)}
+                  </select>
+                </label>
               </div>
               {warmupResolutionError ? (
                 <p className="mt-2.5 text-xs leading-snug text-rose-400">{warmupResolutionError}</p>
@@ -1268,6 +1283,9 @@ export default function CommonParamsModal({
                   {t("record.commonResLeaveBlankHint")}
                 </p>
               )}
+              <p className="mt-1 text-xs leading-relaxed text-cs2-text-muted">
+                {t("record.warmupFpsHint")}
+              </p>
             </div>
           </WorkflowSection>
 

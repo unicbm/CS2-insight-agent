@@ -122,6 +122,7 @@ export function warmupUiOptsToPersisted(opts) {
     aspect_ratio: opts.aspect_ratio != null ? String(opts.aspect_ratio) : "",
     resolution_width: rw != null && rw !== "" ? String(rw) : "",
     resolution_height: rh != null && rh !== "" ? String(rh) : "",
+    recording_fps: opts.recording_fps != null && opts.recording_fps !== "" ? String(opts.recording_fps) : "",
     pov_radar_mode: Number(opts.pov_radar_mode) === 0 ? 0 : -1,
     pov_teamcounter_numeric: !!opts.pov_teamcounter_numeric,
   };
@@ -164,6 +165,7 @@ export function warmupApiPayloadToPersisted(warmup) {
     aspect_ratio: warmup.aspect_ratio != null ? String(warmup.aspect_ratio) : "",
     resolution_width: rw != null && rw !== "" ? String(rw) : "",
     resolution_height: rh != null && rh !== "" ? String(rh) : "",
+    recording_fps: warmup.recording_fps != null && warmup.recording_fps !== "" ? String(warmup.recording_fps) : "",
     pov_radar_mode: Number(warmup.pov_radar_mode) === 0 ? 0 : -1,
     pov_teamcounter_numeric: !!warmup.pov_teamcounter_numeric,
   };

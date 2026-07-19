@@ -36,6 +36,8 @@ from app.lite_cut.composer import (
     _drawtext_filter_complex,
     _stage_custom_font_for_ffmpeg,
     _first_missing_file_asset_for_export,
+    _frame_blend_filter,
+    _frame_blend_frames,
     _missing_file_assets_for_export,
     _is_file_overlay_clip,
     _is_audio_file_clip,
@@ -54,6 +56,7 @@ from app.lite_cut.composer import (
     _project_canvas_settings,
     _project_encoder_tier,
     _project_export_range,
+    _project_frame_blend,
     _project_output_settings,
     _project_master_volume,
     _recorded_source_ids_for_export,
@@ -74,7 +77,7 @@ from app.lite_cut.composer import (
 )
 from app.video_composer import MontageComposerError
 from app.video_composer import _xfade_transition_name
-from app.lite_cut.models import empty_project
+from app.lite_cut.models import OutputConfig, empty_project
 
 
 def test_map_transition_types():
@@ -427,6 +430,96 @@ def test_clip_normalizer_keeps_slow_silent_clips_dual_stream_and_untruncated(mon
     assert "14.100000" in cmd
 
 
+def test_clip_normalizer_uses_probed_source_fps_for_frame_blend(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setitem(
+        _lite_cut_clip_to_ts.__globals__,
+        "probe_video_audio_summary",
+        lambda *_args: {"has_audio": True, "fps": 480},
+    )
+    monkeypatch.setitem(
+        _lite_cut_clip_to_ts.__globals__,
+        "resolve_ffprobe_binary",
+        lambda _ffmpeg: tmp_path / "ffprobe.exe",
+    )
+    monkeypatch.setitem(
+        _lite_cut_clip_to_ts.__globals__,
+        "_run_ffmpeg_process",
+        lambda cmd, **_kwargs: commands.append(cmd) or SimpleNamespace(returncode=0, stderr="", stdout=""),
+    )
+
+    _lite_cut_clip_to_ts(
+        ffmpeg_bin=tmp_path / "ffmpeg.exe",
+        src=tmp_path / "high-fps.mp4",
+        out_ts=tmp_path / "normalized.ts",
+        clip={"trim_in": 0, "trim_out": 4},
+        width=1920,
+        height=1080,
+        fps=60,
+        canvas_fit="contain",
+        background_color="black",
+        blur_amount=24,
+        video_encode_quality=["-c:v", "libx264"],
+        frame_blend="360",
+    )
+
+    vf = commands[0][commands[0].index("-vf") + 1]
+    assert "tmix=frames=8:weights='1 1 1 1 1 1 1 1'" in vf
+    assert vf.index("tmix=frames=8") < vf.index("fps=60")
+
+
+@pytest.mark.parametrize(
+    "clip",
+    [
+        {"trim_in": 0, "trim_out": 4, "reverse": True},
+        {
+            "trim_in": 0,
+            "trim_out": 4,
+            "speed_keyframes": [
+                {"source_sec": 0, "speed": 1},
+                {"source_sec": 2, "speed": 2},
+            ],
+        },
+    ],
+)
+def test_clip_normalizer_safely_skips_frame_blend_for_unsupported_temporal_modes(
+    monkeypatch, tmp_path, clip
+):
+    commands = []
+    monkeypatch.setitem(
+        _lite_cut_clip_to_ts.__globals__,
+        "probe_video_audio_summary",
+        lambda *_args: {"has_audio": False, "fps": 480},
+    )
+    monkeypatch.setitem(
+        _lite_cut_clip_to_ts.__globals__,
+        "resolve_ffprobe_binary",
+        lambda _ffmpeg: tmp_path / "ffprobe.exe",
+    )
+    monkeypatch.setitem(
+        _lite_cut_clip_to_ts.__globals__,
+        "_run_ffmpeg_process",
+        lambda cmd, **_kwargs: commands.append(cmd) or SimpleNamespace(returncode=0, stderr="", stdout=""),
+    )
+
+    _lite_cut_clip_to_ts(
+        ffmpeg_bin=tmp_path / "ffmpeg.exe",
+        src=tmp_path / "unsupported.mp4",
+        out_ts=tmp_path / "normalized.ts",
+        clip=clip,
+        width=1920,
+        height=1080,
+        fps=60,
+        canvas_fit="contain",
+        background_color="black",
+        blur_amount=24,
+        video_encode_quality=["-c:v", "libx264"],
+        frame_blend="360",
+    )
+
+    assert "tmix=" not in " ".join(commands[0])
+
+
 def test_speed_ramp_uses_timeline_duration_for_video_fade_out():
     ramped_clip = {
         "trim_in": 0,
@@ -678,6 +771,55 @@ def test_project_export_range_defaults_to_full_and_bounds_custom():
     assert _project_export_range({"output": {"range_mode": "custom", "range_start_sec": 8, "range_end_sec": 4}}) == (8.0, None)
 
 
+def test_output_frame_blend_contract_defaults_and_validates_modes():
+    assert OutputConfig().frame_blend == "off"
+    assert OutputConfig(frame_blend="180").frame_blend == "180"
+    assert OutputConfig(frame_blend="360").frame_blend == "360"
+    with pytest.raises(ValueError):
+        OutputConfig(frame_blend="strong")
+
+
+def test_project_frame_blend_safely_defaults_unknown_values_to_off():
+    assert _project_frame_blend({}) == "off"
+    assert _project_frame_blend({"output": {"frame_blend": "180"}}) == "180"
+    assert _project_frame_blend({"output": {"frame_blend": "360"}}) == "360"
+    assert _project_frame_blend({"output": {"frame_blend": "strong"}}) == "off"
+
+
+@pytest.mark.parametrize(
+    ("mode", "source_fps", "output_fps", "speed", "expected"),
+    [
+        ("off", 480, 60, 1, 1),
+        ("180", 240, 60, 1, 2),
+        ("360", 240, 60, 1, 4),
+        ("180", 480, 60, 1, 4),
+        ("360", 480, 60, 1, 8),
+        ("180", 500, 60, 1, 4),
+        ("360", 500, 60, 1, 8),
+        ("360", 60, 60, 1, 1),
+        ("180", 480, 60, 2, 8),
+        ("360", 10000, 24, 1, 32),
+        ("360", float("nan"), 60, 1, 1),
+    ],
+)
+def test_frame_blend_window_tracks_source_rate_output_rate_and_speed(
+    mode, source_fps, output_fps, speed, expected
+):
+    assert _frame_blend_frames(
+        mode,
+        source_fps=source_fps,
+        output_fps=output_fps,
+        speed=speed,
+    ) == expected
+
+
+def test_frame_blend_filter_uses_deterministic_equal_weights():
+    assert _frame_blend_filter("180", source_fps=480, output_fps=60) == (
+        "tmix=frames=4:weights='1 1 1 1'"
+    )
+    assert _frame_blend_filter("360", source_fps=60, output_fps=60) == ""
+
+
 def test_empty_project_output_preserves_canvas_settings():
     project = empty_project().model_dump(mode="json")
     assert project["output"]["canvas_fit"] == "contain"
@@ -686,6 +828,7 @@ def test_empty_project_output_preserves_canvas_settings():
     assert project["output"]["range_mode"] == "full"
     assert project["output"]["range_start_sec"] == 0.0
     assert project["output"]["range_end_sec"] is None
+    assert project["output"]["frame_blend"] == "off"
 
 
 def test_clip_audio_fade_is_bounded_to_clip_duration():
@@ -815,6 +958,38 @@ def test_clip_video_filter_chain_uses_project_render_settings():
     assert "scale=1280:720:force_original_aspect_ratio=decrease" in vf
     assert "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=0x112233" in vf
     assert "fps=30" in vf
+
+
+def test_clip_video_filter_chain_blends_real_frames_before_output_fps():
+    vf = _clip_video_filter_chain(
+        {"speed": 2},
+        width=1920,
+        height=1080,
+        fps=60,
+        frame_blend="180",
+        source_fps=480,
+    )
+    assert "tmix=frames=8:weights='1 1 1 1 1 1 1 1'" in vf
+    assert vf.index("setpts=PTS/2.000000") < vf.index("tmix=frames=8") < vf.index("fps=60")
+
+
+@pytest.mark.parametrize(
+    "clip",
+    [
+        {"reverse": True},
+        {"speed_keyframes": [{"source_sec": 0, "speed": 1}, {"source_sec": 2, "speed": 2}]},
+    ],
+)
+def test_clip_video_filter_chain_safely_skips_blend_for_reverse_and_speed_ramps(clip):
+    vf = _clip_video_filter_chain(
+        clip,
+        width=1920,
+        height=1080,
+        fps=60,
+        frame_blend="360",
+        source_fps=480,
+    )
+    assert "tmix=" not in vf
 
 
 def test_clip_video_filter_chain_supports_cover_and_blur_canvas_modes():

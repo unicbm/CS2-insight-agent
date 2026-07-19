@@ -79,6 +79,10 @@ function parseWarmup(value, defaults) {
       const text = requireString(value[key], field, 8);
       if (text !== "" && (!/^\d+$/.test(text) || Number(text) <= 0 || Number(text) > 16384)) invalid(field, "range");
       result[key] = text;
+    } else if (key === "recording_fps") {
+      const text = requireString(value[key], field, 4);
+      if (text !== "" && !["60", "120", "240", "480"].includes(text)) invalid(field, "range");
+      result[key] = text;
     }
   }
   return result;
