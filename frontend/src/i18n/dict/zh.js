@@ -1026,7 +1026,7 @@ export default {
   "playercfg.btnOpenBackupDir": "打开备份目录",
   "playercfg.loading": "正在读取配置备份状态…",
   "playercfg.fetchFailTitle": "无法连接后端读取备份状态",
-  "playercfg.fetchFailHint": "安装版可写数据在 Electron「用户数据」下的 {data} 文件夹（配置 / 数据库 / 日志 / 备份均在该目录）。设置页的「打开配置数据目录」会打开该 {data2} 目录；玩家 CFG 备份在其中的 {backup}。",
+  "playercfg.fetchFailHint": "安装版可写数据在桌面应用数据目录下的 {data} 文件夹（配置 / 数据库 / 日志 / 备份均在该目录）。设置页的「打开配置数据目录」会打开该 {data2} 目录；玩家 CFG 备份在其中的 {backup}。",
   "playercfg.restoreTitle": "需要恢复玩家配置文件",
   "playercfg.restoreDesc": "检测到上次录制过程中程序未正常结束，本地 CS2 配置可能尚未切回玩家目录。请先关闭 CS2，然后点击下方按钮恢复。",
   "playercfg.cs2StatusRunning": "CS2 运行状态：正在运行（须关闭后再恢复）",
