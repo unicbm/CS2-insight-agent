@@ -41,6 +41,7 @@
       },
       "nsis": {
         "installerIcon": "../../packaging/windows/app-icon.ico",
+        "installerHooks": "windows/upgrade-hooks.nsh",
         "installMode": "currentUser",
         "displayLanguageSelector": false
       }
