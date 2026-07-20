@@ -16,62 +16,61 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Default)]
 struct BackendProcess(Mutex<Option<Child>>);
 
-fn move_if_absent(from: &Path, to: &Path) {
-    if !from.exists() || to.exists() {
-        return;
-    }
-    if let Some(parent) = to.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::rename(from, to);
-}
-
-fn migrate_legacy_layout(container: &Path, data_root: &Path) {
-    let _ = fs::create_dir_all(data_root);
-    move_if_absent(
-        &container.join("cs2-insight.config.json"),
-        &data_root.join("cs2-insight.config.json"),
-    );
-    for suffix in ["", "-wal", "-shm"] {
-        let name = format!("cs2-insight.db{suffix}");
-        move_if_absent(&container.join(&name), &data_root.join(name));
-    }
-    for directory in ["logs", ".cs2_config_backup", ".obs_config_backups"] {
-        move_if_absent(&container.join(directory), &data_root.join(directory));
-    }
-}
-
-fn has_existing_data(root: &Path) -> bool {
-    root.join("data").exists()
-        || root.join("cs2-insight.config.json").exists()
-        || root.join("cs2-insight.db").exists()
-}
-
-fn writable_data_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let tauri_root = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法解析应用数据目录：{error}"))?;
-
+fn writable_data_root(_app: &AppHandle, root: &Path, python: &Path) -> Result<PathBuf, String> {
     #[cfg(windows)]
-    let container = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .and_then(|app_data| {
-            ["CS2 Insight Agent", "cs2-insight-agent"]
-                .into_iter()
-                .map(|name| app_data.join(name))
-                .find(|candidate| has_existing_data(candidate))
-        })
-        .unwrap_or(tauri_root);
+    {
+        let app_data = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| "Windows APPDATA 环境变量不存在".to_string())?;
+        let migration_script = root.join("backend/app/desktop_data_migration.py");
+        if !migration_script.is_file() {
+            return Err(format!(
+                "未找到桌面数据迁移脚本：{}",
+                migration_script.display()
+            ));
+        }
+
+        let mut command = Command::new(python);
+        command
+            .arg("-I")
+            .arg(&migration_script)
+            .arg("--appdata")
+            .arg(&app_data)
+            .env("PYTHONNOUSERSITE", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .output()
+            .map_err(|error| format!("无法执行桌面数据迁移：{error}"))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if detail.is_empty() {
+                format!("桌面数据迁移失败，退出码：{}", output.status)
+            } else {
+                format!("桌面数据迁移失败：{detail}")
+            });
+        }
+
+        let data_root = app_data.join("CS2 Insight Agent").join("data");
+        fs::create_dir_all(data_root.join("logs"))
+            .map_err(|error| format!("无法创建应用数据目录 {}：{error}", data_root.display()))?;
+        return Ok(data_root);
+    }
 
     #[cfg(not(windows))]
-    let container = tauri_root;
-
-    let data_root = container.join("data");
-    migrate_legacy_layout(&container, &data_root);
-    fs::create_dir_all(data_root.join("logs"))
-        .map_err(|error| format!("无法创建应用数据目录 {}：{error}", data_root.display()))?;
-    Ok(data_root)
+    {
+        let data_root = _app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("无法解析应用数据目录：{error}"))?
+            .join("data");
+        fs::create_dir_all(data_root.join("logs"))
+            .map_err(|error| format!("无法创建应用数据目录 {}：{error}", data_root.display()))?;
+        Ok(data_root)
+    }
 }
 
 fn runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -126,7 +125,7 @@ fn start_backend(app: &AppHandle) -> Result<(), String> {
         return Err(format!("未找到后端入口：{}", run_server.display()));
     }
 
-    let data_root = writable_data_root(app)?;
+    let data_root = writable_data_root(app, &root, &python)?;
     let logs_dir = data_root.join("logs");
     let backend_dir = root.join("backend");
     let bundle_data_dir = root.join("data");
