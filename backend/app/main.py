@@ -50,6 +50,12 @@ from .env_utils import (
 from .demo_db import DemoDB, DemoListFilters, utc_now_iso
 from .demo_library_hub import demo_library_hub
 from .demo_compat_service import ensure_demo_compatible
+from .demo_playback_service import (
+    DemoPlaybackBusyError,
+    DemoPlaybackCs2RunningError,
+    DemoPlaybackPovOptions,
+    demo_playback_service,
+)
 from .demo_watcher import DemoWatcher, _demo_ingest_md5_enabled
 from .file_hash import file_md5_hex
 from .gsi_ready import (
@@ -77,6 +83,8 @@ from .cs2_config_backup import (
     open_backup_directory,
     restore_latest_user_config_backup,
 )
+from .api_errors import error_detail
+from .pov_hud_manager import PovHudError
 import httpx
 
 from .steam_match_history import (
@@ -234,16 +242,8 @@ async def _enqueue_demo_path(path: Path, origin_zip: str | None = None) -> None:
                     pass
             return
 
-        # 轻量解析：只提取地图与记分板元数据，避免重量级玩家片段解析。
-        try:
-            from .demo_parse_isolation import get_demo_match_summary_isolated
-
-            meta = await asyncio.to_thread(get_demo_match_summary_isolated, demo_path)
-            if isinstance(meta, dict):
-                refined_source = infer_demo_source(path.name, server_name=meta.get("server_name"))
-                await demo_db.update_lightweight_meta(demo_path, meta, source=refined_source)
-        except Exception:
-            logger.exception("Lightweight meta parse failed for %s", demo_path)
+        # 发现阶段只做文件登记、去重与基础校验。地图、名单和记分板在用户确认
+        # 入库时一次性提取，避免“扫描目录一次 + 入库一次”的重复 parser 读盘。
         await demo_db.update_status(demo_path, "pending", error_msg=None, parsed_at=None)
         if can_store_md5:
             try:
@@ -260,10 +260,10 @@ async def lifespan(_: FastAPI):
     仅初始化 DB 与 DemoWatcher 实例（不启动 watchdog Observer，也不做启动时扫描）。
 
     **为什么不再自动扫描**：watchdog Observer 会在目录出现新 .dem 时立刻触发
-    ``_enqueue_demo_path``，其中包含 ``get_demo_match_summary`` 的轻量解析。录制期我们会
+    ``_enqueue_demo_path``。录制期我们会
     准备一个兼容性复验后的 ``_insight_<uuid>.dem`` 到 CS2 的 ``csgo/``；若用户的监听目录与
     ``csgo/`` 有重叠（常见：就是把 CS2 的 replay 目录作为监听目录），**每次录制都会在后台触发
-    入库与轻量读盘**（记分板元数据等），仍可能与录制争用磁盘；历史上还曾叠加「名单自动深度解析」
+    登记新文件并做内容去重，仍可能与录制争用磁盘；历史上还曾叠加解析工作
     加重负载，故默认不在启动时全量扫描。
     保留 ``DemoWatcher`` 实例只是为 ``POST /api/demos/scan`` 这一条手动扫描接口
     服务；页面上改为用户点"刷新"按钮时主动扫描。
@@ -281,7 +281,12 @@ async def lifespan(_: FastAPI):
     removed_gsi_configs = cleanup_stale_gsi_configs(cfg.cs2_path)
     if removed_gsi_configs:
         logger.info("Removed %d stale CS2 Insight GSI config(s)", len(removed_gsi_configs))
-    demo_watcher = DemoWatcher(cfg.demo_watch_paths or [], _enqueue_demo_path, demo_db)
+    demo_watcher = DemoWatcher(
+        cfg.demo_watch_paths or [],
+        _enqueue_demo_path,
+        demo_db,
+        max_depth=cfg.demo_watch_scan_depth,
+    )
     from .pov_hud_manager import try_restore_stale_pov_on_startup
 
     for _msg in try_restore_stale_pov_on_startup(cfg):
@@ -729,6 +734,7 @@ class ConfigPayload(BaseModel):
     montage_encoder: Optional[str] = None
     cs2_path: Optional[str] = None
     demo_watch_paths: Optional[list[str]] = None
+    demo_watch_scan_depth: Optional[int] = Field(default=None, ge=0, le=32)
     ai_mode: Optional[bool] = None
     locale: Optional[str] = None
     expected_parse_players: Optional[list[str]] = None
@@ -1023,6 +1029,8 @@ async def update_config(payload: ConfigPayload):
         cfg.cs2_path = payload.cs2_path
     if payload.demo_watch_paths is not None:
         cfg.demo_watch_paths = [str(Path(p).expanduser()) for p in payload.demo_watch_paths if str(p).strip()]
+    if payload.demo_watch_scan_depth is not None:
+        cfg.demo_watch_scan_depth = int(payload.demo_watch_scan_depth)
     if payload.ai_mode is not None:
         cfg.ai_mode = payload.ai_mode
     if payload.locale is not None and payload.locale in ("zh", "en", "auto"):
@@ -1123,11 +1131,13 @@ async def update_config(payload: ConfigPayload):
     if payload.last_update_check_at is not None:
         cfg.last_update_check_at = str(payload.last_update_check_at).strip()
     save_config(cfg)
-    if demo_watcher is not None and payload.demo_watch_paths is not None:
+    if demo_watcher is not None and (
+        payload.demo_watch_paths is not None or payload.demo_watch_scan_depth is not None
+    ):
         # 只更新路径配置（供后续 /api/demos/scan 手动扫描使用）；
         # 不再 restart watchdog、也不再自动 scan_existing，避免配置保存瞬间触发
         # 大量重型解析抢占 CS2 录制时的系统资源。
-        demo_watcher._paths = list(cfg.demo_watch_paths or [])
+        demo_watcher.configure(cfg.demo_watch_paths or [], cfg.demo_watch_scan_depth)
     return {"status": "ok"}
 
 
@@ -1154,10 +1164,10 @@ def experimental_pov_restore():
     cfg = ensure_cs2_path(cfg)
     try:
         mgr = PovHudManager(cfg)
-        mgr.restore()
+        verification = mgr.restore()
     except PovHudError as e:
         raise HTTPException(400, str(e)) from e
-    return {"ok": True, "message": "POV HUD 修改已恢复"}
+    return {"ok": bool(verification.get("verified")), "restore": verification}
 
 
 def merge_obs_for_connection(payload: Optional[OBSConfig], saved: OBSConfig) -> OBSConfig:
@@ -2555,6 +2565,11 @@ class DemoDisplayNamePatch(BaseModel):
     display_name: str = Field(default="", max_length=512)
 
 
+class DemoWatchPathInspectBody(BaseModel):
+    path: str = Field(..., min_length=1, max_length=4096)
+    max_depth: int = Field(default=2, ge=0, le=32)
+
+
 @app.patch("/api/demos/{demo_id}")
 async def patch_demo_display_name(demo_id: int, body: DemoDisplayNamePatch):
     ok = await demo_db.update_display_name(demo_id, body.display_name)
@@ -2579,6 +2594,46 @@ async def scan_watch_paths():
         logger.exception("count discovered demos after scan failed")
         discovered_count = 0
     return {"scanned": scanned, "player_stats_index": None, "discovered_count": discovered_count}
+
+
+@app.post("/api/demos/watch-path/inspect")
+async def inspect_demo_watch_path(body: DemoWatchPathInspectBody):
+    """Validate and enumerate a watch directory without parsing demo contents."""
+    from .demo_watcher import iter_candidate_files
+
+    candidate = Path(body.path).expanduser()
+    if not candidate.is_dir():
+        return {
+            "valid": False,
+            "path": str(candidate),
+            "demo_count": 0,
+            "zip_count": 0,
+            "error": "目录不存在或无法访问",
+        }
+    try:
+        resolved = candidate.resolve()
+
+        def _count_candidates() -> tuple[int, int]:
+            demos = sum(1 for _ in iter_candidate_files(resolved, (".dem",), max_depth=body.max_depth))
+            zips = sum(1 for _ in iter_candidate_files(resolved, (".zip",), max_depth=body.max_depth))
+            return demos, zips
+
+        demo_count, zip_count = await asyncio.to_thread(_count_candidates)
+    except OSError as exc:
+        return {
+            "valid": False,
+            "path": str(candidate),
+            "demo_count": 0,
+            "zip_count": 0,
+            "error": str(exc),
+        }
+    return {
+        "valid": True,
+        "path": str(resolved),
+        "demo_count": demo_count,
+        "zip_count": zip_count,
+        "max_depth": body.max_depth,
+    }
 
 
 @app.post("/api/demos/{demo_id}/parse")
@@ -2652,80 +2707,83 @@ async def delete_demo(
     return {"status": "deleted", "demo_id": demo_id}
 
 
-def _launch_cs2_play_demo(dem_path: Path) -> None:
-    """将 Demo 复制到 game/csgo/ 后直接启动 CS2 播放，不涉及 OBS 录制。"""
-    cfg = load_config()
-    cs2_path = cfg.cs2_path
-    if not cs2_path or not Path(cs2_path).is_file():
-        raise HTTPException(400, "CS2 路径未配置或文件不存在，请先在设置中配置 CS2 路径。")
+class DemoPlaybackPovBody(BaseModel):
+    enabled: bool = False
+    radar_mode: Literal[-1, 0] = 0
+    teamcounter_numeric: bool = False
 
+
+class DemoPlaybackOptionsBody(BaseModel):
+    pov_hud: DemoPlaybackPovBody = Field(default_factory=DemoPlaybackPovBody)
+
+
+class DemoPlayByPathBody(DemoPlaybackOptionsBody):
+    path: str = Field(..., min_length=1)
+
+
+def _launch_cs2_play_demo(
+    dem_path: Path,
+    options: Optional[DemoPlaybackOptionsBody] = None,
+) -> dict[str, Any]:
+    """Launch managed direct playback; both normal and POV modes require CS2 to be closed."""
+    cfg = ensure_cs2_path(load_config())
+    if not cfg.cs2_path or not Path(cfg.cs2_path).is_file():
+        raise HTTPException(400, error_detail("DEMO_PLAYBACK_CS2_PATH_MISSING"))
     if not dem_path.is_file():
-        raise HTTPException(422, "Demo 文件不存在于磁盘，无法播放。")
+        raise HTTPException(422, error_detail("DEMO_PLAYBACK_DEMO_NOT_FOUND", path=str(dem_path)))
 
+    body = options or DemoPlaybackOptionsBody()
+    pov = body.pov_hud
     try:
-        cs2_bin = Path(cs2_path)
-        # 约定路径结构: …/game/bin/win64/cs2.exe → game/
-        game_root = cs2_bin.parents[2]
-        csgo_dir = game_root / "csgo"
-        dest = csgo_dir / "cs2_insight_preview.dem"
-        compat = ensure_demo_compatible(dem_path)
-        dest.unlink(missing_ok=True)
-        shutil.copy2(dem_path, dest)
-        logger.info(
-            "Direct CS2 demo compatibility ready: cached=%s outcome=%s "
-            "removed_type138=%d source=%s",
-            compat.cached,
-            compat.report.outcome,
-            compat.report.removed_messages,
+        return demo_playback_service.launch(
             dem_path,
+            cfg,
+            DemoPlaybackPovOptions(
+                enabled=bool(pov.enabled),
+                radar_mode=int(pov.radar_mode),
+                teamcounter_numeric=bool(pov.teamcounter_numeric),
+            ),
         )
-        logger.info("Launch CS2 for playback: cwd=%s demo=%s", game_root, dest)
-        import subprocess as _sp
-
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = (
-                getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(_sp, "DETACHED_PROCESS", 0)
-            )
-        _sp.Popen(
-            [
-                str(cs2_bin),
-                "-steam",
-                "-insecure",
-                "-novid",
-                "-console",
-                "+playdemo",
-                "cs2_insight_preview.dem",
-            ],
-            cwd=str(game_root),
-            stdin=_sp.DEVNULL,
-            stdout=_sp.DEVNULL,
-            stderr=_sp.DEVNULL,
-            close_fds=True,
-            creationflags=creationflags,
-        )
+    except DemoPlaybackCs2RunningError as exc:
+        raise HTTPException(409, error_detail("DEMO_PLAYBACK_CS2_RUNNING")) from exc
+    except DemoPlaybackBusyError as exc:
+        raise HTTPException(409, error_detail("DEMO_PLAYBACK_BUSY")) from exc
+    except PovHudError as exc:
+        raise HTTPException(400, error_detail("DEMO_PLAYBACK_POV_FAILED", err=str(exc))) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(400, error_detail("DEMO_PLAYBACK_CS2_PATH_MISSING")) from exc
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("Failed to launch CS2 for playback")
-        raise HTTPException(500, f"启动 CS2 失败: {e}") from e
+    except Exception as exc:
+        logger.exception("Failed to launch CS2 for direct playback")
+        raise HTTPException(500, error_detail("DEMO_PLAYBACK_LAUNCH_FAILED", err=str(exc))) from exc
 
 
-class DemoPlayByPathBody(BaseModel):
-    path: str = Field(..., min_length=1)
+@app.get("/api/demo/playback/preflight")
+async def demo_playback_preflight():
+    """Preflight for the playback dialog; launch performs the authoritative recheck."""
+    cfg = ensure_cs2_path(load_config())
+    return await asyncio.to_thread(demo_playback_service.preflight, cfg)
+
+
+@app.get("/api/demo/playback/status")
+async def demo_playback_status(session_id: str = Query(..., min_length=1, max_length=128)):
+    """Return the measured lifecycle and POV file-restoration result for one playback session."""
+    return await asyncio.to_thread(demo_playback_service.session_status, session_id)
 
 
 @app.post("/api/demo/play")
 async def play_demo_by_path(body: DemoPlayByPathBody):
     """按路径启动 CS2 播放 Demo（本地上传等无库内 id 的场景）。"""
     dem_path = resolve_uploaded_demo_path(body.path)
-    await asyncio.to_thread(_launch_cs2_play_demo, dem_path)
-    return {"ok": True}
+    return await asyncio.to_thread(_launch_cs2_play_demo, dem_path, body)
 
 
 @app.post("/api/demos/{demo_id}/play")
-async def play_demo_in_cs2(demo_id: int):
+async def play_demo_in_cs2(
+    demo_id: int,
+    body: Annotated[Optional[DemoPlaybackOptionsBody], Body()] = None,
+):
     """将 Demo 复制到 game/csgo/ 后直接启动 CS2 播放，不涉及 OBS 录制。"""
     row = await demo_db.get_demo_by_id(demo_id)
     if not row:
@@ -2735,8 +2793,7 @@ async def play_demo_in_cs2(demo_id: int):
     if not dem_path or not Path(dem_path).is_file():
         raise HTTPException(422, "Demo 文件不存在于磁盘，无法播放。")
 
-    await asyncio.to_thread(_launch_cs2_play_demo, Path(dem_path))
-    return {"ok": True}
+    return await asyncio.to_thread(_launch_cs2_play_demo, Path(dem_path), body)
 
 
 @app.post("/api/demos/{demo_id}/delete-file")

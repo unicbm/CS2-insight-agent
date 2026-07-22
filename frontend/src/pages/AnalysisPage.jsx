@@ -12,14 +12,13 @@ import { Loader2, RefreshCw, Film, User } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useAppShell } from "../context/AppShellContext";
 import { useT } from "../i18n/useT.js";
-import { usePlayDemoToast } from "../hooks/usePlayDemoToast.jsx";
-import { playDemoErrorLabel, playDemoInCs2 } from "../utils/playDemoInCs2.js";
+import { useDemoPlaybackDialog } from "../hooks/useDemoPlaybackDialog.jsx";
 import { summarizeWeaponKills } from "../utils/weaponKillCompilations.js";
 
 export default function AnalysisPage() {
   const s = useAppShell();
   const t = useT();
-  const { showPlayToast, PlayDemoToast } = usePlayDemoToast();
+  const { requestPlayDemo, DemoPlaybackUi } = useDemoPlaybackDialog();
   const [analysisViewMode, setAnalysisViewMode] = useState("clips");
   const timelineRounds = s.timeline?.rounds?.length ?? 0;
   const roundTlLen = s.roundTimeline?.length ?? 0;
@@ -32,18 +31,13 @@ export default function AnalysisPage() {
   const showPlayerTabs = s.parsedPlayerNames.length > 1;
   const currentUpload = s.uploadedDemos?.[s.currentMatchIndex] ?? null;
 
-  const handlePlayCurrentDemo = useCallback(async () => {
+  const handlePlayCurrentDemo = useCallback(() => {
     const label =
       (currentUpload?.filename && String(currentUpload.filename).trim()) ||
       s.currentFilename ||
       "Demo";
-    try {
-      await playDemoInCs2({ id: currentUpload?.id, path: currentUpload?.path });
-      showPlayToast(true, label);
-    } catch (e) {
-      showPlayToast(false, playDemoErrorLabel(e));
-    }
-  }, [currentUpload, s.currentFilename, showPlayToast]);
+    void requestPlayDemo({ id: currentUpload?.id, path: currentUpload?.path, label });
+  }, [currentUpload, requestPlayDemo, s.currentFilename]);
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col overflow-hidden">
@@ -348,13 +342,14 @@ export default function AnalysisPage() {
           onSelectAll={s.handleSelectAll}
           onDeselectAll={s.handleDeselectAll}
           onAddSelectedToQueue={s.handleAddSelectedToQueue}
-          onAddAllHighlightsAllMatches={s.handleAddAllHighlightsAllMatches}
+          onAddCurrentPlayerHighlights={s.handleAddCurrentPlayerHighlights}
+          currentPlayer={s.currentActivePlayer}
           queueLength={s.queue.length}
           batchRecording={s.batchRecording}
-          canAddAllHighlights={s.canAddAllHighlights}
+          canAddCurrentPlayerHighlights={s.canAddCurrentPlayerHighlights}
         />
       )}
-      <PlayDemoToast />
+      <DemoPlaybackUi />
     </div>
   );
 }
