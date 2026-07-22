@@ -49,10 +49,10 @@ export const desktopBridge = isDesktopApp
           return [];
         }
       },
-      async chooseDirectory(defaultPath = "") {
+      async chooseDirectory(defaultPath = "", title = "选择文件夹") {
         try {
           const selected = await open({
-            title: "Choose export folder",
+            title,
             defaultPath: typeof defaultPath === "string" && defaultPath.trim() ? defaultPath.trim() : undefined,
             directory: true,
             multiple: false,
