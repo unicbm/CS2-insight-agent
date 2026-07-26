@@ -1,6 +1,15 @@
+import type { CSSProperties } from "react";
+
 const HUD_ICON_BASE = "/hud-death-notice";
 
-function HudEquipmentIcon({ stem, className = "" }) {
+type BombStatus = "planted" | "dropped" | "defused" | "exploded";
+
+interface HudEquipmentIconProps {
+  stem: string;
+  className?: string;
+}
+
+function HudEquipmentIcon({ stem, className = "" }: HudEquipmentIconProps) {
   return (
     <img
       src={`${HUD_ICON_BASE}/${stem}.svg`}
@@ -11,21 +20,26 @@ function HudEquipmentIcon({ stem, className = "" }) {
   );
 }
 
-function bombTitle(status, site) {
-  if (status === "planted") {
-    return `C4 已放置${site ? ` · ${site} 区` : ""}`;
-  }
+function bombTitle(status: BombStatus, site: string): string {
+  if (status === "planted") return `C4 已放置${site ? ` · ${site} 区` : ""}`;
   if (status === "dropped") return "C4 已掉落";
   if (status === "defused") return "C4 已拆除";
-  if (status === "exploded") return "C4 已引爆";
-  return "C4";
+  return "C4 已引爆";
 }
 
-/**
- * Ground C4 marker: dropped (static dark-gold) vs planted (orange-red + pulse rings).
- * Positioning (`left`/`top` %) is passed via `style` from the scene canvas.
- */
-export default function ReplayBombMarker({ status, site = "", style, className = "" }) {
+interface ReplayBombMarkerProps {
+  status: BombStatus;
+  site?: string;
+  style?: CSSProperties;
+  className?: string;
+}
+
+export default function ReplayBombMarker({
+  status,
+  site = "",
+  style,
+  className = "",
+}: ReplayBombMarkerProps) {
   const muted = status === "defused" || status === "exploded";
   const planted = status === "planted";
   const dropped = status === "dropped";
@@ -61,14 +75,8 @@ export default function ReplayBombMarker({ status, site = "", style, className =
       <div className="relative flex items-center justify-center">
         {planted && (
           <>
-            <span
-              className="planted-c4-ring pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 -ml-2 -mt-2 rounded-full border-2 border-orange-500"
-              aria-hidden="true"
-            />
-            <span
-              className="planted-c4-ring pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 -ml-2 -mt-2 rounded-full border-2 border-orange-500"
-              aria-hidden="true"
-            />
+            <span className="planted-c4-ring pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 -ml-2 -mt-2 rounded-full border-2 border-orange-500" aria-hidden="true" />
+            <span className="planted-c4-ring pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 -ml-2 -mt-2 rounded-full border-2 border-orange-500" aria-hidden="true" />
           </>
         )}
         <div className={`relative z-[1] flex ${chipSize} items-center justify-center rounded-[2px] border ${chipTone}`}>

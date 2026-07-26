@@ -1,31 +1,30 @@
+import { BarChart3, BookOpen, Clapperboard, Library, Moon, Package, Settings, Sun } from "lucide-react";
 import { NavLink } from "react-router-dom";
-import {
-  BookOpen,
-  Library,
-  BarChart3,
-  Package,
-  Clapperboard,
-  Settings,
-  Sun,
-  Moon,
-} from "lucide-react";
-import { useThemeStore } from "../stores/themeStore";
-import { useReplayStore } from "../stores/replayStore";
+
 import { useT } from "../i18n/useT.js";
+import { useReplayStore } from "../stores/replayStore";
+import { useThemeStore } from "../stores/themeStore";
 
 const linkBase =
   "flex items-center gap-2 rounded-lg px-2 py-2 text-[12px] font-semibold transition-colors border border-transparent";
-const linkIdle = "text-cs2-text-secondary hover:border-cs2-border hover:bg-cs2-bg-input/50 hover:text-cs2-text-primary";
+const linkIdle =
+  "text-cs2-text-secondary hover:border-cs2-border hover:bg-cs2-bg-input/50 hover:text-cs2-text-primary";
 const linkActive = "border-cs2-accent/45 bg-cs2-accent-soft text-cs2-accent";
+
+interface SidebarNavProps {
+  queueLength?: number;
+  disabled?: boolean;
+}
 
 function suspendReplayPlayback() {
   useReplayStore.getState().requestSuspendPlayback();
 }
 
-export default function SidebarNav({ queueLength = 0, disabled = false }) {
-  const theme = useThemeStore((s) => s.theme);
-  const toggleTheme = useThemeStore((s) => s.toggleTheme);
+export default function SidebarNav({ queueLength = 0, disabled = false }: SidebarNavProps) {
+  const theme = useThemeStore((state) => state.theme);
+  const toggleTheme = useThemeStore((state) => state.toggleTheme);
   const t = useT();
+  const disabledLinkClass = disabled ? "pointer-events-none opacity-40" : "";
 
   return (
     <aside className="flex w-48 shrink-0 flex-col border-r border-cs2-border bg-cs2-bg-sidebar">
@@ -40,8 +39,12 @@ export default function SidebarNav({ queueLength = 0, disabled = false }) {
             className="h-16 w-16 shrink-0 object-contain"
           />
           <div className="min-w-0">
-            <div className="truncate text-sm font-bold tracking-wide text-cs2-text-primary">{t("nav.brand")}</div>
-            <div className="font-mono text-[10px] tracking-widest text-cs2-text-muted">v{__APP_VERSION__}</div>
+            <div className="truncate text-sm font-bold tracking-wide text-cs2-text-primary">
+              {t("nav.brand")}
+            </div>
+            <div className="font-mono text-[10px] tracking-widest text-cs2-text-muted">
+              v{__APP_VERSION__}
+            </div>
           </div>
         </div>
       </div>
@@ -65,24 +68,26 @@ export default function SidebarNav({ queueLength = 0, disabled = false }) {
         </NavLink>
         <NavLink
           to="/queue"
-          className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle} ${disabled ? "pointer-events-none opacity-40" : ""}`}
+          className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle} ${disabledLinkClass}`}
         >
           <Package className="h-4 w-4 shrink-0 opacity-90" />
           <span className="flex min-w-0 flex-1 items-center justify-between gap-2">
             <span>{t("nav.recordQueue")}</span>
-            <span className="rounded bg-cs2-accent/20 px-1.5 font-mono text-[10px] tabular-nums text-cs2-text-primary">{queueLength}</span>
+            <span className="rounded bg-cs2-accent/20 px-1.5 font-mono text-[10px] tabular-nums text-cs2-text-primary">
+              {queueLength}
+            </span>
           </span>
         </NavLink>
         <NavLink
           to="/montage"
-          className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle} ${disabled ? "pointer-events-none opacity-40" : ""}`}
+          className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle} ${disabledLinkClass}`}
         >
           <Clapperboard className="h-4 w-4 shrink-0 opacity-90" />
           {t("nav.montage")}
         </NavLink>
         <NavLink
           to="/lite-cut"
-          className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle} ${disabled ? "pointer-events-none opacity-40" : ""}`}
+          className={({ isActive }) => `${linkBase} ${isActive ? linkActive : linkIdle} ${disabledLinkClass}`}
         >
           <Clapperboard className="h-4 w-4 shrink-0 opacity-90 text-amber-400" />
           LiteCut

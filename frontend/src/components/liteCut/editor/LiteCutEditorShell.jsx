@@ -10,7 +10,7 @@ import LiteCutResizableLayout from "./LiteCutResizableLayout.jsx";
 import LiteCutPresetsDrawer from "./LiteCutPresetsDrawer.jsx";
 import LiteCutProjectStartPage from "./LiteCutProjectStartPage.jsx";
 import LiteCutExportProgressDialog from "./LiteCutExportProgressDialog.jsx";
-import FfmpegRequiredDialog from "../../FfmpegRequiredDialog.jsx";
+import FfmpegRequiredDialog from "../../FfmpegRequiredDialog";
 import { filterStyleFromColor, TEXT_STYLE_CARDS } from "./editorPresets.js";
 import { transitionPreviewVisual } from "./transitionPreviewUtils.js";
 import { LITECUT_PROJECT_TEMPLATES, projectBodyFromTemplate } from "./projectTemplates.js";

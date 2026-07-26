@@ -1,7 +1,17 @@
 import { useT } from "../i18n/useT.js";
 
-/** i18n key for POV HUD conflict message (CommonParamsModal and RecordWarmupModal). */
 export const POV_CONFLICT_HUD = "record.hudPovConflict";
+
+interface RecordingHudCardProps {
+  title: string;
+  code: string;
+  description: string;
+  checked: boolean;
+  onChange(checked: boolean): void;
+  outcomeOn?: string;
+  disabled?: boolean;
+  disabledReason?: string;
+}
 
 /** 录制画面效果：名称 / 指令 / 开关 / 说明 / 启用后的成片预期 */
 export function RecordingHudCard({
@@ -13,7 +23,7 @@ export function RecordingHudCard({
   outcomeOn,
   disabled = false,
   disabledReason,
-}) {
+}: RecordingHudCardProps) {
   const t = useT();
   const disabledMsg = disabledReason ? t(disabledReason) : undefined;
   return (
@@ -33,9 +43,8 @@ export function RecordingHudCard({
           type="checkbox"
           checked={checked}
           disabled={disabled}
-          onChange={(e) => {
-            if (disabled) return;
-            onChange(e.target.checked);
+          onChange={(event) => {
+            if (!disabled) onChange(event.target.checked);
           }}
           className="mt-1 h-4 w-4 shrink-0 rounded border-cs2-border accent-cs2-accent disabled:opacity-50"
         />

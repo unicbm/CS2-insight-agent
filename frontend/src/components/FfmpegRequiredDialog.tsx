@@ -1,10 +1,20 @@
 import { Clapperboard } from "lucide-react";
 import { useT } from "../i18n/useT.js";
 
-/**
- * FFmpeg 门控：未配置或不可用时展示，不可通过遮罩/关闭按钮 dismiss。
- */
-export default function FfmpegRequiredDialog({ title, subtitle, message, onGoSettings }) {
+interface FfmpegRequiredDialogProps {
+  title?: string;
+  subtitle?: string;
+  message: string;
+  onGoSettings(): void;
+}
+
+/** FFmpeg 门控：未配置或不可用时展示，不可通过遮罩/关闭按钮 dismiss。 */
+export default function FfmpegRequiredDialog({
+  title,
+  subtitle,
+  message,
+  onGoSettings,
+}: FfmpegRequiredDialogProps) {
   const t = useT();
   return (
     <div

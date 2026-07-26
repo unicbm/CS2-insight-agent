@@ -1,7 +1,20 @@
 import { useEffect, useRef } from "react";
 import { Loader2, OctagonX, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+
 import { useT } from "../i18n/useT.js";
+
+interface ProgressBarProps {
+  text: string;
+  active: boolean;
+  batchRecording?: boolean;
+  onAbortBatch?: () => void | Promise<void>;
+  dismissible?: boolean;
+  onDismiss?: () => void;
+  autoDismissAfterMs?: number;
+  showQueueNavigate?: boolean;
+  isError?: boolean;
+}
 
 export default function ProgressBar({
   text,
@@ -10,32 +23,20 @@ export default function ProgressBar({
   onAbortBatch,
   dismissible = false,
   onDismiss,
-  /** 非空时，在展示若干毫秒后自动触发 onDismiss（用于短时成功/提示；失败请勿传此值） */
   autoDismissAfterMs,
-  /** 为 true 时展示跳转录制队列按钮（点击后导航并关闭通知） */
   showQueueNavigate = false,
-  /**
-   * Explicit error flag — when true the bar will NOT auto-dismiss (stays until manually dismissed).
-   * Replaces the old approach of sniffing Chinese error words in the text.
-   * Defaults to false for backward compatibility.
-   */
   isError = false,
-}) {
+}: ProgressBarProps) {
   const t = useT();
   const navigate = useNavigate();
   const onDismissRef = useRef(onDismiss);
   onDismissRef.current = onDismiss;
 
   useEffect(() => {
-    // If isError is explicitly set, never auto-dismiss (caller can still pass autoDismissAfterMs
-    // to override this default, though that is unusual for errors).
-    const effDismissMs = autoDismissAfterMs || (isError ? 0 : 4500);
-    if (!effDismissMs || effDismissMs <= 0 || !text?.trim()) return;
-    // 解析读条 / 批量录制进行中时不计时，避免误关或中途消失
+    const dismissAfterMs = autoDismissAfterMs || (isError ? 0 : 4500);
+    if (!dismissAfterMs || dismissAfterMs <= 0 || !text.trim()) return;
     if (active || batchRecording) return;
-    const id = window.setTimeout(() => {
-      onDismissRef.current?.();
-    }, effDismissMs);
+    const id = window.setTimeout(() => onDismissRef.current?.(), dismissAfterMs);
     return () => window.clearTimeout(id);
   }, [text, autoDismissAfterMs, active, batchRecording, isError]);
 
@@ -57,17 +58,17 @@ export default function ProgressBar({
             {t("progressbar.queueBtn")}
           </button>
         ) : null}
-        {dismissible && typeof onDismiss === "function" ? (
+        {dismissible && onDismiss ? (
           <button
             type="button"
-            onClick={() => onDismiss()}
+            onClick={onDismiss}
             className="inline-flex shrink-0 rounded-md border border-cs2-border p-1.5 text-cs2-text-muted transition-colors hover:border-cs2-border hover:text-cs2-text-primary"
             aria-label={t("progressbar.closeAriaLabel")}
           >
             <X className="h-3.5 w-3.5" />
           </button>
         ) : null}
-        {batchRecording && typeof onAbortBatch === "function" ? (
+        {batchRecording && onAbortBatch ? (
           <button
             type="button"
             onClick={() => void onAbortBatch()}

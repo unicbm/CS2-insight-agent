@@ -1,15 +1,23 @@
-// frontend/src/components/BatchLoadErrorModal.jsx
-import { X, AlertCircle } from "lucide-react";
+import { AlertCircle, X } from "lucide-react";
 import { useT } from "../i18n/useT.js";
 
-/**
- * @param {{
- *   open: boolean;
- *   failed: Array<{ id: number; filename: string; reason: string }>;
- *   onClose: () => void;
- * }} props
- */
-export default function BatchLoadErrorModal({ open, failed = [], onClose }) {
+interface FailedDemo {
+  id: number;
+  filename: string;
+  reason: string;
+}
+
+interface BatchLoadErrorModalProps {
+  open: boolean;
+  failed?: FailedDemo[];
+  onClose(): void;
+}
+
+export default function BatchLoadErrorModal({
+  open,
+  failed = [],
+  onClose,
+}: BatchLoadErrorModalProps) {
   const t = useT();
   if (!open) return null;
 
@@ -26,6 +34,7 @@ export default function BatchLoadErrorModal({ open, failed = [], onClose }) {
             <span className="font-semibold text-sm">{t("dialog.batchLoadErrorTitle")}</span>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="text-zinc-500 hover:text-zinc-300 transition-colors"
             aria-label={t("dialog.batchLoadErrorClose")}
@@ -45,6 +54,7 @@ export default function BatchLoadErrorModal({ open, failed = [], onClose }) {
 
         <div className="px-5 pb-5 pt-2 flex justify-end">
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm text-zinc-200 transition-colors"
           >
