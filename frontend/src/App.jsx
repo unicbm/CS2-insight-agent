@@ -41,11 +41,11 @@ import {
   recordingQueueWasAborted,
   unexpectedCs2ExitRecoveryMessageKey,
 } from "./utils/recordingAbort";
-import { shouldCheckAppUpdates } from "./utils/shouldCheckAppUpdates";
-import { createDesktopUpdateCheck } from "./utils/desktopUpdater";
-import { getVersion as getDesktopAppVersion } from "@tauri-apps/api/app";
+import { useDesktopUpdater } from "./hooks/useDesktopUpdater";
+import { useStartupInitialization } from "./hooks/useStartupInitialization";
+import { useDemoLibraryController } from "./hooks/useDemoLibraryController";
 import { Loader2 } from "lucide-react";
-import API, { API_BASE_URL } from "./api/api";
+import API from "./api/api";
 
 import CustomTitleBar from "./components/CustomTitleBar";
 
@@ -64,12 +64,17 @@ export default function App() {
   const t = useT();
   const locale = useLocaleStore((s) => s.locale);
   const [backendReady, setBackendReady] = useState(false);
-  /** 后端就绪后的启动流程：先检查更新，再拉取首页配置检查 */
-  const [startupInitDone, setStartupInitDone] = useState(false);
-  const [startupInitPhase, setStartupInitPhase] = useState(/** @type {"update" | "config" | null} */ (null));
-  const [initialQuickCheckStatus, setInitialQuickCheckStatus] = useState(null);
-  const startupInitStartedRef = useRef(false);
-  const startupUpdateWaitRef = useRef(/** @type {(() => void) | null} */ (null));
+  const {
+    updateInfo,
+    updateModalOpen,
+    updateModalManual,
+    fetchUpdateInfo,
+    handleUpdateModalClose,
+    handleUpdateConfirm,
+    handleUpdateCancel,
+  } = useDesktopUpdater(t);
+  const { startupInitDone, startupInitPhase, initialQuickCheckStatus } =
+    useStartupInitialization({ backendReady, fetchUpdateInfo });
   const [aiMode, setAiMode] = useState(false);
 
   const [obsConfig, setObsConfig] = useState({ host: "localhost", port: 4455, password: "", obs_path: "" });
@@ -77,14 +82,6 @@ export default function App() {
   const [obsHasSavedPassword, setObsHasSavedPassword] = useState(false);
   /** 用户是否正在编辑密码框（用于失焦时恢复“已保存”提示） */
   const [obsPasswordEditing, setObsPasswordEditing] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState(null);
-  const [updateModalOpen, setUpdateModalOpen] = useState(false);
-  const [updateModalManual, setUpdateModalManual] = useState(false);
-  const updateCheckOptsRef = useRef({ manual: false, awaitDismiss: false });
-  /** 当前活跃的 Tauri updater 控制器；旧控制器的迟到状态会被忽略 */
-  const updateControllerRef = useRef(null);
-  /** 用户点「关闭」后忽略后续 cancelled 重开弹窗 */
-  const updateModalDismissedRef = useRef(false);
   const obsConfigRef = useRef(obsConfig);
   obsConfigRef.current = obsConfig;
   const obsConfigHydratedRef = useRef(false);
@@ -186,43 +183,51 @@ export default function App() {
   const [demoWatchPaths, setDemoWatchPaths] = useState([]);
   const [demoWatchScanDepth, setDemoWatchScanDepth] = useState(2);
   const [expectedParsePlayersText, setExpectedParsePlayersText] = useState("");
-  const [demoLibraryItems, setDemoLibraryItems] = useState([]);
-  const [libraryLoading, setLibraryLoading] = useState(false);
-  /** 仅「扫描本地 demo 库」进行中；不在顶部 ProgressBar 展示，由按钮内 spinner 表示 */
-  const [libraryScanning, setLibraryScanning] = useState(false);
+  const {
+    demoLibraryItems,
+    libraryLoading,
+    libraryScanning,
+    libraryPage,
+    setLibraryPage,
+    libraryHasNextPage,
+    libraryTotal,
+    selectedLibraryDemoIds,
+    setSelectedLibraryDemoIds,
+    libraryRename,
+    setLibraryRename,
+    libraryDeletePrompt,
+    setLibraryDeletePrompt,
+    librarySearchInput,
+    setLibrarySearchInput,
+    librarySearchQ,
+    setLibrarySearchQ,
+    libraryAdvFilters,
+    setLibraryAdvFilters,
+    libraryJumpDraft,
+    setLibraryJumpDraft,
+    libraryPageSize,
+    setLibraryPageSize,
+    libraryTotalPages,
+    hasLibraryAdvancedFilters,
+    refreshDemoLibrary,
+    handleLibrarySearchSubmit,
+    handleLibraryPageJump,
+    handleScanDemos,
+    handleDeleteDemo,
+    handleDeleteDemoFile,
+    handleLibraryBatchDelete,
+    handleSaveLibraryRename,
+    selectLibraryPage,
+    selectAllLibraryDemos,
+    clearLibrarySelection,
+  } = useDemoLibraryController({
+    enabled: startupInitDone,
+    t,
+    reportProgress: setProgressText,
+  });
   const [libraryLoadingOverlay, setLibraryLoadingOverlay] = useState(false);
   const [libraryLoadingText, setLibraryLoadingText] = useState("");
-  const [libraryPage, setLibraryPage] = useState(1);
-  const libraryPageRef = useRef(1);
-  const [libraryHasNextPage, setLibraryHasNextPage] = useState(false);
-  const [libraryTotal, setLibraryTotal] = useState(null);
-  const [selectedLibraryDemoIds, setSelectedLibraryDemoIds] = useState(new Set());
   const [libraryDemoIdsByIndex, setLibraryDemoIdsByIndex] = useState({});
-  const [libraryRename, setLibraryRename] = useState(null);
-  /** @type {{ id: number, label: string } | null} */
-  const [libraryDeletePrompt, setLibraryDeletePrompt] = useState(null);
-  const [librarySearchInput, setLibrarySearchInput] = useState("");
-  const [librarySearchQ, setLibrarySearchQ] = useState("");
-  const [libraryAdvFilters, setLibraryAdvFilters] = useState({
-    mapName: "",
-    status: "all",
-    playerQuery: "",
-    steamQuery: "",
-    minKills: "",
-    maxDeaths: "",
-    minAssists: "",
-    minKd: "",
-    roundsMin: "",
-    roundsMax: "",
-    durationMin: "",
-    durationMax: "",
-    dateFrom: "",
-    dateTo: "",
-  });
-  const [libraryJumpDraft, setLibraryJumpDraft] = useState("");
-  /** Demo 库列表每页条数（与 GET /demos limit 一致） */
-  const [libraryPageSize, setLibraryPageSize] = useState(12);
-  const libraryPageSizeEffectSkipRef = useRef(false);
   const [libraryBatchModalOpen, setLibraryBatchModalOpen] = useState(false);
   const [batchLoadError, setBatchLoadError] = useState({ open: false, failed: [] });
   const [llmKeySavedOnServer, setLlmKeySavedOnServer] = useState(false);
@@ -383,256 +388,6 @@ export default function App() {
       };
     });
   }, [uploadedDemos, parsedMatches]);
-
-  const libraryTotalPages =
-    libraryTotal == null ? null : Math.max(1, Math.ceil(libraryTotal / libraryPageSize));
-
-  const libraryAdvFiltersKey = useMemo(() => JSON.stringify(libraryAdvFilters), [libraryAdvFilters]);
-
-  useEffect(() => {
-    setLibraryPage(1);
-  }, [libraryAdvFiltersKey]);
-
-  const appendDemoLibraryFilterParams = useCallback((params) => {
-    const f = libraryAdvFilters;
-    if (f.mapName.trim()) params.map_name = f.mapName.trim();
-    if (f.status && f.status !== "all") params.status = f.status;
-    const pq = f.playerQuery.trim();
-    if (pq) params.player_query = pq;
-    const sq = f.steamQuery.trim();
-    if (sq) params.steam_query = sq;
-    const num = (v) => {
-      const s = String(v ?? "").trim();
-      if (!s) return null;
-      const n = parseInt(s, 10);
-      return Number.isFinite(n) && n >= 0 ? n : null;
-    };
-    const fl = (v) => {
-      const s = String(v ?? "").trim();
-      if (!s) return null;
-      const n = parseFloat(s);
-      return Number.isFinite(n) && n >= 0 ? n : null;
-    };
-    const mk = num(f.minKills);
-    if (mk != null) params.min_kills = mk;
-    const xdth = num(f.maxDeaths);
-    if (xdth != null) params.max_deaths = xdth;
-    const ma = num(f.minAssists);
-    if (ma != null) params.min_assists = ma;
-    const mkd = fl(f.minKd);
-    if (mkd != null) params.min_kd = mkd;
-    const roundsMin = num(f.roundsMin);
-    if (roundsMin != null) params.rounds_min = roundsMin;
-    const roundsMax = num(f.roundsMax);
-    if (roundsMax != null) params.rounds_max = roundsMax;
-    const durationMin = fl(f.durationMin);
-    if (durationMin != null) params.duration_min = durationMin;
-    const durationMax = fl(f.durationMax);
-    if (durationMax != null) params.duration_max = durationMax;
-    const dateBoundary = (value, endOfDay) => {
-      const date = String(value ?? "").trim();
-      if (!date) return null;
-      const local = new Date(`${date}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}`);
-      return Number.isNaN(local.getTime()) ? null : local.toISOString();
-    };
-    const dateFrom = dateBoundary(f.dateFrom, false);
-    if (dateFrom) params.date_from = dateFrom;
-    const dateTo = dateBoundary(f.dateTo, true);
-    if (dateTo) params.date_to = dateTo;
-  }, [libraryAdvFilters]);
-
-  const refreshDemoLibrary = useCallback(async (page = libraryPage, opts = {}) => {
-    const { manageLoading = true, searchQ: searchQOverride } = opts;
-    if (manageLoading) setLibraryLoading(true);
-    try {
-      const limit = libraryPageSize;
-      const offset = (page - 1) * limit;
-      const params = { limit, offset };
-      const qEff = searchQOverride !== undefined ? searchQOverride : librarySearchQ;
-      if (qEff) params.q = qEff;
-      appendDemoLibraryFilterParams(params);
-      const { data } = await API.get("/demos/compact", { params });
-      setDemoLibraryItems(data.items || []);
-      const total = typeof data.total === "number" ? data.total : null;
-      if (total != null) {
-        setLibraryTotal(total);
-        setLibraryHasNextPage(offset + (data.items || []).length < total);
-      } else {
-        setLibraryTotal(null);
-        setLibraryHasNextPage((data.items || []).length === limit);
-      }
-    } catch {
-      // ignore
-    } finally {
-      if (manageLoading) setLibraryLoading(false);
-    }
-  }, [libraryPage, librarySearchQ, libraryPageSize, appendDemoLibraryFilterParams]);
-
-  const refreshDemoLibraryRef = useRef(refreshDemoLibrary);
-  refreshDemoLibraryRef.current = refreshDemoLibrary;
-
-  const handleLibrarySearchSubmit = useCallback(() => {
-    const next = librarySearchInput.trim();
-    setLibrarySearchQ(next);
-    setLibraryPage(1);
-    void refreshDemoLibrary(1, { manageLoading: true, searchQ: next });
-  }, [librarySearchInput, refreshDemoLibrary]);
-
-  useEffect(() => {
-    if (!libraryPageSizeEffectSkipRef.current) {
-      libraryPageSizeEffectSkipRef.current = true;
-      return;
-    }
-    setLibraryPage(1);
-    void refreshDemoLibraryRef.current(1, { manageLoading: false });
-  }, [libraryPageSize]);
-
-  useEffect(() => {
-    libraryPageRef.current = libraryPage;
-  }, [libraryPage]);
-
-  useEffect(() => {
-    let cancelled = false;
-    let es = null;
-    let debounce = null;
-    const scheduleRefresh = () => {
-      if (cancelled) return;
-      window.clearTimeout(debounce);
-      debounce = window.setTimeout(() => {
-        void refreshDemoLibrary(libraryPageRef.current, { manageLoading: false });
-      }, 600);
-    };
-    const connect = () => {
-      if (cancelled) return;
-      try {
-        es = new EventSource(`${API_BASE_URL}/api/demos/stream`);
-      } catch {
-        return;
-      }
-      es.addEventListener("library", scheduleRefresh);
-      es.onerror = () => {
-        if (cancelled) return;
-        try {
-          es?.close();
-        } catch {
-          /* ignore */
-        }
-        es = null;
-        if (!cancelled) window.setTimeout(connect, 4000);
-      };
-    };
-    connect();
-    return () => {
-      cancelled = true;
-      window.clearTimeout(debounce);
-      try {
-        es?.close();
-      } catch {
-        /* ignore */
-      }
-    };
-  }, [refreshDemoLibrary]);
-
-  const handleLibraryPageJump = useCallback(() => {
-    const raw = libraryJumpDraft.trim();
-    if (!raw) return;
-    const n = parseInt(raw, 10);
-    if (!Number.isFinite(n) || n < 1) {
-      setProgressText(t("app.libraryPageJumpInvalid"));
-      return;
-    }
-    const maxPage = libraryTotalPages;
-    let target = n;
-    if (maxPage != null && n > maxPage) {
-      target = maxPage;
-      setProgressText(t("app.libraryPageJumpClamped", { maxPage }));
-    }
-    setLibraryJumpDraft("");
-    setLibraryPage(target);
-    void refreshDemoLibrary(target, { manageLoading: false });
-  }, [libraryJumpDraft, libraryTotalPages, refreshDemoLibrary, t]);
-
-  const handleScanDemos = useCallback(async () => {
-    setLibraryScanning(true);
-    try {
-      const { data } = await API.post("/demos/scan");
-      await refreshDemoLibrary(libraryPage, { manageLoading: false });
-      const n = data?.discovered_count;
-      setProgressText(
-        typeof n === "number" && n > 0
-          ? t("app.scanDone", { n })
-          : t("app.scanDoneEmpty", { scanned: data?.scanned || 0 })
-      );
-      return data;
-    } catch (e) {
-      setProgressText(t("app.scanFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
-      return null;
-    } finally {
-      setLibraryScanning(false);
-    }
-  }, [refreshDemoLibrary, libraryPage, t]);
-
-  const handleDeleteDemo = useCallback(
-    async (id, rescan) => {
-      try {
-        await API.delete(`/demos/${id}`, { params: { rescan } });
-        setLibraryDeletePrompt(null);
-        await refreshDemoLibrary(libraryPage, { manageLoading: false });
-      } catch (e) {
-        setProgressText(t("app.deleteFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
-      }
-    },
-    [refreshDemoLibrary, libraryPage, t]
-  );
-
-  const handleDeleteDemoFile = useCallback(
-    async (id) => {
-      try {
-        await API.post(`/demos/${id}/delete-file`);
-        setLibraryDeletePrompt(null);
-        setProgressText(t("app.deleteFileDone"));
-        await refreshDemoLibrary(libraryPage, { manageLoading: false });
-      } catch (e) {
-        setProgressText(t("app.deleteFileFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
-      }
-    },
-    [refreshDemoLibrary, libraryPage, t]
-  );
-
-  const handleLibraryBatchDelete = useCallback(
-    async (ids, rescan = "skip") => {
-      const list = [...ids];
-      if (!list.length) return;
-      setProgressText(t("app.batchDeleteProgress", { done: 0, total: list.length }), { loading: true });
-      let done = 0;
-      for (const id of list) {
-        try {
-          await API.delete(`/demos/${id}`, { params: { rescan } });
-          done += 1;
-          setProgressText(t("app.batchDeleteProgress", { done, total: list.length }), { loading: true });
-        } catch (e) {
-          setProgressText(t("app.batchDeleteFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
-          await refreshDemoLibrary(libraryPage, { manageLoading: false });
-          return;
-        }
-      }
-      setSelectedLibraryDemoIds(new Set());
-      setProgressText(t("app.batchDeleteDone", { n: list.length }));
-      await refreshDemoLibrary(libraryPage, { manageLoading: false });
-    },
-    [refreshDemoLibrary, libraryPage, t]
-  );
-
-  const handleSaveLibraryRename = useCallback(async () => {
-    if (!libraryRename) return;
-    try {
-      await API.patch(`/demos/${libraryRename.id}`, { display_name: libraryRename.draft });
-      setLibraryRename(null);
-      await refreshDemoLibrary(libraryPage, { manageLoading: false });
-    } catch (e) {
-      setProgressText(t("app.renameFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
-    }
-  }, [libraryRename, refreshDemoLibrary, libraryPage, t]);
 
   const handleLoadDemoFromLibrary = useCallback(async (items, opts = {}) => {
     const { resolvedByDemoId, skipLoadingOverlay = false } = opts;
@@ -831,37 +586,6 @@ export default function App() {
     }
   }, [selectedLibraryDemoIds, handleLoadDemoFromLibrary, setProgressText, t]);
 
-  const selectLibraryPage = useCallback(() => {
-    setSelectedLibraryDemoIds((prev) => {
-      const next = new Set(prev);
-      for (const it of demoLibraryItems) {
-        next.add(it.id);
-      }
-      return next;
-    });
-  }, [demoLibraryItems]);
-
-  const selectAllLibraryDemos = useCallback(async () => {
-    try {
-      const cap = 1000;
-      const want = libraryTotal != null ? Math.min(libraryTotal, cap) : cap;
-      const params = { limit: want, offset: 0 };
-      if (librarySearchQ) params.q = librarySearchQ;
-      appendDemoLibraryFilterParams(params);
-      const { data } = await API.get("/demos/ids", { params });
-      setSelectedLibraryDemoIds(new Set(data.ids || []));
-      if (libraryTotal != null && libraryTotal > cap) {
-        setProgressText(t("app.librarySelectAllCapped", { cap }));
-      }
-    } catch (e) {
-      setProgressText(t("app.librarySelectAllFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
-    }
-  }, [libraryTotal, librarySearchQ, appendDemoLibraryFilterParams, t]);
-
-  const clearLibrarySelection = useCallback(() => {
-    setSelectedLibraryDemoIds(new Set());
-  }, []);
-
   const applyCommonParamsFromConfigData = useCallback((data) => {
     if (!data || typeof data !== "object") return;
     if (data.default_record_warmup && typeof data.default_record_warmup === "object") {
@@ -1009,45 +733,6 @@ export default function App() {
   }, [refreshConfigBackupStatus]);
 
   // 全局节奏改由「常用参数」页顶「保存」写入配置；录制队列抽屉内微调仍只改内存，刷新后以配置文件为准。
-
-  useEffect(() => {
-    // 后端就绪后再拉库，避免启动阶段请求失败导致进 Demo 库需手动回车刷新
-    if (!startupInitDone) return;
-    void refreshDemoLibrary(libraryPage, { manageLoading: false });
-  }, [refreshDemoLibrary, libraryPage, startupInitDone]);
-
-  useEffect(() => {
-    if (!startupInitDone) return;
-    const timer = window.setTimeout(() => {
-      const next = librarySearchInput.trim();
-      if (next === librarySearchQ) return;
-      setLibrarySearchQ(next);
-      setLibraryPage(1);
-      void refreshDemoLibraryRef.current(1, { manageLoading: false, searchQ: next });
-    }, 400);
-    return () => window.clearTimeout(timer);
-  }, [librarySearchInput, librarySearchQ, startupInitDone]);
-
-  const hasLibraryAdvancedFilters = useMemo(() => {
-    const f = libraryAdvFilters;
-    const numOrStr = (v) => String(v ?? "").trim();
-    return !!(
-      f.mapName.trim() ||
-      (f.status && f.status !== "all") ||
-      f.playerQuery.trim() ||
-      f.steamQuery.trim() ||
-      numOrStr(f.minKills) ||
-      numOrStr(f.maxDeaths) ||
-      numOrStr(f.minAssists) ||
-      numOrStr(f.minKd) ||
-      numOrStr(f.roundsMin) ||
-      numOrStr(f.roundsMax) ||
-      numOrStr(f.durationMin) ||
-      numOrStr(f.durationMax) ||
-      numOrStr(f.dateFrom) ||
-      numOrStr(f.dateTo)
-    );
-  }, [libraryAdvFilters]);
 
   const handleUpload = useCallback(async (files) => {
     const list = Array.isArray(files) ? files : [files];
@@ -2597,241 +2282,6 @@ export default function App() {
       setProgressText(t("app.aiTestRequestFail", { msg: e.response?.data?.detail || e.message }), { isError: true });
     }
   }, [persistLlmConfig, t]);
-
-  const waitForUpdateModalDismiss = useCallback(
-    () =>
-      new Promise((resolve) => {
-        startupUpdateWaitRef.current = resolve;
-      }),
-    [],
-  );
-
-  const markUpdateChecked = useCallback(async () => {
-    const checkedAt = new Date().toISOString();
-    try {
-      await API.put("config", { last_update_check_at: checkedAt });
-    } catch {
-      // ignore persistence failures
-    }
-  }, []);
-
-  const handleUpdateModalClose = useCallback(() => {
-    const st = String(updateInfo?.status || "");
-    const isForce = String(updateInfo?.update_mode || "").toLowerCase() === "force";
-    // force：发现更新后或下载中不可关闭
-    if (isForce && (st === "available" || st === "downloading" || st === "downloaded")) {
-      return;
-    }
-    updateModalDismissedRef.current = true;
-    if (st === "checking" || st === "available") {
-      if (typeof updateControllerRef.current?.defer === "function") {
-        updateControllerRef.current.defer();
-      } else {
-        updateControllerRef.current?.cancel();
-      }
-    }
-    setUpdateModalOpen(false);
-    setUpdateModalManual(false);
-    const resume = startupUpdateWaitRef.current;
-    startupUpdateWaitRef.current = null;
-    resume?.();
-  }, [updateInfo?.status, updateInfo?.update_mode]);
-
-  const handleUpdateConfirm = useCallback(() => {
-    updateControllerRef.current?.confirm?.();
-  }, []);
-
-  const handleUpdateCancel = useCallback(() => {
-    // 「停止更新」：仅 normal；下载开始后无法真正打断
-    if (String(updateInfo?.update_mode || "").toLowerCase() === "force") return;
-    updateModalDismissedRef.current = false;
-    updateControllerRef.current?.cancel();
-  }, [updateInfo?.update_mode]);
-
-  /** Cloudflare R2 + Tauri updater（不走 GitHub /api/app/update-info） */
-  const fetchUpdateInfo = useCallback(
-    async (opts = { manual: false, awaitDismiss: false }) => {
-      const manual = Boolean(opts.manual);
-      const awaitDismiss = Boolean(opts.awaitDismiss);
-
-      if (!(await shouldCheckAppUpdates())) {
-        if (manual) {
-          setUpdateInfo({
-            status: "error",
-            error: t("settings.updateDevModeError"),
-            current_version: "",
-            latest_version: null,
-            update_mode: "normal",
-          });
-          setUpdateModalManual(true);
-          setUpdateModalOpen(true);
-        }
-        return;
-      }
-
-      updateCheckOptsRef.current = { manual, awaitDismiss };
-      updateModalDismissedRef.current = false;
-
-      let currentVersion = "";
-      try {
-        currentVersion = String((await getDesktopAppVersion()) || "");
-      } catch {
-        currentVersion = "";
-      }
-
-      updateControllerRef.current?.cancel();
-
-      const controller = createDesktopUpdateCheck((statusPayload) => {
-        if (updateControllerRef.current !== controller) return;
-        const status = String(statusPayload?.status || "");
-        const incomingLatest =
-          statusPayload?.latest_version || statusPayload?.info?.version || null;
-        const incomingNotes =
-          typeof statusPayload?.release_notes === "string"
-            ? statusPayload.release_notes
-            : typeof statusPayload?.info?.releaseNotes === "string"
-              ? statusPayload.info.releaseNotes
-              : "";
-        const incomingMode =
-          statusPayload?.update_mode || statusPayload?.info?.update_mode || null;
-        setUpdateInfo((prev) => ({
-          status,
-          current_version: currentVersion || prev?.current_version || "",
-          latest_version: incomingLatest || prev?.latest_version || null,
-          release_notes: incomingNotes || prev?.release_notes || "",
-          update_mode: incomingMode || prev?.update_mode || "normal",
-          progress: statusPayload?.progress || null,
-          error:
-            statusPayload?.error === "dev-mode"
-              ? t("settings.updateDevModeError")
-              : statusPayload?.error
-                ? String(statusPayload.error)
-                : "",
-        }));
-
-        const isManual = Boolean(updateCheckOptsRef.current.manual);
-
-        if (status === "checking") {
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          }
-          return;
-        }
-
-        if (status === "available" || status === "downloading" || status === "downloaded") {
-          if (status === "available") void markUpdateChecked();
-          setUpdateModalManual(isManual);
-          setUpdateModalOpen(true);
-          return;
-        }
-
-        if (status === "cancelled") {
-          if (updateModalDismissedRef.current) {
-            setUpdateModalOpen(false);
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-            return;
-          }
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          } else {
-            setUpdateModalOpen(false);
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-          }
-          return;
-        }
-
-        if (status === "not-available") {
-          void markUpdateChecked();
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          } else {
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-          }
-          return;
-        }
-
-        if (status === "error") {
-          if (isManual) {
-            setUpdateModalManual(true);
-            setUpdateModalOpen(true);
-          } else {
-            const resume = startupUpdateWaitRef.current;
-            startupUpdateWaitRef.current = null;
-            resume?.();
-          }
-        }
-      });
-      updateControllerRef.current = controller;
-
-      setUpdateInfo({
-        status: "checking",
-        current_version: currentVersion,
-        latest_version: null,
-        release_notes: "",
-        update_mode: "normal",
-        error: "",
-      });
-      if (manual) {
-        setUpdateModalManual(true);
-        setUpdateModalOpen(true);
-      }
-
-      const dismissWait = awaitDismiss ? waitForUpdateModalDismiss() : null;
-      controller.start();
-      if (dismissWait) await dismissWait;
-    },
-    [t, waitForUpdateModalDismiss, markUpdateChecked],
-  );
-
-  useEffect(() => {
-    return () => {
-      updateControllerRef.current?.cancel();
-      updateControllerRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!backendReady || startupInitStartedRef.current) return;
-    startupInitStartedRef.current = true;
-
-    let cancelled = false;
-    const runStartupInit = async () => {
-      try {
-        if ((await shouldCheckAppUpdates())) {
-          setStartupInitPhase("update");
-          await fetchUpdateInfo({ manual: false, awaitDismiss: true });
-          if (cancelled) return;
-        }
-
-        setStartupInitPhase("config");
-        try {
-          const { data } = await API.get("/config/quick-check");
-          if (!cancelled) setInitialQuickCheckStatus(data);
-        } catch {
-          if (!cancelled) setInitialQuickCheckStatus(null);
-        }
-      } finally {
-        if (!cancelled) {
-          setStartupInitPhase(null);
-          setStartupInitDone(true);
-        }
-      }
-    };
-
-    void runStartupInit();
-    return () => {
-      cancelled = true;
-    };
-  }, [backendReady, fetchUpdateInfo]);
 
   const hasDemos = uploadedDemos && uploadedDemos.length > 0;
   const currentFilename = currentUpload?.filename ?? "";

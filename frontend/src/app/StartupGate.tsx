@@ -1,8 +1,7 @@
 import { Loader2 } from "lucide-react";
 
 import { BACKEND_CONNECT_LABEL } from "../api/api";
-
-export type StartupInitPhase = "update" | "config" | null;
+import type { StartupInitPhase } from "../hooks/useStartupInitialization";
 
 interface StartupGateProps {
   backendReady: boolean;
