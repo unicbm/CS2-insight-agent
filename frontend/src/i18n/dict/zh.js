@@ -1700,6 +1700,7 @@ export default {
   "app.backendStarting": "正在启动本地分析引擎，请稍候",
   "app.startupCheckingUpdate": "正在检查版本更新…",
   "app.startupCheckingConfig": "正在检查配置…",
+  "app.startupPreparing": "正在完成启动检查…",
   "app.startupPleaseWait": "请稍候，即将进入首页",
   "app.batchRecording": "正在批量录制…",
   "app.checkUpdate": "检查更新",

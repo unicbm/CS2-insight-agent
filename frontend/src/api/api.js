@@ -6,11 +6,6 @@ const IS_DESKTOP_APP = Boolean(window.__TAURI_INTERNALS__);
 
 export const API_BASE_URL = IS_DESKTOP_APP ? "http://127.0.0.1:19871" : "";
 
-/** 启动屏展示的连接目标（浏览器 dev 走 Vite 代理，桌面壳直连 19871）。 */
-export const BACKEND_CONNECT_LABEL = IS_DESKTOP_APP
-  ? "127.0.0.1:19871"
-  : "127.0.0.1:8000 (Vite proxy)";
-
 /** 桌面壳须用绝对 URL；浏览器 dev 用相对路径走 Vite 代理。 */
 export function getDemosStreamUrl() {
   return API_BASE_URL ? `${API_BASE_URL}/api/demos/stream` : "/api/demos/stream";

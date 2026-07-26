@@ -1,4 +1,8 @@
 import "./index.css";
+import { hydrateDesktopBootstrapLocale } from "./i18n/localeStore";
 import { restoreLegacyElectronUiState } from "./utils/legacyElectronUiState";
 
-restoreLegacyElectronUiState().finally(() => import("./renderApp.jsx"));
+Promise.allSettled([
+  restoreLegacyElectronUiState(),
+  hydrateDesktopBootstrapLocale(),
+]).finally(() => import("./renderApp.jsx"));

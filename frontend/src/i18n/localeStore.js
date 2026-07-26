@@ -48,3 +48,21 @@ export const useLocaleStore = create((set, get) => ({
     });
   },
 }));
+
+/**
+ * Read the persisted locale through Tauri before React renders. The backend
+ * config remains authoritative; this only removes the wrong-language flash
+ * while the local Python service is still starting.
+ */
+export async function hydrateDesktopBootstrapLocale() {
+  if (!globalThis.__TAURI_INTERNALS__) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const locale = await invoke("read_bootstrap_locale");
+    if (typeof locale === "string") {
+      useLocaleStore.getState().hydrate(locale);
+    }
+  } catch {
+    // Fall back to the OS language until GET /api/config becomes available.
+  }
+}

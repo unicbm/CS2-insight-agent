@@ -1699,6 +1699,7 @@ export default {
   "app.backendStarting": "Starting local analysis engine, please wait",
   "app.startupCheckingUpdate": "Checking for updates…",
   "app.startupCheckingConfig": "Checking configuration…",
+  "app.startupPreparing": "Finishing startup checks…",
   "app.startupPleaseWait": "Please wait — loading home page",
   "app.batchRecording": "Batch recording in progress…",
   "app.checkUpdate": "Check for Updates",
