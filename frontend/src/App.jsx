@@ -1,5 +1,7 @@
-import { lazy, Suspense, useState, useCallback, useMemo, useEffect, useRef } from "react";
-import { Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
+import AppRoutes from "./app/AppRoutes";
+import StartupGate from "./app/StartupGate";
 import { AppShellProvider } from "./context/AppShellContext";
 import SidebarNav from "./components/SidebarNav";
 import UpdateCheckModal from "./components/UpdateCheckModal";
@@ -43,23 +45,9 @@ import { shouldCheckAppUpdates } from "./utils/shouldCheckAppUpdates";
 import { createDesktopUpdateCheck } from "./utils/desktopUpdater";
 import { getVersion as getDesktopAppVersion } from "@tauri-apps/api/app";
 import { Loader2 } from "lucide-react";
-import API, { API_BASE_URL, BACKEND_CONNECT_LABEL } from "./api/api";
+import API, { API_BASE_URL } from "./api/api";
 
 import CustomTitleBar from "./components/CustomTitleBar";
-
-const GuidePage = lazy(() => import("./pages/GuidePage"));
-const DemoLibraryPage = lazy(() => import("./pages/DemoLibraryPage"));
-const DemoAnalysisPreviewPage = lazy(() => import("./pages/DemoAnalysisPreviewPage"));
-const RecordingQueuePage = lazy(() => import("./pages/RecordingQueuePage"));
-const MontageWorkbenchPage = lazy(() => import("./pages/MontageWorkbenchPage"));
-const LiteCutEditorPage = lazy(() => import("./pages/liteCut/LiteCutEditorPage"));
-const LiteCutExportPage = lazy(() => import("./pages/liteCut/LiteCutExportPage"));
-const RecordingParamsPage = lazy(() => import("./pages/RecordingParamsPage"));
-const SettingsPage = lazy(() => import("./pages/SettingsPage"));
-const PlayerGameConfigPage = lazy(() => import("./pages/PlayerGameConfigPage"));
-const MatchHistoryPage = lazy(() => import("./pages/MatchHistoryPage"));
-const ObsAiTuningPreviewPage = lazy(() => import("./pages/ObsAiTuningPreviewPage"));
-const ObsAiEntryPreviewPage = lazy(() => import("./pages/ObsAiEntryPreviewPage"));
 
 const DEFAULT_CS2_EXTRA_LAUNCH_ARGS = "-fullscreen";
 
@@ -3045,64 +3033,16 @@ export default function App() {
             disabled={batchRecording}
           />
           <main className="flex min-w-0 flex-1 flex-col overflow-hidden relative">
-            {!isStandalonePreview && (!backendReady ? (
-              <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-cs2-bg-dark/80 backdrop-blur-sm">
-                <div className="flex flex-col items-center gap-6 p-8 rounded-2xl border border-white/5 bg-cs2-bg-card shadow-2xl">
-                  <div className="relative">
-                    <Loader2 className="h-12 w-12 animate-spin text-cs2-orange" />
-                    <div className="absolute inset-0 animate-ping rounded-full bg-cs2-orange/20" />
-                  </div>
-                  <div className="flex flex-col items-center gap-2">
-                    <h2 className="text-xl font-bold tracking-tight text-dynamic-white">{t("app.backendConnecting")}</h2>
-                    <p className="text-sm text-dynamic-zinc-400">{t("app.backendStarting")}</p>
-                  </div>
-                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/40 border border-white/5">
-                    <div className="w-1.5 h-1.5 rounded-full bg-cs2-orange animate-pulse" />
-                    <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">
-                      Attempting to connect: {BACKEND_CONNECT_LABEL}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ) : !startupInitDone ? (
-              <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-cs2-bg-dark/80 backdrop-blur-sm">
-                <div className="flex flex-col items-center gap-6 p-8 rounded-2xl border border-white/5 bg-cs2-bg-card shadow-2xl">
-                  <Loader2 className="h-12 w-12 animate-spin text-cs2-orange" />
-                  <div className="flex flex-col items-center gap-2">
-                    <h2 className="text-xl font-bold tracking-tight text-dynamic-white">
-                      {startupInitPhase === "config"
-                        ? t("app.startupCheckingConfig")
-                        : t("app.startupCheckingUpdate")}
-                    </h2>
-                    <p className="text-sm text-dynamic-zinc-400">{t("app.startupPleaseWait")}</p>
-                  </div>
-                </div>
-              </div>
-            ) : null)}
+            <StartupGate
+              backendReady={backendReady}
+              startupInitDone={startupInitDone}
+              startupInitPhase={startupInitPhase}
+              standalonePreview={isStandalonePreview}
+              t={t}
+            />
 
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-              <Suspense fallback={<div className="flex min-h-0 flex-1 items-center justify-center" aria-label="正在加载页面"><Loader2 className="h-7 w-7 animate-spin text-cs2-orange" /></div>}>
-              <Routes>
-                <Route path="/" element={<GuidePage />} />
-                <Route path="/library" element={<DemoLibraryPage />} />
-                <Route path="/analysis" element={<DemoAnalysisPreviewPage />} />
-                <Route path="/demo-analysis-preview" element={<Navigate to="/analysis" replace />} />
-                <Route path="/queue" element={<RecordingQueuePage />} />
-                <Route path="/montage" element={<MontageWorkbenchPage />} />
-                <Route path="/lite-cut" element={<LiteCutEditorPage />} />
-                <Route path="/lite-cut/editor" element={<Navigate to="/lite-cut" replace />} />
-                <Route path="/lite-cut/text" element={<Navigate to="/lite-cut" replace />} />
-                <Route path="/lite-cut/color" element={<Navigate to="/lite-cut" replace />} />
-                <Route path="/lite-cut/export" element={<LiteCutExportPage />} />
-                <Route path="/params" element={<RecordingParamsPage />} />
-                <Route path="/settings" element={<SettingsPage />} />
-                <Route path="/player-game-config" element={<PlayerGameConfigPage />} />
-                <Route path="/match-history" element={<MatchHistoryPage />} />
-                <Route path="/obs-ai-entry-preview" element={<ObsAiEntryPreviewPage />} />
-                <Route path="/obs-ai-preview" element={<ObsAiTuningPreviewPage />} />
-                <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
-              </Suspense>
+              <AppRoutes />
             </div>
           </main>
         </div>

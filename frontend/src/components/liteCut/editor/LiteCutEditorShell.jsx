@@ -16,7 +16,7 @@ import { transitionPreviewVisual } from "./transitionPreviewUtils.js";
 import { LITECUT_PROJECT_TEMPLATES, projectBodyFromTemplate } from "./projectTemplates.js";
 import { inspectorTabForTimelineSelection } from "./inspectorSelectionUtils.js";
 import API, { getLiteCutAssetStreamUrl, getRecordedClipStreamUrl } from "../../../api/api.js";
-import { desktopBridge } from "../../../desktop/desktopBridge.js";
+import { desktopBridge } from "../../../desktop/desktopBridge";
 import { useLiteCutEditorStore } from "../../../stores/liteCutEditorStore.js";
 import { collectUsedLiteCutAssetIds, mapAssetRow } from "../../../stores/liteCut/assetUtils.js";
 import { liteCutClipStreamUrl } from "./clipStreamUrlUtils.js";

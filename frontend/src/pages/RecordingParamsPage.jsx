@@ -1,7 +1,11 @@
 import CommonParamsModal from "../components/CommonParamsModal";
 import { useAppShell } from "../context/AppShellContext";
 
-export default function RecordingParamsPage({ embedded = false, onRegisterSave, onSaveUiChange }) {
+export default function RecordingParamsPage({
+  embedded = false,
+  onRegisterSave = undefined,
+  onSaveUiChange = undefined,
+}) {
   const s = useAppShell();
   return (
     <CommonParamsModal

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Archive, Download, History, Loader2, RefreshCw, RotateCcw, Trash2, X, Zap } from "lucide-react";
 import API from "../../../api/api.js";
-import { desktopBridge } from "../../../desktop/desktopBridge.js";
+import { desktopBridge } from "../../../desktop/desktopBridge";
 
 const formatBytes = (value) => {
   const bytes = Math.max(0, Number(value) || 0);

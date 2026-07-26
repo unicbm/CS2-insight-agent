@@ -1,6 +1,6 @@
 import { CheckCircle2, Copy, FolderOpen, Loader2, X } from "lucide-react";
 import API from "../../../api/api.js";
-import { desktopBridge } from "../../../desktop/desktopBridge.js";
+import { desktopBridge } from "../../../desktop/desktopBridge";
 
 function basenameFromPath(path) {
   const normalized = String(path || "").replace(/\\/g, "/");

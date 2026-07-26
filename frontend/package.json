@@ -14,6 +14,7 @@
     "desktop:build": "pnpm run desktop:stage-python && pnpm run desktop:stage-resources && tauri build",
     "desktop:build:ver": "node scripts/tauri-build-version.mjs",
     "deploy:r2": "node scripts/deploy-r2.mjs",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -31,6 +32,8 @@
     "@tauri-apps/cli": "^2.0.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.3.0",
     "antd": "^5.26.0",
     "axios": "^1.7.0",
@@ -40,6 +43,7 @@
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.15.0",
     "tailwindcss": "^4.0.0",
+    "typescript": "^7.0.2",
     "vite": "^6.0.0",
     "vitest": "^2.1.9",
     "zustand": "^5.0.12"

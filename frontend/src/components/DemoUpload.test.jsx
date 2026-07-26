@@ -7,7 +7,7 @@ const desktopBridgeMock = vi.hoisted(() => ({
   chooseDemoFiles: vi.fn(),
 }));
 
-vi.mock("../desktop/desktopBridge.js", () => ({
+vi.mock("../desktop/desktopBridge", () => ({
   desktopBridge: desktopBridgeMock,
 }));
 

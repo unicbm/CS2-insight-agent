@@ -26,7 +26,7 @@ import { ConfigProvider } from "antd";
 import { useLiteCutTimelineStore } from "../../../stores/liteCut/timelineStore.js";
 import { useT } from "../../../i18n/useT.js";
 import API from "../../../api/api.js";
-import { desktopBridge } from "../../../desktop/desktopBridge.js";
+import { desktopBridge } from "../../../desktop/desktopBridge";
 import AudioWaveformBars from "./AudioWaveformBars.jsx";
 import ColorPropertyPane from "./ColorPropertyPane.jsx";
 import SpeedPropertyPane from "./SpeedPropertyPane.jsx";

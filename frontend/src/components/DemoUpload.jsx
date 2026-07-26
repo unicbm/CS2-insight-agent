@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef } from "react";
 import { Upload, FileCode2, Loader2 } from "lucide-react";
 import { useT } from "../i18n/useT.js";
-import { desktopBridge } from "../desktop/desktopBridge.js";
+import { desktopBridge } from "../desktop/desktopBridge";
 
 function collectDemFiles(fileList) {
   if (!fileList?.length) return [];

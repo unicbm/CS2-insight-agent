@@ -22,7 +22,7 @@ import {
 } from "../utils/demoLibraryDisplay";
 import { useDemoPlaybackDialog } from "../hooks/useDemoPlaybackDialog.jsx";
 import { useT } from "../i18n/useT.js";
-import { desktopBridge } from "../desktop/desktopBridge.js";
+import { desktopBridge } from "../desktop/desktopBridge";
 
 const INITIAL_ADV_FILTERS = {
   mapName: "",

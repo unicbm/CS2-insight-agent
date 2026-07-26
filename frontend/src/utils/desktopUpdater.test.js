@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeUpdateMode } from "./desktopUpdater.js";
+import { normalizeUpdateMode } from "./desktopUpdater";
 
 describe("normalizeUpdateMode", () => {
   it("defaults to normal", () => {

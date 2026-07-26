@@ -5,7 +5,7 @@ import { calibrateObs, getObsConfigStatus } from "../api/obsConfigCenter";
 import { useT } from "../i18n/useT.js";
 import { useLocaleStore } from "../i18n/localeStore.js";
 import { useAppShell } from "../context/AppShellContext";
-import { desktopBridge } from "../desktop/desktopBridge.js";
+import { desktopBridge } from "../desktop/desktopBridge";
 import RecordingParamsPage from "./RecordingParamsPage";
 import SponsorModal from "../components/SponsorModal";
 import ObsAiSettingsPanel from "../components/ObsAiSettingsPanel";
