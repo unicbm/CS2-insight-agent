@@ -14,7 +14,6 @@ import os
 import re
 from typing import Any, Callable, Literal, Optional
 
-from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 from pydantic import BaseModel, Field, ValidationError
 
 from .env_utils import LLMConfig, llm_base_url_is_local_host
@@ -146,7 +145,7 @@ async def review_tuning_plan(
     recommendation: dict[str, Any],
     *,
     timeout_seconds: float = 35.0,
-    client_factory: Callable[..., Any] = AsyncOpenAI,
+    client_factory: Optional[Callable[..., Any]] = None,
 ) -> dict[str, Any]:
     """Return an auditable LLM review, or an explicit rule-based fallback status."""
     model = (llm.model or "").strip()
@@ -168,6 +167,26 @@ async def review_tuning_plan(
         }
 
     base_url = normalize_llm_base_url(llm.base_url)
+    transient_errors: tuple[type[BaseException], ...] = (asyncio.TimeoutError,)
+    if client_factory is None:
+        # openai imports a large generated model surface. Keep it out of the
+        # desktop cold-start path; OBS AI review is only used on explicit user
+        # action and can pay that one-time import cost then.
+        from openai import (
+            APIConnectionError,
+            APIError,
+            APITimeoutError,
+            AsyncOpenAI,
+            RateLimitError,
+        )
+
+        client_factory = AsyncOpenAI
+        transient_errors += (
+            APITimeoutError,
+            APIConnectionError,
+            RateLimitError,
+            APIError,
+        )
     client = client_factory(api_key=key, base_url=base_url, timeout=timeout_seconds)
     user_message = "请评估以下 OBS 录制目标：\n" + json.dumps(
         _sanitized_payload(goal, discovery, recommendation),
@@ -228,7 +247,7 @@ async def review_tuning_plan(
                 **review.model_dump(),
             }
         raise invalid_response or ValueError("AI 没有返回可用内容")
-    except (APITimeoutError, APIConnectionError, RateLimitError, APIError, asyncio.TimeoutError) as exc:
+    except transient_errors as exc:
         logger.warning("OBS tuning AI review failed: %s", exc)
         message = "AI 连接暂时不可用，已经改用本机检测结果生成设置；不影响后面的真实录制测试。"
         reason_code = "service_unavailable"

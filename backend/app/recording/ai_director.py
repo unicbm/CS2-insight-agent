@@ -9,7 +9,6 @@ import os
 import re
 from typing import Any, Literal, Optional
 
-from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from ..env_utils import LLMConfig, llm_api_key_configured, llm_base_url_is_local_host, load_config, resolve_config_path
@@ -790,7 +789,23 @@ async def suggest_recording_outline(
 
     model = (cfg_llm.model or "").strip() or "gpt-4o-mini"
     base_url = normalize_llm_base_url(cfg_llm.base_url)
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec)
+    try:
+        # This path is optional and user-triggered. Importing the generated
+        # OpenAI SDK during FastAPI route registration adds measurable desktop
+        # cold-start time even when AI directing is never used.
+        from openai import (
+            APIConnectionError,
+            APIError,
+            APITimeoutError,
+            AsyncOpenAI,
+            RateLimitError,
+        )
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec)
+    except Exception as e:  # noqa: BLE001
+        err = _format_llm_error(e)
+        logger.warning("AI director client unavailable: %s", err)
+        return _heuristic_outline(req), "heuristic", err
 
     user_msg = (
         "请为以下击杀列表生成录制大纲 JSON。\n"
