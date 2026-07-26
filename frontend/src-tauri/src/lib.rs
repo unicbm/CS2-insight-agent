@@ -4,7 +4,7 @@ mod commands;
 use std::thread;
 
 use backend_process::{start_backend, stop_backend, BackendProcess};
-use commands::{read_bootstrap_locale, read_legacy_ui_state};
+use commands::read_legacy_ui_state;
 use tauri::{Manager, RunEvent, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
@@ -22,14 +22,11 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(BackendProcess::default())
-        .invoke_handler(tauri::generate_handler![
-            read_legacy_ui_state,
-            read_bootstrap_locale
-        ])
+        .invoke_handler(tauri::generate_handler![read_legacy_ui_state])
         .setup(|app| {
             // Start the backend on a worker thread so the window (and its
-            // non-blocking startup status) appears immediately instead of
-            // waiting for the Python process to answer HTTP.
+            // "connecting to backend" splash) appears immediately instead of
+            // after the Python process answers HTTP.
             let handle = app.handle().clone();
             thread::spawn(move || {
                 if let Err(error) = start_backend(&handle) {

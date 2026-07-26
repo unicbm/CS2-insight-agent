@@ -1,7 +1,7 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import AppRoutes from "./app/AppRoutes";
-import StartupStatus from "./app/StartupStatus";
+import StartupGate from "./app/StartupGate";
 import { AppShellProvider } from "./context/AppShellContext";
 import SidebarNav from "./components/SidebarNav";
 import UpdateCheckModal from "./components/UpdateCheckModal";
@@ -651,7 +651,6 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let failedAttempts = 0;
     const initialize = async () => {
       while (!cancelled) {
         try {
@@ -698,12 +697,7 @@ export default function App() {
           setBackendReady(true);
           break;
         } catch {
-          failedAttempts += 1;
-          // During an ordinary cold start, notice readiness promptly instead
-          // of quantizing it to a one-second polling interval. Back off after
-          // five seconds so a genuinely failed backend stays inexpensive.
-          const retryDelayMs = failedAttempts <= 25 ? 200 : 1000;
-          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+          await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       }
     };
@@ -2489,7 +2483,7 @@ export default function App() {
             disabled={batchRecording}
           />
           <main className="flex min-w-0 flex-1 flex-col overflow-hidden relative">
-            <StartupStatus
+            <StartupGate
               backendReady={backendReady}
               startupInitDone={startupInitDone}
               startupInitPhase={startupInitPhase}
