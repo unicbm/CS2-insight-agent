@@ -198,10 +198,9 @@ frontend\src-tauri\target\release\bundle\nsis\CS2 Insight Agent_<ver>_x64-setup.
 
 ### 4.3 鸡生蛋问题（白名单 vs 安装包）
 
-父进程哈希来自「本版」主程序 / python。实务上常见两种做法：
+父进程哈希来自「本版」主程序 / python。**一键脚本** `build_desktop_with_skin_core.ps1` 现在是三轮：Pass1 拿 PE → 编 skin-core → Pass2 嵌入 sidecar → **按 Pass2 最终 Agent 重编 skin-core → Pass3 再打包并校验白名单**。不要只用 Pass1 哈希出货：嵌入资源后 Agent SHA256 会变（本机曾出现 Pass1=`dfad…`、Pass2=`723d…`），祖先链若读不到 bundled python 就会在数秒内 auth 失败（exit 2）。
 
-1. **两轮构建**：先打一版 Insight 拿到 PE → anyskin `-ParentPe` 编 skin-core → 再设 `CS2_SKIN_CORE_EXE` 打最终 Insight 安装包（若主程序 PE 因嵌入资源变化，需以最终 exe 为准再编一次 skin-core）。  
-2. **固定运行时 PE**：若最终安装目录中的 `CS2 Insight Agent.exe` 与 bundled `python.exe` 哈希稳定，用安装后路径哈希编 skin-core，再打补丁/下一版资源更新。
+手动两轮时也必须以**最终** `cs2-insight-agent-desktop.exe` + bundled `python.exe` 再跑一次 `release-skin-core.ps1 -ParentPe …`，再打安装包。
 
 发布前在干净机器验证：未设 DEV 时换肤可用；换非官方启动器应失败。
 
