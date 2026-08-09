@@ -164,17 +164,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\release-skin-core.ps1 `
 `frontend/scripts/stage-tauri-resources.mjs` 会：
 
 - 若设了 **`CS2_SKIN_CORE_EXE`** → 复制该文件  
-- 否则尝试 `../CS2-demo-anyskin/dist/skin-core.exe` 等  
 - 目标：`frontend/src-tauri/bundle-resources/tools/skin-core.exe`  
-- **缺失则跳过**（OSS CI 不失败；正式发布前必须确认已注入）
+- 未显式设置时跳过，不会从兄弟目录静默拾取旧 release 产物（OSS CI 不失败；正式发布前必须确认已注入）
 
 推荐正式构建前：
 
 ```powershell
 # 已用正式 PE 白名单编好的闭源产物
 $env:CS2_SKIN_CORE_EXE = "C:\code\CS2-demo-anyskin\dist\skin-core.exe"
-
-# 若目录已是 ../CS2-demo-anyskin/dist/skin-core.exe，也可不设环境变量
 ```
 
 ### 4.2 打 Windows 安装包
